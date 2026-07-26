@@ -4,15 +4,11 @@ import torch
 import time
 
 class ShowerSimulation:
-    def __init__(self, primary_type='gamma', energy=1000.0, z_start=20000.0):
+    def __init__(self, primary_types=['gamma'], energies=[1000.0], z_starts=[20000.0]):
         """
         A 3D toy Monte Carlo using fully tensorized PyTorch operations.
-        Distances are in meters, Energy in GeV.
+        Supports batch processing of multiple independent showers.
         """
-        self.primary_type = primary_type
-        self.energy = energy
-        self.z_start = z_start
-        
         self.critical_energy = 0.085 # 85 MeV
         self.photon_yield_factor = 1.0 
         
@@ -21,23 +17,36 @@ class ShowerSimulation:
         if self.device is None:
             self.device = torch.device('cpu')
             
-        # PIDs: gamma: 0, e+: 1, e-: 2, proton: 3, pi_charged: 4, pi0: 5, mu: 6
         self.PID_MAP = {'gamma': 0, 'e+': 1, 'e-': 2, 'proton': 3, 'pi_charged': 4, 'pi0': 5, 'mu': 6}
         self.INV_PID_MAP = {v: k for k, v in self.PID_MAP.items()}
         
-        # State tensor [PID, E, x, y, z, px, py, pz, generation]
-        init_state = [self.PID_MAP[primary_type], energy, 0.0, 0.0, z_start, 0.0, 0.0, -1.0, 0.0]
-        self.active = torch.tensor([init_state], dtype=torch.float32, device=self.device)
+        # Ensure inputs are lists
+        if isinstance(primary_types, str):
+            primary_types = [primary_types]
+        if isinstance(energies, (float, int)):
+            energies = [energies]
+        if isinstance(z_starts, (float, int)):
+            z_starts = [z_starts]
+            
+        batch_size = len(primary_types)
         
-        # Cherenkov segment accumulators (for zero-copy transfer to backend)
+        # State tensor [PID, E, x, y, z, px, py, pz, generation, event_id]
+        init_state = []
+        for i in range(batch_size):
+            init_state.append([self.PID_MAP[primary_types[i]], energies[i], 0.0, 0.0, z_starts[i], 0.0, 0.0, -1.0, 0.0, float(i)])
+            
+        self.active = torch.tensor(init_state, dtype=torch.float32, device=self.device)
+        self.batch_size = batch_size
+        
+        # Cherenkov segment accumulators
         self.c_segs_start = []
         self.c_segs_end = []
         self.c_segs_p = []
         self.c_segs_E = []
-        self.cherenkov_photons = {
-            'x_emit': np.array([]), 'y_emit': np.array([]), 'z_emit': np.array([]),
-            'x_ground': np.array([]), 'y_ground': np.array([])
-        }
+        self.c_segs_event_id = []
+        
+        # Output dictionary mapping event_id to its Cherenkov photons
+        self.cherenkov_photons_by_event = {i: {'x_ground': np.array([]), 'y_ground': np.array([])} for i in range(batch_size)}
 
     def _atmospheric_density(self, z):
         return 1.225e-3 * torch.exp(-z / 7640.0)
@@ -71,6 +80,7 @@ class ShowerSimulation:
         x, y, z = p[:, 2], p[:, 3], p[:, 4]
         px, py, pz = p[:, 5], p[:, 6], p[:, 7]
         gen = p[:, 8]
+        evt = p[:, 9]
         N = p.shape[0]
         dist = torch.zeros(N, device=self.device, dtype=torch.float32)
         
@@ -160,6 +170,7 @@ class ShowerSimulation:
             self.c_segs_end.append(torch.stack([x_new[c_mask], y_new[c_mask], z_new[c_mask]], dim=1))
             self.c_segs_p.append(torch.stack([px[c_mask], py[c_mask], pz[c_mask]], dim=1))
             self.c_segs_E.append(E[c_mask])
+            self.c_segs_event_id.append(evt[c_mask])
             
         z_new = torch.clamp(z_new, min=0.0)
         
@@ -189,12 +200,13 @@ class ShowerSimulation:
             px2, py2, pz2 = self._norm_dir(px[idx_g] - pt*torch.cos(phi), py[idx_g] - pt*torch.sin(phi), pz[idx_g])
             
             gen_new = gen[idx_g] + 1
+            evt_new = evt[idx_g]
             x_g = x_new[idx_g]
             y_g = y_new[idx_g]
             z_g = z_new[idx_g]
             
-            e1 = torch.stack([torch.full_like(e1_E, 1), e1_E, x_g, y_g, z_g, px1, py1, pz1, gen_new], dim=1)
-            e2 = torch.stack([torch.full_like(e2_E, 2), e2_E, x_g, y_g, z_g, px2, py2, pz2, gen_new], dim=1)
+            e1 = torch.stack([torch.full_like(e1_E, 1), e1_E, x_g, y_g, z_g, px1, py1, pz1, gen_new, evt_new], dim=1)
+            e2 = torch.stack([torch.full_like(e2_E, 2), e2_E, x_g, y_g, z_g, px2, py2, pz2, gen_new, evt_new], dim=1)
             new_particles.extend([e1, e2])
             
         # 2. Bremsstrahlung
@@ -217,12 +229,13 @@ class ShowerSimulation:
             px2, py2, pz2 = self._norm_dir(px[idx_b] + pt*torch.cos(phi), py[idx_b] + pt*torch.sin(phi), pz[idx_b])
             
             gen_new = gen[idx_b] + 1
+            evt_new = evt[idx_b]
             x_b = x_new[idx_b]
             y_b = y_new[idx_b]
             z_b = z_new[idx_b]
             
-            e_out = torch.stack([pid[idx_b].float(), e_E, x_b, y_b, z_b, px1, py1, pz1, gen_new], dim=1)
-            g_out = torch.stack([torch.full_like(g_E, 0), g_E, x_b, y_b, z_b, px2, py2, pz2, gen_new], dim=1)
+            e_out = torch.stack([pid[idx_b].float(), e_E, x_b, y_b, z_b, px1, py1, pz1, gen_new, evt_new], dim=1)
+            g_out = torch.stack([torch.full_like(g_E, 0), g_E, x_b, y_b, z_b, px2, py2, pz2, gen_new, evt_new], dim=1)
             new_particles.extend([e_out, g_out])
 
         # 3. Hadronic
@@ -235,6 +248,7 @@ class ShowerSimulation:
             e_split = E_h / 5.0
             
             gen_new = gen[idx_h] + 1
+            evt_new = evt[idx_h]
             x_h = x_new[idx_h]
             y_h = y_new[idx_h]
             z_h = z_new[idx_h]
@@ -243,7 +257,7 @@ class ShowerSimulation:
                 phi = torch.rand(N_h, device=self.device) * 2 * np.pi
                 px_c, py_c, pz_c = self._norm_dir(px[idx_h] + pt*torch.cos(phi), py[idx_h] + pt*torch.sin(phi), pz[idx_h])
                 c_pid = 5 if i < 2 else 4
-                child = torch.stack([torch.full_like(e_split, c_pid), e_split, x_h, y_h, z_h, px_c, py_c, pz_c, gen_new], dim=1)
+                child = torch.stack([torch.full_like(e_split, c_pid), e_split, x_h, y_h, z_h, px_c, py_c, pz_c, gen_new, evt_new], dim=1)
                 new_particles.append(child)
                 
         # 4. Pi0 -> 2 gamma
@@ -259,19 +273,20 @@ class ShowerSimulation:
             px2, py2, pz2 = self._norm_dir(px[idx_p0] - pt*torch.cos(phi), py[idx_p0] - pt*torch.sin(phi), pz[idx_p0])
             
             gen_new = gen[idx_p0] + 1
+            evt_new = evt[idx_p0]
             x_p0 = x_new[idx_p0]
             y_p0 = y_new[idx_p0]
             z_p0 = z_new[idx_p0]
             e_split = E_p0 / 2.0
             
-            g1 = torch.stack([torch.full_like(e_split, 0), e_split, x_p0, y_p0, z_p0, px1, py1, pz1, gen_new], dim=1)
-            g2 = torch.stack([torch.full_like(e_split, 0), e_split, x_p0, y_p0, z_p0, px2, py2, pz2, gen_new], dim=1)
+            g1 = torch.stack([torch.full_like(e_split, 0), e_split, x_p0, y_p0, z_p0, px1, py1, pz1, gen_new, evt_new], dim=1)
+            g2 = torch.stack([torch.full_like(e_split, 0), e_split, x_p0, y_p0, z_p0, px2, py2, pz2, gen_new, evt_new], dim=1)
             new_particles.extend([g1, g2])
 
         if new_particles:
             self.active = torch.cat(new_particles, dim=0)
         else:
-            self.active = torch.empty((0, 9), device=self.device)
+            self.active = torch.empty((0, 10), device=self.device)
         
     def run(self, max_generations=12, verbose=True):
         t0 = time.time()
@@ -290,7 +305,7 @@ class ShowerSimulation:
         t1 = time.time()
         self.calculate_cherenkov_pool()
         if verbose:
-            n_phot = len(self.cherenkov_photons.get('x_ground', []))
+            n_phot = sum(len(d.get('x_ground', [])) for d in self.cherenkov_photons_by_event.values())
             print(f"      Cherenkov pool: {n_phot:,} photons ({time.time()-t1:.1f}s)")
 
     def calculate_cherenkov_pool(self):
@@ -303,19 +318,32 @@ class ShowerSimulation:
         ends = torch.cat(self.c_segs_end, dim=0)
         ps = torch.cat(self.c_segs_p, dim=0)
         Es = torch.cat(self.c_segs_E, dim=0)
+        evts = torch.cat(self.c_segs_event_id, dim=0)
         
-        self.cherenkov_photons = compute_cherenkov_pool_gpu(
-            starts[:, 0], starts[:, 1], starts[:, 2],
-            ends[:, 0], ends[:, 1], ends[:, 2],
-            ps[:, 0], ps[:, 1], ps[:, 2],
-            Es, self.photon_yield_factor
-        )
+        # Ray trace per event to avoid mixing photons
+        for i in range(self.batch_size):
+            mask = (evts == i)
+            if not mask.any():
+                continue
+                
+            e_starts = starts[mask]
+            e_ends = ends[mask]
+            e_ps = ps[mask]
+            e_Es = Es[mask]
+            
+            self.cherenkov_photons_by_event[i] = compute_cherenkov_pool_gpu(
+                e_starts[:, 0], e_starts[:, 1], e_starts[:, 2],
+                e_ends[:, 0], e_ends[:, 1], e_ends[:, 2],
+                e_ps[:, 0], e_ps[:, 1], e_ps[:, 2],
+                e_Es, self.photon_yield_factor
+            )
 
-    def get_cherenkov_dataframe(self):
-        if len(self.cherenkov_photons.get('x_ground', [])) == 0:
+    def get_cherenkov_dataframe(self, event_idx=0):
+        photons = self.cherenkov_photons_by_event.get(event_idx, {'x_ground': []})
+        if len(photons.get('x_ground', [])) == 0:
             return pd.DataFrame(columns=['x', 'y'])
             
-        n_tot = len(self.cherenkov_photons['x_ground'])
+        n_tot = len(photons['x_ground'])
         max_plot = 10000
         if n_tot > max_plot:
             indices = np.random.choice(n_tot, max_plot, replace=False)
@@ -323,15 +351,15 @@ class ShowerSimulation:
             indices = np.arange(n_tot)
             
         data = {
-            'x': self.cherenkov_photons['x_ground'][indices],
-            'y': self.cherenkov_photons['y_ground'][indices]
+            'x': photons['x_ground'][indices],
+            'y': photons['y_ground'][indices]
         }
         return pd.DataFrame(data)
 
     def get_tracks_dataframe(self):
         # We omitted storing full tracks to save VRAM. Return empty.
-        return pd.DataFrame(columns=['particle_id', 'pid', 'energy', 'generation', 'x', 'y', 'z'])
+        return pd.DataFrame(columns=['particle_id', 'pid', 'energy', 'generation', 'x', 'y', 'z', 'event_id'])
 
 if __name__ == "__main__":
-    sim = ShowerSimulation('gamma', energy=100.0)
+    sim = ShowerSimulation(['gamma', 'proton'], energies=[100.0, 500.0])
     sim.run(max_generations=12)

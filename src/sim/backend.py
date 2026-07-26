@@ -287,7 +287,7 @@ def _cherenkov_torch(seg_x1, seg_y1, seg_z1,
         ye_v = ye[valid_photon]
         ze_v = ze[valid_photon]
 
-        # Transfer to CPU and append
+        # Transfer to CPU and append to prevent VRAM overflow (OOM paging)
         result_xe.append(xe_v.cpu().numpy())
         result_ye.append(ye_v.cpu().numpy())
         result_ze.append(ze_v.cpu().numpy())
@@ -465,83 +465,123 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
 def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                       x_tel, y_tel, z_tel, mirror_radius,
                       mirror_reflectivity, quantum_efficiency, device):
-    """Ray-tracing using torch.cdist for GPU-accelerated nearest-neighbor."""
+    """Ray-tracing using O(1) vectorized hexagonal binning for GPU, chunked to save VRAM."""
     
     n_pixels = len(pixel_x)
+    total_photons = len(cherenkov_photons['x_ground'])
     
-    xg = torch.tensor(cherenkov_photons['x_ground'], dtype=torch.float64, device=device)
-    yg = torch.tensor(cherenkov_photons['y_ground'], dtype=torch.float64, device=device)
-    xe = torch.tensor(cherenkov_photons['x_emit'], dtype=torch.float64, device=device)
-    ye = torch.tensor(cherenkov_photons['y_emit'], dtype=torch.float64, device=device)
-    ze = torch.tensor(cherenkov_photons['z_emit'], dtype=torch.float64, device=device)
+    # Precompute lookup table for mapping (q, r) to pixel index
+    n_rings = int((n_pixels / 3)**0.5) + 2 
+    grid_size = 2 * n_rings + 1
+    lookup = torch.full((grid_size, grid_size), -1, dtype=torch.int64, device=device)
     
-    # Project to z_tel
-    frac = (z_tel - ze) / (-ze)
-    x_hit = xe + frac * (xg - xe)
-    y_hit = ye + frac * (yg - ye)
+    idx = 0
+    for q in range(-n_rings, n_rings + 1):
+        for r in range(-n_rings, n_rings + 1):
+            if -n_rings <= q + r <= n_rings:
+                if idx < n_pixels:
+                    lookup[q + n_rings, r + n_rings] = idx
+                idx += 1
+                
+    total_signal = np.zeros(n_pixels, dtype=np.float64)
+    chunk_size = 5_000_000
     
-    # Mirror hit test
-    dist_sq = (x_hit - x_tel)**2 + (y_hit - y_tel)**2
-    hit_mask = dist_sq <= mirror_radius**2
+    step = pixel_size
+    height = (3**0.5) / 2.0 * step
     
-    if not torch.any(hit_mask):
-        return np.zeros(n_pixels)
-    
-    xe = xe[hit_mask]
-    ye = ye[hit_mask]
-    ze = ze[hit_mask]
-    x_hit = x_hit[hit_mask]
-    y_hit = y_hit[hit_mask]
-    
-    # Survival filter (mirror reflectivity * quantum efficiency)
-    survival_prob = mirror_reflectivity * quantum_efficiency
-    survived = torch.rand(x_hit.shape[0], device=device) < survival_prob
-    
-    if not torch.any(survived):
-        return np.zeros(n_pixels)
-    
-    xe = xe[survived]
-    ye = ye[survived]
-    ze = ze[survived]
-    x_hit = x_hit[survived]
-    y_hit = y_hit[survived]
-    
-    # Project to focal plane
-    dx = x_hit - xe
-    dy = y_hit - ye
-    dz = z_tel - ze
-    
-    u_deg = torch.rad2deg(torch.atan2(-dx, -dz))
-    v_deg = torch.rad2deg(torch.atan2(-dy, -dz))
-    
-    # GPU nearest-neighbor via torch.cdist
-    # Process in chunks to avoid OOM on large photon counts
-    pix_coords = torch.tensor(np.column_stack((pixel_x, pixel_y)),
-                               dtype=torch.float64, device=device)  # (n_pixels, 2)
-    
-    signal = torch.zeros(n_pixels, dtype=torch.float64, device=device)
-    
-    chunk_size = 500_000  # Process photons in chunks to limit GPU memory
-    n_photons = u_deg.shape[0]
-    
-    for start in range(0, n_photons, chunk_size):
-        end = min(start + chunk_size, n_photons)
-        photon_coords = torch.stack((u_deg[start:end], v_deg[start:end]), dim=1)  # (chunk, 2)
+    for start in range(0, total_photons, chunk_size):
+        end = min(start + chunk_size, total_photons)
         
-        # cdist: (chunk, n_pixels) distance matrix
-        dists = torch.cdist(photon_coords, pix_coords)  # (chunk, n_pixels)
+        # Load chunk to GPU
+        xg = torch.tensor(cherenkov_photons['x_ground'][start:end], dtype=torch.float32, device=device)
+        yg = torch.tensor(cherenkov_photons['y_ground'][start:end], dtype=torch.float32, device=device)
+        xe = torch.tensor(cherenkov_photons['x_emit'][start:end], dtype=torch.float32, device=device)
+        ye = torch.tensor(cherenkov_photons['y_emit'][start:end], dtype=torch.float32, device=device)
+        ze = torch.tensor(cherenkov_photons['z_emit'][start:end], dtype=torch.float32, device=device)
         
-        # Find nearest pixel for each photon
-        min_dists, min_indices = torch.min(dists, dim=1)  # (chunk,)
+        # Project to z_tel
+        frac = (z_tel - ze) / (-ze)
+        x_hit = xe + frac * (xg - xe)
+        y_hit = ye + frac * (yg - ye)
         
-        # Filter by pixel acceptance radius
-        valid = min_dists < (pixel_size / 2.0)
-        valid_indices = min_indices[valid]
+        # Mirror hit test
+        dist_sq = (x_hit - x_tel)**2 + (y_hit - y_tel)**2
+        hit_mask = dist_sq <= mirror_radius**2
         
-        # Bin into pixels
-        signal.scatter_add_(0, valid_indices, torch.ones_like(valid_indices, dtype=torch.float64))
-    
-    return signal.cpu().numpy()
+        if not torch.any(hit_mask):
+            continue
+            
+        xe = xe[hit_mask]
+        ye = ye[hit_mask]
+        ze = ze[hit_mask]
+        x_hit = x_hit[hit_mask]
+        y_hit = y_hit[hit_mask]
+        
+        # Survival filter
+        survival_prob = mirror_reflectivity * quantum_efficiency
+        survived = torch.rand(x_hit.shape[0], device=device) < survival_prob
+        
+        if not torch.any(survived):
+            continue
+            
+        xe = xe[survived]
+        ye = ye[survived]
+        ze = ze[survived]
+        x_hit = x_hit[survived]
+        y_hit = y_hit[survived]
+        
+        # Project to focal plane
+        dx = x_hit - xe
+        dy = y_hit - ye
+        dz = z_tel - ze
+        
+        u_deg = torch.rad2deg(torch.atan2(-dx, -dz))
+        v_deg = torch.rad2deg(torch.atan2(-dy, -dz))
+        
+        r_float = v_deg / height
+        q_float = (u_deg / step) - (r_float / 2.0)
+        
+        x = q_float
+        z = r_float
+        y = -x - z
+        
+        rx = torch.round(x)
+        ry = torch.round(y)
+        rz = torch.round(z)
+        
+        x_diff = torch.abs(rx - x)
+        y_diff = torch.abs(ry - y)
+        z_diff = torch.abs(rz - z)
+        
+        mask_x = (x_diff > y_diff) & (x_diff > z_diff)
+        mask_y = (~mask_x) & (y_diff > z_diff)
+        mask_z = ~(mask_x | mask_y)
+        
+        rx = torch.where(mask_x, -ry - rz, rx)
+        ry = torch.where(mask_y, -rx - rz, ry)
+        rz = torch.where(mask_z, -rx - ry, rz)
+        
+        q_int = rx.to(torch.int32)
+        r_int = rz.to(torch.int32)
+        
+        valid = (q_int >= -n_rings) & (q_int <= n_rings) & \
+                (r_int >= -n_rings) & (r_int <= n_rings) & \
+                ((q_int + r_int) >= -n_rings) & ((q_int + r_int) <= n_rings)
+                
+        q_valid = q_int[valid]
+        r_valid = r_int[valid]
+        
+        if q_valid.shape[0] == 0:
+            continue
+            
+        pixel_indices = lookup[q_valid + n_rings, r_valid + n_rings]
+        valid_idx = pixel_indices >= 0
+        pixel_indices = pixel_indices[valid_idx]
+        
+        signal = torch.bincount(pixel_indices, minlength=n_pixels)
+        total_signal += signal.cpu().numpy()
+        
+    return total_signal
 
 
 def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
