@@ -7,54 +7,46 @@ import torch.optim as optim
 from torch_geometric.data import Data, DataLoader
 from torch_geometric.nn import radius_graph
 from recon.gnn import HexCameraGNN
+from analysis.dataset import CherenkovDataset
 import numpy as np
 
-def create_edge_index(pixel_x, pixel_y, radius=0.105):
-    """Create edge_index for the hexagonal camera grid without relying on pyg-lib."""
-    pos = torch.stack([pixel_x, pixel_y], dim=1)
-    # Compute pairwise distances
-    dist = torch.cdist(pos, pos)
-    # Connect nodes within `radius` (excluding self loops if dist > 0)
-    # Due to floating point errors, dist to self is 0
-    adj_matrix = (dist > 0.01) & (dist < radius)
-    edge_index = adj_matrix.nonzero(as_tuple=False).t().contiguous()
-    return edge_index
-
-def prepare_dataset(data_path):
-    dataset_raw = torch.load(data_path, weights_only=False)
-    images = dataset_raw['images'] # [N, num_pixels]
-    energies = dataset_raw['energies'] # [N]
-    labels = dataset_raw['labels'] # [N]
-    
-    pixel_x = dataset_raw['pixel_x']
-    pixel_y = dataset_raw['pixel_y']
-    
-    edge_index = create_edge_index(pixel_x, pixel_y)
-    
-    data_list = []
-    for i in range(len(images)):
-        # Node features: just the pixel amplitude, shape [num_pixels, 1]
-        # We should normalize the image? Clamp to 0 to remove negative electronic noise, then log10
-        img_clamped = torch.clamp(images[i], min=0.0)
-        x = torch.log10(img_clamped.unsqueeze(1) + 1.0)
-        
-        y_energy = torch.log10(energies[i]).unsqueeze(0)
-        y_class = labels[i].float().unsqueeze(0)
-        
-        data = Data(x=x, edge_index=edge_index, y_energy=y_energy, y_class=y_class)
-        data_list.append(data)
-        
-    return data_list
-
 def train_gnn():
-    print("Loading dataset...")
-    data_list = prepare_dataset('data/train_events.pt')
+    print("Loading dataset from data/...")
+    
+    # Generate the edge index for the hexagonal camera grid
+    from sim.camera import Camera
+    cam = Camera()
+    pixel_x, pixel_y = cam.pixel_x, cam.pixel_y
+    pos = torch.stack([torch.tensor(pixel_x, dtype=torch.float32), 
+                       torch.tensor(pixel_y, dtype=torch.float32)], dim=1)
+    
+    dist = torch.cdist(pos, pos)
+    adj_matrix = (dist > 0.01) & (dist < 0.105)
+    edge_index = adj_matrix.nonzero(as_tuple=False).t().contiguous()
+    
+    # Pre-transform to attach edge_index to every Data object
+    import torch_geometric.transforms as T
+    
+    class AddEdgeIndex(object):
+        def __init__(self, edge_idx):
+            self.edge_idx = edge_idx
+        def __call__(self, data):
+            data.edge_index = self.edge_idx
+            return data
+            
+    dataset = CherenkovDataset(root='data', pre_transform=AddEdgeIndex(edge_index))
+    
+    print(f"Dataset loaded with {len(dataset)} events.")
+    
+    if len(dataset) == 0:
+        print("No events found in 'data/raw/'. Please run the simulator first.")
+        return
     
     # Split train/val
-    np.random.shuffle(data_list)
-    split = int(0.8 * len(data_list))
-    train_data = data_list[:split]
-    val_data = data_list[split:]
+    dataset = dataset.shuffle()
+    split = int(0.8 * len(dataset))
+    train_data = dataset[:split]
+    val_data = dataset[split:]
     
     train_loader = DataLoader(train_data, batch_size=16, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=16, shuffle=False)

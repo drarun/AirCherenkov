@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Generator
 import torch
 
+import numpy as np
 class BaseDataReader(ABC):
     """
     Unified abstract interface for reading IACT raw data formats 
@@ -59,3 +60,71 @@ class TraceProcessor:
         timing = cleaned_traces.argmax(dim=1).float()
         
         return {"charge": charge, "timing": timing}
+
+class VBFReader(BaseDataReader):
+    """
+    Reader for proprietary VERITAS Bank Format (.vbf) files.
+    This relies on the pyvbf library (C++ bindings).
+    """
+    def __init__(self, file_path: str, device: torch.device = None, **kwargs):
+        super().__init__(file_path, device, **kwargs)
+        try:
+            import pyvbf
+            self.vbf_file = pyvbf.VBFArchive(self.file_path)
+        except ImportError:
+            self.vbf_file = None
+            print("Warning: pyvbf not installed. VBFReader will yield empty events.")
+        
+    def read_event(self) -> Generator[Dict[str, Any], None, None]:
+        if self.vbf_file is None:
+            yield {}
+            return
+            
+        for event in self.vbf_file.events():
+            # Get raw traces: shape (num_pixels, num_samples)
+            traces = np.array(event.get_fadc_traces(), dtype=np.float32)
+            fadc = torch.tensor(traces, device=self.device)
+            
+            pixel_ids = torch.tensor(event.get_pixel_ids(), device=self.device)
+            
+            metadata = {
+                "event_id": event.get_event_number(),
+                "timestamp": event.get_timestamp(),
+                "telescope_id": event.get_telescope_id()
+            }
+            yield {"fadc_traces": fadc, "pixel_ids": pixel_ids, "event_metadata": metadata}
+
+class HDF5Reader(BaseDataReader):
+    """
+    Reader for standardized HDF5 files (e.g., CTA DL0/DL1 data).
+    Utilizes h5py for chunked, fast reading.
+    """
+    def __init__(self, file_path: str, device: torch.device = None, **kwargs):
+        super().__init__(file_path, device, **kwargs)
+        try:
+            import h5py
+            self.h5_file = h5py.File(self.file_path, 'r')
+        except ImportError:
+            self.h5_file = None
+            print("Warning: h5py not installed. HDF5Reader will yield empty events.")
+        
+    def read_event(self) -> Generator[Dict[str, Any], None, None]:
+        if self.h5_file is None:
+            yield {}
+            return
+            
+        # Assuming typical CTA DL0 structure: /dl0/event/telescope/waveform/tel_001
+        events = self.h5_file.get('dl0/event/telescope/waveform/tel_001', None)
+        if events is None:
+            yield {}
+            return
+            
+        for i in range(events.shape[0]):
+            waveform = events[i]['waveform'] # (num_pixels, num_samples)
+            fadc = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            
+            metadata = {
+                "event_id": events[i]['event_id'],
+                "obs_id": events[i]['obs_id']
+            }
+            yield {"fadc_traces": fadc, "event_metadata": metadata}
