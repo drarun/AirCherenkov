@@ -6,3 +6,5 @@ plotly
 pandas
 pytest
 tqdm
+
+torch
