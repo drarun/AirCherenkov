@@ -191,4 +191,5 @@ def generate_dataset_batched(num_events, filename_prefix, batch_size=100, e_min=
 
 if __name__ == '__main__':
     os.makedirs('data', exist_ok=True)
-    generate_dataset_batched(100, 'data/train_events', batch_size=50)
+    # Massive overnight run
+    generate_dataset_batched(1_000_000, 'data/train_events', batch_size=500)
