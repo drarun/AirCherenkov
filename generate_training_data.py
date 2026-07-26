@@ -5,8 +5,11 @@ import time
 import numpy as np
 import torch
 import multiprocessing
+import glob
+from tqdm import tqdm
+import multiprocessing
 from sim.shower import ShowerSimulation
-from sim.telescope import Telescope
+from sim.telescope import Telescope, TelescopeArray
 from sim.backend import compute_cherenkov_pool_gpu
 
 def simulate_shower_cpu(args):
@@ -88,10 +91,27 @@ def simulate_shower_cpu(args):
     }
 
 def generate_dataset_batched(num_events, filename_prefix, batch_size=100, e_min=100.0, e_max=10000.0):
-    print(f"Generating {num_events} events for {filename_prefix} in batches of {batch_size}...")
     
-    tel = Telescope(x_tel=0.0, y_tel=0.0)
-    tasks = [(i, e_min, e_max) for i in range(num_events)]
+    # --- Resume Logic ---
+    existing_batches = glob.glob(f"{filename_prefix}_batch*.pt")
+    start_batch_idx = 0
+    if existing_batches:
+        # Extract batch indices
+        indices = [int(f.split('_batch')[-1].split('.pt')[0]) for f in existing_batches]
+        start_batch_idx = max(indices) + 1
+        print(f"Found {len(existing_batches)} existing batches. Resuming from batch {start_batch_idx}...")
+    else:
+        print(f"Generating {num_events} events for {filename_prefix} in batches of {batch_size}...")
+        
+    array = TelescopeArray.veritas_array()
+    
+    # Offset the total events and tasks based on where we are starting
+    events_to_generate = num_events - (start_batch_idx * batch_size)
+    if events_to_generate <= 0:
+        print("All requested events have already been generated!")
+        return
+        
+    tasks = [(i, e_min, e_max) for i in range(events_to_generate)]
     
     t0 = time.time()
     
@@ -101,15 +121,16 @@ def generate_dataset_batched(num_events, filename_prefix, batch_size=100, e_min=
     total_passing = 0
     
     with multiprocessing.Pool(processes=num_cores) as pool:
-        for batch_idx, i in enumerate(range(0, num_events, batch_size)):
+        batch_generator = range(0, events_to_generate, batch_size)
+        # Add tqdm progress bar over the remaining batches
+        for local_batch_idx, i in tqdm(enumerate(batch_generator), total=len(batch_generator), desc="Batches"):
+            global_batch_idx = start_batch_idx + local_batch_idx
             batch_tasks = tasks[i:i+batch_size]
             
             # 1. CPU Phase: cascade generation in parallel
-            print(f"  Batch {batch_idx+1}: Processing {len(batch_tasks)} cascades on CPU...")
             results = pool.map(simulate_shower_cpu, batch_tasks)
             
             # 2. GPU Phase: run Cherenkov & ray trace sequentially on the main thread for the batch
-            print(f"  Batch {batch_idx+1}: Running Cherenkov & Ray Tracing on GPU...")
             
             images = []
             energies = []
@@ -128,15 +149,24 @@ def generate_dataset_batched(num_events, filename_prefix, batch_size=100, e_min=
                     seg_px, seg_py, seg_pz, seg_energy, pyf
                 )
                 
-                tel.x_tel = -res['ix']
-                tel.y_tel = -res['iy']
+                # Offset the array relative to the shower core
+                for tel in array.telescopes:
+                    tel.x_tel -= res['ix']
+                    tel.y_tel -= res['iy']
                 
-                img = tel.ray_trace(cherenkov_photons)
+                imgs = array.ray_trace(cherenkov_photons)
                 
-                if np.sum(img) < 20: # arbitrary minimum PE cut
+                # Restore the array positions
+                for tel in array.telescopes:
+                    tel.x_tel += res['ix']
+                    tel.y_tel += res['iy']
+                
+                # Stereo trigger condition: require at least 2 telescopes with > 20 PE
+                trigger_count = sum(1 for img in imgs if np.sum(img) > 20)
+                if trigger_count < 2:
                     continue
                     
-                images.append(img)
+                images.append(imgs)  # List of 4 images
                 energies.append(res['energy'])
                 labels.append(1 if res['is_gamma'] else 0)
                 impact_x.append(res['ix'])
@@ -144,23 +174,21 @@ def generate_dataset_batched(num_events, filename_prefix, batch_size=100, e_min=
             
             if len(images) > 0:
                 # Save batch file
-                out_filename = f"{filename_prefix}_batch{batch_idx}.pt"
+                out_filename = f"{filename_prefix}_batch{global_batch_idx}.pt"
                 torch.save({
                     'images': torch.tensor(np.array(images), dtype=torch.float32),
                     'energies': torch.tensor(energies, dtype=torch.float32),
                     'labels': torch.tensor(labels, dtype=torch.long),
                     'impact_x': torch.tensor(impact_x, dtype=torch.float32),
                     'impact_y': torch.tensor(impact_y, dtype=torch.float32),
-                    'pixel_x': torch.tensor(tel.camera.pixel_x, dtype=torch.float32),
-                    'pixel_y': torch.tensor(tel.camera.pixel_y, dtype=torch.float32)
+                    'pixel_x': torch.tensor(array.telescopes[0].camera.pixel_x, dtype=torch.float32),
+                    'pixel_y': torch.tensor(array.telescopes[0].camera.pixel_y, dtype=torch.float32)
                 }, out_filename)
                 
                 total_passing += len(images)
-                print(f"  Batch {batch_idx+1}: Saved {len(images)} passing events to {out_filename} ({(time.time()-t0)/60:.1f} min elapsed)")
     
     print(f"Finished generating. {total_passing} total events passed trigger.")
 
 if __name__ == '__main__':
     os.makedirs('data', exist_ok=True)
-    # Generate a small test set for now in batches
     generate_dataset_batched(100, 'data/train_events', batch_size=50)
