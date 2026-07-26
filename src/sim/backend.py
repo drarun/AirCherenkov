@@ -124,16 +124,16 @@ def _cherenkov_torch(seg_x1, seg_y1, seg_z1,
     MAX_TOTAL_PHOTONS = 50_000_000  # 50M photon budget (~1 GB total)
     
     # Compute segment properties on GPU (these are small — one per track segment)
-    x1 = torch.tensor(seg_x1, dtype=DTYPE, device=device)
-    y1 = torch.tensor(seg_y1, dtype=DTYPE, device=device)
-    z1 = torch.tensor(seg_z1, dtype=DTYPE, device=device)
-    x2 = torch.tensor(seg_x2, dtype=DTYPE, device=device)
-    y2 = torch.tensor(seg_y2, dtype=DTYPE, device=device)
-    z2 = torch.tensor(seg_z2, dtype=DTYPE, device=device)
-    px = torch.tensor(seg_px, dtype=DTYPE, device=device)
-    py = torch.tensor(seg_py, dtype=DTYPE, device=device)
-    pz = torch.tensor(seg_pz, dtype=DTYPE, device=device)
-    energies = torch.tensor(seg_energy, dtype=DTYPE, device=device)
+    x1 = torch.as_tensor(seg_x1, dtype=DTYPE, device=device)
+    y1 = torch.as_tensor(seg_y1, dtype=DTYPE, device=device)
+    z1 = torch.as_tensor(seg_z1, dtype=DTYPE, device=device)
+    x2 = torch.as_tensor(seg_x2, dtype=DTYPE, device=device)
+    y2 = torch.as_tensor(seg_y2, dtype=DTYPE, device=device)
+    z2 = torch.as_tensor(seg_z2, dtype=DTYPE, device=device)
+    px = torch.as_tensor(seg_px, dtype=DTYPE, device=device)
+    py = torch.as_tensor(seg_py, dtype=DTYPE, device=device)
+    pz = torch.as_tensor(seg_pz, dtype=DTYPE, device=device)
+    energies = torch.as_tensor(seg_energy, dtype=DTYPE, device=device)
 
     # Midpoints and segment lengths
     z_mid = (z1 + z2) / 2.0

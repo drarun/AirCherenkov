@@ -13,7 +13,14 @@ The project uses Python and can be run on Windows, Mac, or Linux.
 pip install -r requirements.txt
 ```
 
-> **Note on Hardware:** While the code can run on a CPU (falling back to NumPy/SciPy), simulating massive multi-telescope arrays (like CTA) with millions of photons requires a CUDA-enabled GPU to run efficiently. The backend (`src/sim/backend.py`) will automatically utilize PyTorch CUDA tensors and massive batched projections if a compatible GPU is detected.
+> **Note on Hardware:** The AirCherenkov simulation engine (`src/sim/shower.py` and `src/sim/backend.py`) has been completely refactored into a **fully tensorized PyTorch state machine**. It assumes a CUDA-enabled GPU to run efficiently, abandoning CPU-fallback in favor of massively parallel batch processing of physics interactions in VRAM.
+
+## Physics Overview
+AirCherenkov simulates the complex physics of extensive air showers and the resulting Cherenkov radiation:
+- **Particle Cascades**: Simulates electromagnetic (pair production, Bremsstrahlung) and hadronic (pion decay) interactions as primary cosmic rays strike the upper atmosphere.
+- **Atmospheric Optics**: Tracks the density-dependent Cherenkov emission threshold and the photon yield factor based on the Frank-Tamm formula.
+- **Multiple Coulomb Scattering**: Models Highland scattering using vectorized tensor cross-products to capture the lateral spread of the shower.
+- **Ray-Tracing**: Implements highly parallelized projections to trace emitted Cherenkov photons from the 3D shower track down to the focal plane of ground-based telescope arrays (like VERITAS or CTA).
 
 ## Pipeline Overview
 

@@ -1,15 +1,19 @@
 import numpy as np
-from sim.shower import ShowerSimulation, Particle
+import torch
+from sim.shower import ShowerSimulation
 
 def test_shower_initialization():
     sim = ShowerSimulation('gamma', energy=100.0)
     assert sim.primary_type == 'gamma'
     assert sim.energy == 100.0
-    assert len(sim.active_particles) == 1
-    assert sim.active_particles[0].pid == 'gamma'
-
-def test_particle_update():
-    p = Particle('e+', 10, 0, 0, 100, 0, 0, -1)
-    p.update_position(0, 0, -10, 0, 0, -1)
-    assert p.z == 90
-    assert len(p.track) == 2
+    assert sim.active.shape == (1, 9)
+    assert sim.active[0, 0].item() == sim.PID_MAP['gamma']
+    assert sim.active[0, 1].item() == 100.0
+    
+def test_tensor_step():
+    sim = ShowerSimulation('gamma', energy=100.0)
+    sim.step()
+    # After one generation, the gamma (if it survived) may have pair produced.
+    # We just want to ensure step runs without error and active particles tensor is updated.
+    assert isinstance(sim.active, torch.Tensor)
+    assert sim.active.shape[1] == 9

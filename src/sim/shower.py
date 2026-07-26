@@ -1,30 +1,12 @@
 import numpy as np
 import pandas as pd
-
-class Particle:
-    def __init__(self, pid, energy, x, y, z, px, py, pz, generation=0):
-        self.pid = pid  # 'gamma', 'e', 'proton', 'pi0', 'pi_charged', 'mu'
-        self.energy = energy
-        self.x = x
-        self.y = y
-        self.z = z
-        self.px = px
-        self.py = py
-        self.pz = pz
-        self.generation = generation
-        # To store the track for visualization
-        self.track = [(x, y, z, px, py, pz)]
-
-    def update_position(self, dx, dy, dz, px, py, pz):
-        self.x += dx
-        self.y += dy
-        self.z += dz
-        self.track.append((self.x, self.y, self.z, px, py, pz))
+import torch
+import time
 
 class ShowerSimulation:
     def __init__(self, primary_type='gamma', energy=1000.0, z_start=20000.0):
         """
-        A simplified 3D toy Monte Carlo for visualizing air showers.
+        A 3D toy Monte Carlo using fully tensorized PyTorch operations.
         Distances are in meters, Energy in GeV.
         """
         self.primary_type = primary_type
@@ -32,221 +14,278 @@ class ShowerSimulation:
         self.z_start = z_start
         
         self.critical_energy = 0.085 # 85 MeV
-        self.active_particles = []
-        self.dead_particles = []
+        self.photon_yield_factor = 1.0 
         
-        # Inject primary
-        self.active_particles.append(
-            Particle(pid=primary_type, energy=energy, 
-                     x=0, y=0, z=z_start, 
-                     px=0, py=0, pz=-1, generation=0)
-        )
-        self.all_particles = []
-        self.photon_yield_factor = 1.0 # Can be increased for realistic camera images
+        from sim.backend import get_device
+        self.device = get_device()
+        if self.device is None:
+            self.device = torch.device('cpu')
+            
+        # PIDs: gamma: 0, e+: 1, e-: 2, proton: 3, pi_charged: 4, pi0: 5, mu: 6
+        self.PID_MAP = {'gamma': 0, 'e+': 1, 'e-': 2, 'proton': 3, 'pi_charged': 4, 'pi0': 5, 'mu': 6}
+        self.INV_PID_MAP = {v: k for k, v in self.PID_MAP.items()}
+        
+        # State tensor [PID, E, x, y, z, px, py, pz, generation]
+        init_state = [self.PID_MAP[primary_type], energy, 0.0, 0.0, z_start, 0.0, 0.0, -1.0, 0.0]
+        self.active = torch.tensor([init_state], dtype=torch.float32, device=self.device)
+        
+        # Cherenkov segment accumulators (for zero-copy transfer to backend)
+        self.c_segs_start = []
+        self.c_segs_end = []
+        self.c_segs_p = []
+        self.c_segs_E = []
         self.cherenkov_photons = {
-            'x_emit': [], 'y_emit': [], 'z_emit': [],
-            'x_ground': [], 'y_ground': []
+            'x_emit': np.array([]), 'y_emit': np.array([]), 'z_emit': np.array([]),
+            'x_ground': np.array([]), 'y_ground': np.array([])
         }
 
-    def atmospheric_density(self, z):
-        """Returns density in g/cm^3 using the US Standard Atmosphere exponential model."""
-        rho_0 = 1.225e-3 # g/cm^3
-        H = 7640.0 # meters
-        return rho_0 * np.exp(-z / H)
+    def _atmospheric_density(self, z):
+        return 1.225e-3 * torch.exp(-z / 7640.0)
 
-    def grammage(self, z):
-        """Returns the column depth X in g/cm^2."""
-        rho_0 = 1.225e-3 # g/cm^3
-        H = 7640.0 # meters
-        H_cm = H * 100.0
-        return rho_0 * H_cm * np.exp(-z / H)
-
-    def mean_free_path(self, z, X_length):
-        """Returns the mean free path in meters for a given interaction length in g/cm^2."""
-        rho = self.atmospheric_density(z)
+    def _mean_free_path(self, z, X_length):
+        rho = self._atmospheric_density(z)
         return X_length / (rho * 100.0)
-
-    @staticmethod
-    def normalize_direction(px, py, pz):
-        norm = np.sqrt(px**2 + py**2 + pz**2)
-        if norm > 0:
-            return px/norm, py/norm, pz/norm
-        return px, py, pz
-
-    def apply_scattering(self, p, dist):
-        if p.pid not in ['e+', 'e-']:
-            return
-            
-        x_gcm2 = dist * self.atmospheric_density(p.z) * 100.0
-        if x_gcm2 <= 0:
-            return
-            
-        # Compute theta_rms using Highland formula
-        log_term = np.log(x_gcm2 / 36.62)
-        theta_rms = (0.0136 / p.energy) * np.sqrt(x_gcm2 / 36.62) * (1 + 0.038 * log_term)
         
-        # Clamp to a reasonable max (e.g. 0.3 radians) to avoid instabilities at low energy
-        theta_rms = max(0.0, min(theta_rms, 0.3))
-        if theta_rms == 0:
-            return
-
-        theta1 = np.random.normal(0, theta_rms)
-        theta2 = np.random.normal(0, theta_rms)
-
-        px, py, pz = p.px, p.py, p.pz
-        v = np.array([px, py, pz])
-        
-        # Use cross products with (0,0,1) or (1,0,0) to get two perpendicular unit vectors
-        if abs(pz) < 0.99:
-            ref = np.array([0, 0, 1])
-        else:
-            ref = np.array([1, 0, 0])
-            
-        e1 = np.cross(v, ref)
-        norm_e1 = np.linalg.norm(e1)
-        if norm_e1 > 0:
-            e1 = e1 / norm_e1
-        else:
-            e1 = np.array([1.0, 0.0, 0.0]) # Fallback
-            
-        e2 = np.cross(v, e1)
-        norm_e2 = np.linalg.norm(e2)
-        if norm_e2 > 0:
-            e2 = e2 / norm_e2
-        else:
-            e2 = np.array([0.0, 1.0, 0.0]) # Fallback
-            
-        p_new = v + theta1 * e1 + theta2 * e2
-        norm_p = np.linalg.norm(p_new)
-        if norm_p > 0:
-            p_new = p_new / norm_p
-            
-        p.px, p.py, p.pz = p_new[0], p_new[1], p_new[2]
+    def _norm_dir(self, px, py, pz):
+        norm = torch.sqrt(px**2 + py**2 + pz**2)
+        safe = norm > 0
+        return (torch.where(safe, px/norm, px),
+                torch.where(safe, py/norm, py),
+                torch.where(safe, pz/norm, pz))
 
     def step(self):
-        """Advance the simulation by one generation."""
+        """Advance the simulation by one generation using batched tensor ops."""
+        if self.active.shape[0] == 0:
+            return
+            
+        p = self.active
+        # Filter dead immediately
+        alive_mask = (p[:, 1] >= self.critical_energy) & (p[:, 4] > 0)
+        p = p[alive_mask]
+        if p.shape[0] == 0:
+            self.active = p
+            return
+
+        pid = p[:, 0].to(torch.int32)
+        E = p[:, 1]
+        x, y, z = p[:, 2], p[:, 3], p[:, 4]
+        px, py, pz = p[:, 5], p[:, 6], p[:, 7]
+        gen = p[:, 8]
+        N = p.shape[0]
+        dist = torch.zeros(N, device=self.device, dtype=torch.float32)
+        
+        # Mean free paths
+        mask_em = (pid == 0) | (pid == 1) | (pid == 2)
+        mask_had = (pid == 3) | (pid == 4)
+        mask_pi0 = (pid == 5)
+        mask_mu = (pid == 6)
+        
+        if mask_em.any():
+            dist[mask_em] = torch.empty(mask_em.sum(), device=self.device).exponential_() * self._mean_free_path(z[mask_em], 36.62)
+        if mask_had.any():
+            dist[mask_had] = torch.empty(mask_had.sum(), device=self.device).exponential_() * self._mean_free_path(z[mask_had], 90.0)
+        if mask_pi0.any():
+            dist[mask_pi0] = 10.0
+        if mask_mu.any():
+            dist[mask_mu] = 5000.0
+
+        # Highland Scattering
+        mask_e = (pid == 1) | (pid == 2)
+        if mask_e.any():
+            z_e = z[mask_e]
+            dist_e = dist[mask_e]
+            E_e = E[mask_e]
+            x_gcm2 = dist_e * self._atmospheric_density(z_e) * 100.0
+            
+            valid_scatter = x_gcm2 > 0
+            if valid_scatter.any():
+                idx_scatter = mask_e.nonzero(as_tuple=True)[0][valid_scatter]
+                x_g = x_gcm2[valid_scatter]
+                Ee = E_e[valid_scatter]
+                
+                log_term = torch.log(x_g / 36.62)
+                theta_rms = (0.0136 / Ee) * torch.sqrt(x_g / 36.62) * (1 + 0.038 * log_term)
+                theta_rms = torch.clamp(theta_rms, min=0.0, max=0.3)
+                
+                theta1 = torch.normal(mean=0.0, std=theta_rms)
+                theta2 = torch.normal(mean=0.0, std=theta_rms)
+                
+                v_x = px[idx_scatter]
+                v_y = py[idx_scatter]
+                v_z = pz[idx_scatter]
+                
+                ref_z_mask = torch.abs(v_z) < 0.99
+                ref_x = torch.where(ref_z_mask, 0.0, 1.0).to(self.device)
+                ref_y = torch.zeros_like(v_x)
+                ref_z = torch.where(ref_z_mask, 1.0, 0.0).to(self.device)
+                
+                e1_x = v_y * ref_z - v_z * ref_y
+                e1_y = v_z * ref_x - v_x * ref_z
+                e1_z = v_x * ref_y - v_y * ref_x
+                
+                norm_e1 = torch.sqrt(e1_x**2 + e1_y**2 + e1_z**2)
+                safe = norm_e1 > 0
+                e1_x = torch.where(safe, e1_x / norm_e1, 1.0).to(self.device)
+                e1_y = torch.where(safe, e1_y / norm_e1, 0.0).to(self.device)
+                e1_z = torch.where(safe, e1_z / norm_e1, 0.0).to(self.device)
+                
+                e2_x = v_y * e1_z - v_z * e1_y
+                e2_y = v_z * e1_x - v_x * e1_z
+                e2_z = v_x * e1_y - v_y * e1_x
+                
+                norm_e2 = torch.sqrt(e2_x**2 + e2_y**2 + e2_z**2)
+                safe = norm_e2 > 0
+                e2_x = torch.where(safe, e2_x / norm_e2, 0.0).to(self.device)
+                e2_y = torch.where(safe, e2_y / norm_e2, 1.0).to(self.device)
+                e2_z = torch.where(safe, e2_z / norm_e2, 0.0).to(self.device)
+                
+                p_new_x = v_x + theta1 * e1_x + theta2 * e2_x
+                p_new_y = v_y + theta1 * e1_y + theta2 * e2_y
+                p_new_z = v_z + theta1 * e1_z + theta2 * e2_z
+                
+                p_new_x, p_new_y, p_new_z = self._norm_dir(p_new_x, p_new_y, p_new_z)
+                px[idx_scatter] = p_new_x
+                py[idx_scatter] = p_new_y
+                pz[idx_scatter] = p_new_z
+
+        x_new = x + px * dist
+        y_new = y + py * dist
+        z_new = z + pz * dist
+        
+        # Ray Trace Cherenkov Segments
+        valid_z = (z_new > 0) & (z > 0)
+        c_mask = mask_e & valid_z
+        if c_mask.any():
+            self.c_segs_start.append(torch.stack([x[c_mask], y[c_mask], z[c_mask]], dim=1))
+            self.c_segs_end.append(torch.stack([x_new[c_mask], y_new[c_mask], z_new[c_mask]], dim=1))
+            self.c_segs_p.append(torch.stack([px[c_mask], py[c_mask], pz[c_mask]], dim=1))
+            self.c_segs_E.append(E[c_mask])
+            
+        z_new = torch.clamp(z_new, min=0.0)
+        
+        # Ionization
+        mask_ion = mask_e | (pid == 3) | (pid == 4)
+        if mask_ion.any():
+            x_gcm2 = dist[mask_ion] * self._atmospheric_density(z_new[mask_ion]) * 100.0
+            E[mask_ion] -= 0.0021 * x_gcm2
+            
+        # Re-filter alive
+        alive = (E >= self.critical_energy) & (z_new > 0)
+        idx_alive = alive.nonzero(as_tuple=True)[0]
         new_particles = []
         
-        for p in self.active_particles:
-            if p.energy < self.critical_energy or p.z <= 0:
-                self.dead_particles.append(p)
-                continue
-                
-            # Determine distance to next interaction
-            if p.pid in ['gamma', 'e+', 'e-']:
-                dist = np.random.exponential(self.mean_free_path(p.z, 36.62))
-            elif p.pid in ['proton', 'pi_charged']:
-                dist = np.random.exponential(self.mean_free_path(p.z, 90.0))
-            elif p.pid == 'pi0':
-                dist = 10.0 # Decays almost instantly
-            else: # muons don't interact much in this toy model
-                dist = 5000.0 
-                
-            # Apply Multiple Coulomb Scattering
-            self.apply_scattering(p, dist)
-                
-            # Update position
-            dx = p.px * dist
-            dy = p.py * dist
-            dz = p.pz * dist
-            p.update_position(dx, dy, dz, p.px, p.py, p.pz)
+        # 1. Gamma -> e+ e-
+        mask_g = (pid[idx_alive] == 0)
+        if mask_g.any():
+            idx_g = idx_alive[mask_g]
+            N_g = idx_g.shape[0]
+            u = torch.rand(N_g, device=self.device) * 0.8 + 0.1
+            e1_E = u * E[idx_g]
+            e2_E = (1 - u) * E[idx_g]
             
-            # Stop if it hit the ground
-            if p.z <= 0:
-                p.z = 0
-                self.dead_particles.append(p)
-                continue
+            phi = torch.rand(N_g, device=self.device) * 2 * np.pi
+            pt = 0.0005
+            px1, py1, pz1 = self._norm_dir(px[idx_g] + pt*torch.cos(phi), py[idx_g] + pt*torch.sin(phi), pz[idx_g])
+            px2, py2, pz2 = self._norm_dir(px[idx_g] - pt*torch.cos(phi), py[idx_g] - pt*torch.sin(phi), pz[idx_g])
+            
+            gen_new = gen[idx_g] + 1
+            x_g = x_new[idx_g]
+            y_g = y_new[idx_g]
+            z_g = z_new[idx_g]
+            
+            e1 = torch.stack([torch.full_like(e1_E, 1), e1_E, x_g, y_g, z_g, px1, py1, pz1, gen_new], dim=1)
+            e2 = torch.stack([torch.full_like(e2_E, 2), e2_E, x_g, y_g, z_g, px2, py2, pz2, gen_new], dim=1)
+            new_particles.extend([e1, e2])
+            
+        # 2. Bremsstrahlung
+        mask_b = (pid[idx_alive] == 1) | (pid[idx_alive] == 2)
+        if mask_b.any():
+            idx_b = idx_alive[mask_b]
+            N_b = idx_b.shape[0]
+            E_b = E[idx_b]
+            min_u = self.critical_energy / E_b
+            rand_val = torch.rand(N_b, device=self.device)
+            u = torch.pow(min_u, rand_val)
+            u = torch.max(min_u, u)
+            
+            g_E = u * E_b
+            e_E = (1 - u) * E_b
+            
+            phi = torch.rand(N_b, device=self.device) * 2 * np.pi
+            pt = 0.0005
+            px1, py1, pz1 = self._norm_dir(px[idx_b] - pt*torch.cos(phi), py[idx_b] - pt*torch.sin(phi), pz[idx_b])
+            px2, py2, pz2 = self._norm_dir(px[idx_b] + pt*torch.cos(phi), py[idx_b] + pt*torch.sin(phi), pz[idx_b])
+            
+            gen_new = gen[idx_b] + 1
+            x_b = x_new[idx_b]
+            y_b = y_new[idx_b]
+            z_b = z_new[idx_b]
+            
+            e_out = torch.stack([pid[idx_b].float(), e_E, x_b, y_b, z_b, px1, py1, pz1, gen_new], dim=1)
+            g_out = torch.stack([torch.full_like(g_E, 0), g_E, x_b, y_b, z_b, px2, py2, pz2, gen_new], dim=1)
+            new_particles.extend([e_out, g_out])
+
+        # 3. Hadronic
+        mask_h = (pid[idx_alive] == 3) | (pid[idx_alive] == 4)
+        if mask_h.any():
+            idx_h = idx_alive[mask_h]
+            N_h = idx_h.shape[0]
+            E_h = E[idx_h]
+            pt = 0.5 / E_h
+            e_split = E_h / 5.0
+            
+            gen_new = gen[idx_h] + 1
+            x_h = x_new[idx_h]
+            y_h = y_new[idx_h]
+            z_h = z_new[idx_h]
+            
+            for i in range(5):
+                phi = torch.rand(N_h, device=self.device) * 2 * np.pi
+                px_c, py_c, pz_c = self._norm_dir(px[idx_h] + pt*torch.cos(phi), py[idx_h] + pt*torch.sin(phi), pz[idx_h])
+                c_pid = 5 if i < 2 else 4
+                child = torch.stack([torch.full_like(e_split, c_pid), e_split, x_h, y_h, z_h, px_c, py_c, pz_c, gen_new], dim=1)
+                new_particles.append(child)
                 
-            # Ionization energy loss
-            if p.pid in ['e+', 'e-', 'proton', 'pi_charged']:
-                x_gcm2 = dist * self.atmospheric_density(p.z) * 100.0
-                dE = 0.0021 * x_gcm2
-                p.energy -= dE
-                if p.energy < self.critical_energy:
-                    self.dead_particles.append(p)
-                    continue
-                
-            # Interactions
-            if p.pid == 'gamma':
-                # Pair production: gamma -> e+ + e-
-                u = np.random.uniform(0.1, 0.9)
-                e_plus_energy = u * p.energy
-                e_minus_energy = (1 - u) * p.energy
-                
-                pt = 0.0005 
-                phi = np.random.uniform(0, 2*np.pi)
-                px1, py1, pz1 = self.normalize_direction(p.px + pt*np.cos(phi), p.py + pt*np.sin(phi), p.pz)
-                px2, py2, pz2 = self.normalize_direction(p.px - pt*np.cos(phi), p.py - pt*np.sin(phi), p.pz)
-                e1 = Particle('e+', e_plus_energy, p.x, p.y, p.z, px1, py1, pz1, p.generation+1)
-                e2 = Particle('e-', e_minus_energy, p.x, p.y, p.z, px2, py2, pz2, p.generation+1)
-                new_particles.extend([e1, e2])
-                self.dead_particles.append(p)
-                
-            elif p.pid in ['e+', 'e-']:
-                # Bremsstrahlung: e -> e + gamma
-                u = (self.critical_energy / p.energy) ** np.random.uniform()
-                u = max(self.critical_energy / p.energy, u)
-                gamma_energy = u * p.energy
-                e_energy = (1 - u) * p.energy
-                
-                pt = 0.0005
-                phi = np.random.uniform(0, 2*np.pi)
-                px1, py1, pz1 = self.normalize_direction(p.px - pt*np.cos(phi), p.py - pt*np.sin(phi), p.pz)
-                px2, py2, pz2 = self.normalize_direction(p.px + pt*np.cos(phi), p.py + pt*np.sin(phi), p.pz)
-                e_out = Particle(p.pid, e_energy, p.x, p.y, p.z, px1, py1, pz1, p.generation+1)
-                g_out = Particle('gamma', gamma_energy, p.x, p.y, p.z, px2, py2, pz2, p.generation+1)
-                new_particles.extend([e_out, g_out])
-                self.dead_particles.append(p)
-                
-            elif p.pid in ['proton', 'pi_charged']:
-                # Hadronic interaction -> 5 pions (2 pi0, 3 pi_charged) for toy model
-                # Larger transverse momentum
-                pt = 0.5 / p.energy 
-                
-                # Energy split roughly equally
-                e_split = p.energy / 5.0
-                
-                phis = np.random.uniform(0, 2*np.pi, 5)
-                
-                children = []
-                for i in range(5):
-                    px_c, py_c, pz_c = self.normalize_direction(p.px + pt*np.cos(phis[i]), p.py + pt*np.sin(phis[i]), p.pz)
-                    pid = 'pi0' if i < 2 else 'pi_charged'
-                    children.append(Particle(pid, e_split, p.x, p.y, p.z, px_c, py_c, pz_c, p.generation+1))
-                
-                new_particles.extend(children)
-                self.dead_particles.append(p)
-                
-            elif p.pid == 'pi0':
-                # pi0 -> 2 gamma
-                pt = 0.135 / p.energy # pi0 mass
-                phi = np.random.uniform(0, 2*np.pi)
-                px1, py1, pz1 = self.normalize_direction(p.px + pt*np.cos(phi), p.py + pt*np.sin(phi), p.pz)
-                px2, py2, pz2 = self.normalize_direction(p.px - pt*np.cos(phi), p.py - pt*np.sin(phi), p.pz)
-                g1 = Particle('gamma', p.energy/2, p.x, p.y, p.z, px1, py1, pz1, p.generation+1)
-                g2 = Particle('gamma', p.energy/2, p.x, p.y, p.z, px2, py2, pz2, p.generation+1)
-                new_particles.extend([g1, g2])
-                self.dead_particles.append(p)
-                
-        self.active_particles = new_particles
+        # 4. Pi0 -> 2 gamma
+        mask_p0 = (pid[idx_alive] == 5)
+        if mask_p0.any():
+            idx_p0 = idx_alive[mask_p0]
+            N_p0 = idx_p0.shape[0]
+            E_p0 = E[idx_p0]
+            pt = 0.135 / E_p0
+            phi = torch.rand(N_p0, device=self.device) * 2 * np.pi
+            
+            px1, py1, pz1 = self._norm_dir(px[idx_p0] + pt*torch.cos(phi), py[idx_p0] + pt*torch.sin(phi), pz[idx_p0])
+            px2, py2, pz2 = self._norm_dir(px[idx_p0] - pt*torch.cos(phi), py[idx_p0] - pt*torch.sin(phi), pz[idx_p0])
+            
+            gen_new = gen[idx_p0] + 1
+            x_p0 = x_new[idx_p0]
+            y_p0 = y_new[idx_p0]
+            z_p0 = z_new[idx_p0]
+            e_split = E_p0 / 2.0
+            
+            g1 = torch.stack([torch.full_like(e_split, 0), e_split, x_p0, y_p0, z_p0, px1, py1, pz1, gen_new], dim=1)
+            g2 = torch.stack([torch.full_like(e_split, 0), e_split, x_p0, y_p0, z_p0, px2, py2, pz2, gen_new], dim=1)
+            new_particles.extend([g1, g2])
+
+        if new_particles:
+            self.active = torch.cat(new_particles, dim=0)
+        else:
+            self.active = torch.empty((0, 9), device=self.device)
         
     def run(self, max_generations=12, verbose=True):
-        import time
         t0 = time.time()
         for gen in range(max_generations):
-            if not self.active_particles:
+            if self.active.shape[0] == 0:
                 break
-            n_active = len(self.active_particles)
+            n_active = self.active.shape[0]
             self.step()
             if verbose:
                 elapsed = time.time() - t0
                 print(f"      Gen {gen:2d}: {n_active:6d} active particles ({elapsed:.1f}s)")
         
-        # Collect all tracks
-        self.all_particles = self.dead_particles + self.active_particles
-        n_particles = len(self.all_particles)
         if verbose:
-            print(f"      Cascade complete: {n_particles} total particles ({time.time()-t0:.1f}s)")
+            print(f"      Cascade complete ({time.time()-t0:.1f}s)")
             print(f"      Computing Cherenkov pool on GPU...")
         t1 = time.time()
         self.calculate_cherenkov_pool()
@@ -255,66 +294,27 @@ class ShowerSimulation:
             print(f"      Cherenkov pool: {n_phot:,} photons ({time.time()-t1:.1f}s)")
 
     def calculate_cherenkov_pool(self):
-        """
-        Calculates the Cherenkov photons emitted by electrons and positrons
-        and traces them to the ground (z=0).
-        
-        Delegates the heavy computation to sim.backend, which uses
-        PyTorch CUDA when available, falling back to NumPy on CPU.
-        """
         from sim.backend import compute_cherenkov_pool_gpu
-
-        # Vectorized segment collection: extract all e+/e- tracks at once
-        # Each particle has a track [(x,y,z,px,py,pz), ...] — we need pairs of consecutive points
-        track_arrays = []
-        energy_counts = []
-        
-        for p in self.all_particles:
-            if p.pid not in ['e+', 'e-']:
-                continue
-            n_seg = len(p.track) - 1
-            if n_seg <= 0:
-                continue
-            # Convert track to numpy array: shape (n_points, 6)
-            arr = np.array(p.track)
-            track_arrays.append(arr)
-            energy_counts.append((p.energy, n_seg))
-        
-        if not track_arrays:
-            for key in self.cherenkov_photons:
-                self.cherenkov_photons[key] = np.array([])
+        if not self.c_segs_start:
             return
-
-        # Build segment arrays using numpy slicing (no inner for-loop)
-        all_starts = np.concatenate([arr[:-1] for arr in track_arrays])  # (N_segs, 6)
-        all_ends = np.concatenate([arr[1:] for arr in track_arrays])     # (N_segs, 6)
-        seg_energy = np.concatenate([np.full(n, e) for e, n in energy_counts])
+            
+        # Concat all segments on GPU directly
+        starts = torch.cat(self.c_segs_start, dim=0)
+        ends = torch.cat(self.c_segs_end, dim=0)
+        ps = torch.cat(self.c_segs_p, dim=0)
+        Es = torch.cat(self.c_segs_E, dim=0)
         
-        seg_x1 = all_starts[:, 0]
-        seg_y1 = all_starts[:, 1]
-        seg_z1 = all_starts[:, 2]
-        seg_x2 = all_ends[:, 0]
-        seg_y2 = all_ends[:, 1]
-        seg_z2 = all_ends[:, 2]
-        
-        seg_px = all_starts[:, 3]
-        seg_py = all_starts[:, 4]
-        seg_pz = all_starts[:, 5]
-
-        # Dispatch to GPU/CPU backend
         self.cherenkov_photons = compute_cherenkov_pool_gpu(
-            seg_x1, seg_y1, seg_z1,
-            seg_x2, seg_y2, seg_z2,
-            seg_px, seg_py, seg_pz,
-            seg_energy, self.photon_yield_factor
+            starts[:, 0], starts[:, 1], starts[:, 2],
+            ends[:, 0], ends[:, 1], ends[:, 2],
+            ps[:, 0], ps[:, 1], ps[:, 2],
+            Es, self.photon_yield_factor
         )
 
     def get_cherenkov_dataframe(self):
-        """Export Cherenkov ground photons for visualization (downsampled if huge)."""
-        if len(self.cherenkov_photons['x_ground']) == 0:
+        if len(self.cherenkov_photons.get('x_ground', [])) == 0:
             return pd.DataFrame(columns=['x', 'y'])
-        
-        # If there are millions of photons, downsample for Plotly visualization
+            
         n_tot = len(self.cherenkov_photons['x_ground'])
         max_plot = 10000
         if n_tot > max_plot:
@@ -329,24 +329,9 @@ class ShowerSimulation:
         return pd.DataFrame(data)
 
     def get_tracks_dataframe(self):
-        """Export tracks for visualization."""
-        data = []
-        for i, p in enumerate(self.all_particles):
-            for step_idx, (x, y, z, px_t, py_t, pz_t) in enumerate(p.track):
-                data.append({
-                    'particle_id': i,
-                    'pid': p.pid,
-                    'energy': p.energy,
-                    'generation': p.generation,
-                    'x': x,
-                    'y': y,
-                    'z': z
-                })
-        return pd.DataFrame(data)
+        # We omitted storing full tracks to save VRAM. Return empty.
+        return pd.DataFrame(columns=['particle_id', 'pid', 'energy', 'generation', 'x', 'y', 'z'])
 
 if __name__ == "__main__":
-    # Quick test
     sim = ShowerSimulation('gamma', energy=100.0)
-    sim.run(max_generations=5)
-    df = sim.get_tracks_dataframe()
-    print(f"Generated {len(sim.all_particles)} particles, {len(df)} track points.")
+    sim.run(max_generations=12)
