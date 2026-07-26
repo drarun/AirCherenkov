@@ -4,79 +4,163 @@ sys.path.insert(0, 'src')
 import time
 import numpy as np
 import torch
+import multiprocessing
 from sim.shower import ShowerSimulation
 from sim.telescope import Telescope
+from sim.backend import compute_cherenkov_pool_gpu
 
-def generate_dataset(num_events, filename, e_min=100.0, e_max=10000.0):
-    print(f"Generating {num_events} events for {filename}...")
+def simulate_shower_cpu(args):
+    """
+    Run the CPU-intensive cascade generation and return the 
+    segments needed for the GPU Cherenkov calculation.
+    """
+    event_id, e_min, e_max = args
     
-    # We will store the data in PyTorch tensors
-    images = []
-    energies = []
-    labels = []  # 1 for gamma, 0 for proton
-    impact_x = []
-    impact_y = []
+    # Sample particle type: 50% gamma, 50% proton
+    is_gamma = (np.random.rand() < 0.5)
+    pid = 'gamma' if is_gamma else 'proton'
     
-    tel = Telescope(x_tel=0.0, y_tel=0.0) # Telescope position can stay at 0, and we randomize impact
+    # Sample energy from power law E^-2
+    u = np.random.rand()
+    e_inv = (1.0/e_max) + u * ((1.0/e_min) - (1.0/e_max))
+    energy = 1.0 / e_inv
+    
+    # Sample impact parameter
+    r = np.sqrt(np.random.rand()) * 250.0
+    theta = np.random.rand() * 2 * np.pi
+    ix = r * np.cos(theta)
+    iy = r * np.sin(theta)
+    
+    # Run simulation (CPU part only)
+    sim = ShowerSimulation(pid, energy=energy)
+    
+    for gen in range(16):
+        if not sim.active_particles:
+            break
+        sim.step()
+        
+    sim.all_particles = sim.dead_particles + sim.active_particles
+    
+    # Extract tracks for Cherenkov pool calculation
+    track_arrays = []
+    energy_counts = []
+    for p in sim.all_particles:
+        if p.pid not in ['e+', 'e-']:
+            continue
+        n_seg = len(p.track) - 1
+        if n_seg <= 0:
+            continue
+        arr = np.array(p.track)
+        track_arrays.append(arr)
+        energy_counts.append((p.energy, n_seg))
+        
+    if not track_arrays:
+        return {
+            'empty': True,
+            'is_gamma': is_gamma,
+            'energy': energy,
+            'ix': ix,
+            'iy': iy
+        }
+        
+    all_starts = np.concatenate([arr[:-1] for arr in track_arrays])
+    all_ends = np.concatenate([arr[1:] for arr in track_arrays])
+    seg_energy = np.concatenate([np.full(n, e) for e, n in energy_counts])
+    
+    seg_x1 = all_starts[:, 0]
+    seg_y1 = all_starts[:, 1]
+    seg_z1 = all_starts[:, 2]
+    seg_x2 = all_ends[:, 0]
+    seg_y2 = all_ends[:, 1]
+    seg_z2 = all_ends[:, 2]
+    
+    seg_px = all_starts[:, 3]
+    seg_py = all_starts[:, 4]
+    seg_pz = all_starts[:, 5]
+
+    return {
+        'empty': False,
+        'is_gamma': is_gamma,
+        'energy': energy,
+        'ix': ix,
+        'iy': iy,
+        'segments': (seg_x1, seg_y1, seg_z1, seg_x2, seg_y2, seg_z2, seg_px, seg_py, seg_pz, seg_energy, sim.photon_yield_factor)
+    }
+
+def generate_dataset_batched(num_events, filename_prefix, batch_size=100, e_min=100.0, e_max=10000.0):
+    print(f"Generating {num_events} events for {filename_prefix} in batches of {batch_size}...")
+    
+    tel = Telescope(x_tel=0.0, y_tel=0.0)
+    tasks = [(i, e_min, e_max) for i in range(num_events)]
     
     t0 = time.time()
-    for i in range(num_events):
-        if i > 0 and i % 50 == 0:
-            print(f"  Generated {i}/{num_events} events ({(time.time()-t0)/60:.1f} min)")
-            
-        # Sample particle type: 50% gamma, 50% proton
-        is_gamma = (np.random.rand() < 0.5)
-        pid = 'gamma' if is_gamma else 'proton'
-        
-        # Sample energy from power law E^-2 (in linear space, sample uniform from E^-1)
-        # E = (E_max^-1 + u * (E_min^-1 - E_max^-1))^-1
-        u = np.random.rand()
-        e_inv = (1.0/e_max) + u * ((1.0/e_min) - (1.0/e_max))
-        energy = 1.0 / e_inv
-        
-        # Sample impact parameter (x, y) uniformly in area up to R=250m
-        r = np.sqrt(np.random.rand()) * 250.0
-        theta = np.random.rand() * 2 * np.pi
-        ix = r * np.cos(theta)
-        iy = r * np.sin(theta)
-        
-        # We simulate the shower at (0,0) and move the telescope to (-ix, -iy)
-        tel.x_tel = -ix
-        tel.y_tel = -iy
-        
-        # Run simulation
-        sim = ShowerSimulation(pid, energy=energy)
-        sim.run(max_generations=16, verbose=False)
-        sim.get_cherenkov_dataframe() # trigger cherenkov pool
-        
-        # Ray trace
-        img = tel.ray_trace(sim.cherenkov_photons)
-        
-        # Skip events that produce zero signal (below threshold)
-        if np.sum(img) < 20: # arbitrary minimum PE cut
-            continue
-            
-        images.append(img)
-        energies.append(energy)
-        labels.append(1 if is_gamma else 0)
-        impact_x.append(ix)
-        impact_y.append(iy)
-        
-    print(f"Finished generating {len(images)} events passing trigger.")
     
-    # Save dataset
-    torch.save({
-        'images': torch.tensor(np.array(images), dtype=torch.float32),
-        'energies': torch.tensor(energies, dtype=torch.float32),
-        'labels': torch.tensor(labels, dtype=torch.long),
-        'impact_x': torch.tensor(impact_x, dtype=torch.float32),
-        'impact_y': torch.tensor(impact_y, dtype=torch.float32),
-        'pixel_x': torch.tensor(tel.camera.pixel_x, dtype=torch.float32),
-        'pixel_y': torch.tensor(tel.camera.pixel_y, dtype=torch.float32)
-    }, filename)
-    print(f"Saved to {filename}")
+    # Use multiprocessing for CPU tracking, and main thread for GPU pool+raytracing
+    num_cores = max(1, multiprocessing.cpu_count() - 1)
+    
+    total_passing = 0
+    
+    with multiprocessing.Pool(processes=num_cores) as pool:
+        for batch_idx, i in enumerate(range(0, num_events, batch_size)):
+            batch_tasks = tasks[i:i+batch_size]
+            
+            # 1. CPU Phase: cascade generation in parallel
+            print(f"  Batch {batch_idx+1}: Processing {len(batch_tasks)} cascades on CPU...")
+            results = pool.map(simulate_shower_cpu, batch_tasks)
+            
+            # 2. GPU Phase: run Cherenkov & ray trace sequentially on the main thread for the batch
+            print(f"  Batch {batch_idx+1}: Running Cherenkov & Ray Tracing on GPU...")
+            
+            images = []
+            energies = []
+            labels = []
+            impact_x = []
+            impact_y = []
+            
+            for res in results:
+                if res['empty']:
+                    continue
+                
+                seg_x1, seg_y1, seg_z1, seg_x2, seg_y2, seg_z2, seg_px, seg_py, seg_pz, seg_energy, pyf = res['segments']
+                
+                cherenkov_photons = compute_cherenkov_pool_gpu(
+                    seg_x1, seg_y1, seg_z1, seg_x2, seg_y2, seg_z2, 
+                    seg_px, seg_py, seg_pz, seg_energy, pyf
+                )
+                
+                tel.x_tel = -res['ix']
+                tel.y_tel = -res['iy']
+                
+                img = tel.ray_trace(cherenkov_photons)
+                
+                if np.sum(img) < 20: # arbitrary minimum PE cut
+                    continue
+                    
+                images.append(img)
+                energies.append(res['energy'])
+                labels.append(1 if res['is_gamma'] else 0)
+                impact_x.append(res['ix'])
+                impact_y.append(res['iy'])
+            
+            if len(images) > 0:
+                # Save batch file
+                out_filename = f"{filename_prefix}_batch{batch_idx}.pt"
+                torch.save({
+                    'images': torch.tensor(np.array(images), dtype=torch.float32),
+                    'energies': torch.tensor(energies, dtype=torch.float32),
+                    'labels': torch.tensor(labels, dtype=torch.long),
+                    'impact_x': torch.tensor(impact_x, dtype=torch.float32),
+                    'impact_y': torch.tensor(impact_y, dtype=torch.float32),
+                    'pixel_x': torch.tensor(tel.camera.pixel_x, dtype=torch.float32),
+                    'pixel_y': torch.tensor(tel.camera.pixel_y, dtype=torch.float32)
+                }, out_filename)
+                
+                total_passing += len(images)
+                print(f"  Batch {batch_idx+1}: Saved {len(images)} passing events to {out_filename} ({(time.time()-t0)/60:.1f} min elapsed)")
+    
+    print(f"Finished generating. {total_passing} total events passed trigger.")
 
 if __name__ == '__main__':
     os.makedirs('data', exist_ok=True)
-    # Generate a small test set for now
-    generate_dataset(100, 'data/train_events.pt')
+    # Generate a small test set for now in batches
+    generate_dataset_batched(100, 'data/train_events', batch_size=50)
