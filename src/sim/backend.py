@@ -424,7 +424,7 @@ def _cherenkov_numpy(seg_x1, seg_y1, seg_z1,
 # ── Ray-tracing computation (GPU-accelerated pixel lookup) ────────────────────
 
 def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                  x_tel, y_tel, mirror_radius,
+                  x_tel, y_tel, z_tel, mirror_radius,
                   mirror_reflectivity, quantum_efficiency):
     """
     GPU-accelerated ray-tracing: projects photons to focal plane and bins
@@ -438,7 +438,7 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         Camera pixel positions in degrees.
     pixel_size : float
         Pixel diameter in degrees.
-    x_tel, y_tel : float
+    x_tel, y_tel, z_tel : float
         Telescope position on ground (meters).
     mirror_radius : float
         Mirror radius (meters).
@@ -454,16 +454,16 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     
     if not HAS_TORCH or device is None or device.type != 'cuda':
         return _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                                x_tel, y_tel, mirror_radius,
+                                x_tel, y_tel, z_tel, mirror_radius,
                                 mirror_reflectivity, quantum_efficiency)
     
     return _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                            x_tel, y_tel, mirror_radius,
+                            x_tel, y_tel, z_tel, mirror_radius,
                             mirror_reflectivity, quantum_efficiency, device)
 
 
 def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                      x_tel, y_tel, mirror_radius,
+                      x_tel, y_tel, z_tel, mirror_radius,
                       mirror_reflectivity, quantum_efficiency, device):
     """Ray-tracing using torch.cdist for GPU-accelerated nearest-neighbor."""
     
@@ -471,23 +471,31 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     
     xg = torch.tensor(cherenkov_photons['x_ground'], dtype=torch.float64, device=device)
     yg = torch.tensor(cherenkov_photons['y_ground'], dtype=torch.float64, device=device)
+    xe = torch.tensor(cherenkov_photons['x_emit'], dtype=torch.float64, device=device)
+    ye = torch.tensor(cherenkov_photons['y_emit'], dtype=torch.float64, device=device)
+    ze = torch.tensor(cherenkov_photons['z_emit'], dtype=torch.float64, device=device)
+    
+    # Project to z_tel
+    frac = (z_tel - ze) / (-ze)
+    x_hit = xe + frac * (xg - xe)
+    y_hit = ye + frac * (yg - ye)
     
     # Mirror hit test
-    dist_sq = (xg - x_tel)**2 + (yg - y_tel)**2
+    dist_sq = (x_hit - x_tel)**2 + (y_hit - y_tel)**2
     hit_mask = dist_sq <= mirror_radius**2
     
     if not torch.any(hit_mask):
         return np.zeros(n_pixels)
     
-    xe = torch.tensor(cherenkov_photons['x_emit'], dtype=torch.float64, device=device)[hit_mask]
-    ye = torch.tensor(cherenkov_photons['y_emit'], dtype=torch.float64, device=device)[hit_mask]
-    ze = torch.tensor(cherenkov_photons['z_emit'], dtype=torch.float64, device=device)[hit_mask]
-    xg_hit = xg[hit_mask]
-    yg_hit = yg[hit_mask]
+    xe = xe[hit_mask]
+    ye = ye[hit_mask]
+    ze = ze[hit_mask]
+    x_hit = x_hit[hit_mask]
+    y_hit = y_hit[hit_mask]
     
     # Survival filter (mirror reflectivity * quantum efficiency)
     survival_prob = mirror_reflectivity * quantum_efficiency
-    survived = torch.rand(xg_hit.shape[0], device=device) < survival_prob
+    survived = torch.rand(x_hit.shape[0], device=device) < survival_prob
     
     if not torch.any(survived):
         return np.zeros(n_pixels)
@@ -495,13 +503,13 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     xe = xe[survived]
     ye = ye[survived]
     ze = ze[survived]
-    xg_hit = xg_hit[survived]
-    yg_hit = yg_hit[survived]
+    x_hit = x_hit[survived]
+    y_hit = y_hit[survived]
     
     # Project to focal plane
-    dx = xg_hit - xe
-    dy = yg_hit - ye
-    dz = -ze
+    dx = x_hit - xe
+    dy = y_hit - ye
+    dz = z_tel - ze
     
     u_deg = torch.rad2deg(torch.atan2(-dx, -dz))
     v_deg = torch.rad2deg(torch.atan2(-dy, -dz))
@@ -537,7 +545,7 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
 
 
 def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                      x_tel, y_tel, mirror_radius,
+                      x_tel, y_tel, z_tel, mirror_radius,
                       mirror_reflectivity, quantum_efficiency):
     """Ray-tracing using scipy KDTree (CPU fallback)."""
     from scipy.spatial import KDTree
@@ -546,21 +554,28 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     
     xg = cherenkov_photons['x_ground']
     yg = cherenkov_photons['y_ground']
+    xe = cherenkov_photons['x_emit']
+    ye = cherenkov_photons['y_emit']
+    ze = cherenkov_photons['z_emit']
     
-    dist_to_center_sq = (xg - x_tel)**2 + (yg - y_tel)**2
+    frac = (z_tel - ze) / (-ze)
+    x_hit = xe + frac * (xg - xe)
+    y_hit = ye + frac * (yg - ye)
+    
+    dist_to_center_sq = (x_hit - x_tel)**2 + (y_hit - y_tel)**2
     hit_mask = dist_to_center_sq <= mirror_radius**2
     
     if not np.any(hit_mask):
         return np.zeros(n_pixels)
     
-    xe = cherenkov_photons['x_emit'][hit_mask]
-    ye = cherenkov_photons['y_emit'][hit_mask]
-    ze = cherenkov_photons['z_emit'][hit_mask]
-    xg_hit = xg[hit_mask]
-    yg_hit = yg[hit_mask]
+    xe = xe[hit_mask]
+    ye = ye[hit_mask]
+    ze = ze[hit_mask]
+    x_hit = x_hit[hit_mask]
+    y_hit = y_hit[hit_mask]
     
     survival_prob = mirror_reflectivity * quantum_efficiency
-    survived_mask = np.random.rand(len(xg_hit)) < survival_prob
+    survived_mask = np.random.rand(len(x_hit)) < survival_prob
     
     if not np.any(survived_mask):
         return np.zeros(n_pixels)
@@ -568,12 +583,12 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     xe = xe[survived_mask]
     ye = ye[survived_mask]
     ze = ze[survived_mask]
-    xg_hit = xg_hit[survived_mask]
-    yg_hit = yg_hit[survived_mask]
+    x_hit = x_hit[survived_mask]
+    y_hit = y_hit[survived_mask]
     
-    dx = xg_hit - xe
-    dy = yg_hit - ye
-    dz = -ze
+    dx = x_hit - xe
+    dy = y_hit - ye
+    dz = z_tel - ze
     
     u_deg = np.degrees(np.arctan2(-dx, -dz))
     v_deg = np.degrees(np.arctan2(-dy, -dz))

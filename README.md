@@ -13,6 +13,8 @@ The project uses Python and can be run on Windows, Mac, or Linux.
 pip install -r requirements.txt
 ```
 
+> **Note on Hardware:** While the code can run on a CPU (falling back to NumPy/SciPy), simulating massive multi-telescope arrays (like CTA) with millions of photons requires a CUDA-enabled GPU to run efficiently. The backend (`src/sim/backend.py`) will automatically utilize PyTorch CUDA tensors and massive batched projections if a compatible GPU is detected.
+
 ## Pipeline Overview
 
 The project provides an end-to-end pipeline from simulation to neural network-based and SBI-based event reconstruction.

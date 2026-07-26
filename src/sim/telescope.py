@@ -3,11 +3,12 @@ from sim.camera import Camera
 from sim.backend import ray_trace_gpu, device_info
 
 class Telescope:
-    def __init__(self, x_tel=0.0, y_tel=0.0, mirror_radius=6.0, focal_length=15.0, 
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, mirror_radius=6.0, focal_length=15.0, 
                  mirror_reflectivity=0.82, quantum_efficiency=0.20, pedestal_std=0.5,
                  n_rings=15, pixel_size=0.1):
         self.x_tel = x_tel
         self.y_tel = y_tel
+        self.z_tel = z_tel
         self.mirror_radius = mirror_radius
         self.focal_length = focal_length
         self.mirror_reflectivity = mirror_reflectivity
@@ -34,7 +35,7 @@ class Telescope:
         signal = ray_trace_gpu(
             cherenkov_photons,
             self.camera.pixel_x, self.camera.pixel_y, self.camera.pixel_size,
-            self.x_tel, self.y_tel, self.mirror_radius,
+            self.x_tel, self.y_tel, self.z_tel, self.mirror_radius,
             self.mirror_reflectivity, self.quantum_efficiency
         )
         
@@ -46,24 +47,24 @@ class Telescope:
         return image
 
 class VeritasTelescope(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0):
-        super().__init__(x_tel=x_tel, y_tel=y_tel, mirror_radius=6.0, focal_length=12.0, n_rings=12, pixel_size=0.1)
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):
+        super().__init__(x_tel=x_tel, y_tel=y_tel, z_tel=z_tel, mirror_radius=6.0, focal_length=12.0, n_rings=12, pixel_size=0.1)
 
 class HessTelescope(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0):
-        super().__init__(x_tel=x_tel, y_tel=y_tel, mirror_radius=6.0, focal_length=15.0, n_rings=16, pixel_size=0.1)
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):
+        super().__init__(x_tel=x_tel, y_tel=y_tel, z_tel=z_tel, mirror_radius=6.0, focal_length=15.0, n_rings=16, pixel_size=0.1)
 
 class CtaLST(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0):
-        super().__init__(x_tel=x_tel, y_tel=y_tel, mirror_radius=11.5, focal_length=28.0, n_rings=20, pixel_size=0.1)
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):
+        super().__init__(x_tel=x_tel, y_tel=y_tel, z_tel=z_tel, mirror_radius=11.5, focal_length=28.0, n_rings=20, pixel_size=0.1)
 
 class CtaMST(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0):
-        super().__init__(x_tel=x_tel, y_tel=y_tel, mirror_radius=6.0, focal_length=16.0, n_rings=15, pixel_size=0.1)
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):
+        super().__init__(x_tel=x_tel, y_tel=y_tel, z_tel=z_tel, mirror_radius=6.0, focal_length=16.0, n_rings=15, pixel_size=0.1)
 
 class CtaSST(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0):
-        super().__init__(x_tel=x_tel, y_tel=y_tel, mirror_radius=2.0, focal_length=2.2, n_rings=10, pixel_size=0.1)
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):
+        super().__init__(x_tel=x_tel, y_tel=y_tel, z_tel=z_tel, mirror_radius=2.0, focal_length=2.2, n_rings=10, pixel_size=0.1)
 
 class TelescopeArray:
     def __init__(self, telescopes):
