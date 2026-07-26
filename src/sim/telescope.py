@@ -1,6 +1,7 @@
 import numpy as np
 from sim.camera import Camera
 from sim.backend import ray_trace_gpu, device_info
+from sim.fadc import FADC
 
 class Telescope:
     def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, mirror_radius=6.0, focal_length=15.0, 
@@ -16,33 +17,28 @@ class Telescope:
         self.pedestal_std = pedestal_std
         
         self.camera = Camera(n_rings=n_rings, pixel_size=pixel_size)
+        self.fadc = FADC()
         
     def ray_trace(self, cherenkov_photons, nsb_rate=2.0):
         """
         Ray-trace Cherenkov photons through the telescope optics onto the camera.
         
         Uses GPU-accelerated pixel lookup (torch.cdist) when CUDA is available,
-        falling back to scipy KDTree on CPU.
+        falling back to scipy KDTree on CPU. FADC digitization is applied after.
         """
-        # Start with NSB (Night Sky Background)
-        image = np.random.poisson(lam=nsb_rate, size=self.camera.n_pixels).astype(float)
-        
         if len(cherenkov_photons['x_ground']) == 0:
-            image += np.random.normal(scale=self.pedestal_std, size=image.shape)
-            return image
+            signal = np.zeros(self.camera.n_pixels)
+        else:
+            # Dispatch signal computation to GPU/CPU backend
+            signal = ray_trace_gpu(
+                cherenkov_photons,
+                self.camera.pixel_x, self.camera.pixel_y, self.camera.pixel_size,
+                self.x_tel, self.y_tel, self.z_tel, self.mirror_radius,
+                self.mirror_reflectivity, self.quantum_efficiency
+            )
         
-        # Dispatch signal computation to GPU/CPU backend
-        signal = ray_trace_gpu(
-            cherenkov_photons,
-            self.camera.pixel_x, self.camera.pixel_y, self.camera.pixel_size,
-            self.x_tel, self.y_tel, self.z_tel, self.mirror_radius,
-            self.mirror_reflectivity, self.quantum_efficiency
-        )
-        
-        image += signal
-        
-        # Add electronic pedestal noise
-        image += np.random.normal(scale=self.pedestal_std, size=image.shape)
+        # Apply FADC digitization (NSB, PMT shaping, noise, conversion to ADC counts)
+        image = self.fadc.digitize_image(signal, nsb_rate, self.pedestal_std)
         
         return image
 
