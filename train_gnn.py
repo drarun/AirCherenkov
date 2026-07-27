@@ -4,18 +4,16 @@ sys.path.insert(0, 'src')
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch_geometric.data import Data, DataLoader
-from torch_geometric.nn import radius_graph
-from recon.gnn import HexCameraGNN
+from torch_geometric.data import DataLoader
+from recon.gnn import EnergyGNN, ClassGNN
 from analysis.dataset import CherenkovDataset
-import numpy as np
 
-def train_gnn():
-    print("Loading dataset from data/...")
+def train_networks():
+    print("Loading datasets...")
     
     # Generate the edge index for the hexagonal camera grid
     from sim.camera import Camera
-    cam = Camera()
+    cam = Camera(n_rings=12)
     pixel_x, pixel_y = cam.pixel_x, cam.pixel_y
     pos = torch.stack([torch.tensor(pixel_x, dtype=torch.float32), 
                        torch.tensor(pixel_y, dtype=torch.float32)], dim=1)
@@ -34,12 +32,11 @@ def train_gnn():
             data.edge_index = self.edge_idx
             return data
             
-    dataset = CherenkovDataset(root='data', pre_transform=AddEdgeIndex(edge_index))
-    
+    dataset = CherenkovDataset(root='data/train', pre_transform=AddEdgeIndex(edge_index))
     print(f"Dataset loaded with {len(dataset)} events.")
     
     if len(dataset) == 0:
-        print("No events found in 'data/raw/'. Please run the simulator first.")
+        print("No events found. Please run the simulator first.")
         return
     
     # Split train/val
@@ -48,44 +45,61 @@ def train_gnn():
     train_data = dataset[:split]
     val_data = dataset[split:]
     
-    train_loader = DataLoader(train_data, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=16, shuffle=False)
+    train_loader = DataLoader(train_data, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=128, shuffle=False)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = HexCameraGNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    # Loss functions
+    # Initialize the two independent networks
+    energy_model = EnergyGNN().to(device)
+    class_model = ClassGNN().to(device)
+    
+    opt_energy = optim.Adam(energy_model.parameters(), lr=0.001)
+    opt_class = optim.Adam(class_model.parameters(), lr=0.001)
+    
     criterion_energy = nn.MSELoss()
     criterion_class = nn.BCEWithLogitsLoss()
     
     epochs = 10
-    print(f"Training on {device} for {epochs} epochs...")
+    print(f"\nTraining on {device} for {epochs} epochs...")
+    
     for epoch in range(epochs):
-        model.train()
-        total_loss = 0
+        energy_model.train()
+        class_model.train()
+        
+        total_loss_e, total_loss_c = 0, 0
+        
         for batch in train_loader:
             batch = batch.to(device)
-            optimizer.zero_grad()
             
-            energy_pred, class_logits = model(batch.x, batch.edge_index, batch.batch)
-            
-            loss_e = criterion_energy(energy_pred.view(-1), batch.y_energy.view(-1))
+            # 1. Train Classification Model (on all events)
+            opt_class.zero_grad()
+            class_logits = class_model(batch.x, batch.edge_index, batch.batch)
             loss_c = criterion_class(class_logits.view(-1), batch.y_class.view(-1))
+            loss_c.backward()
+            torch.nn.utils.clip_grad_norm_(class_model.parameters(), max_norm=2.0)
+            opt_class.step()
+            total_loss_c += loss_c.item()
             
-            loss = loss_e + loss_c
-            loss.backward()
+            # 2. Train Energy Model (ONLY on Gamma events: y_class == 1)
+            gamma_mask = (batch.y_class.view(-1) == 1.0)
             
-            # Gradient clipping to prevent NaNs
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            if gamma_mask.any():
+                opt_energy.zero_grad()
+                # Re-run forward pass just to filter out protons from the loss
+                energy_pred = energy_model(batch.x, batch.edge_index, batch.batch)
+                
+                loss_e = criterion_energy(energy_pred.view(-1)[gamma_mask], batch.y_energy.view(-1)[gamma_mask])
+                loss_e.backward()
+                torch.nn.utils.clip_grad_norm_(energy_model.parameters(), max_norm=2.0)
+                opt_energy.step()
+                total_loss_e += loss_e.item()
             
-            optimizer.step()
-            total_loss += loss.item()
-            
-        print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{epochs} | Class Loss: {total_loss_c/len(train_loader):.4f} | Energy Loss: {total_loss_e/len(train_loader):.4f}")
         
-    print("Training complete! Model saved to data/gnn_model.pt")
-    torch.save(model.state_dict(), 'data/gnn_model.pt')
+    print("\nTraining complete! Saving models...")
+    torch.save(energy_model.state_dict(), 'data/energy_gnn.pt')
+    torch.save(class_model.state_dict(), 'data/class_gnn.pt')
 
 if __name__ == '__main__':
-    train_gnn()
+    train_networks()

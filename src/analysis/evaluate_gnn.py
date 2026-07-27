@@ -12,7 +12,7 @@ from sim.camera import Camera
 
 def evaluate_gnn():
     print("Setting up camera and edge index...")
-    cam = Camera()
+    cam = Camera(n_rings=12)
     pixel_x, pixel_y = cam.pixel_x, cam.pixel_y
     pos = torch.stack([torch.tensor(pixel_x, dtype=torch.float32), 
                        torch.tensor(pixel_y, dtype=torch.float32)], dim=1)

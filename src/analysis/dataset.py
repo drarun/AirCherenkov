@@ -113,16 +113,27 @@ class CherenkovDataset(InMemoryDataset):
                 elif isinstance(sim_data, list):
                     # New format from benchmark_sim.py
                     for evt in sim_data:
-                        # evt['images'] shape is (4 telescopes, 331 pixels). Let's sum them for now.
-                        img = torch.tensor(evt['images'], dtype=torch.float32).sum(dim=0)
-                        img_clamped = torch.clamp(img, min=0.0)
-                        x = torch.log10(img_clamped.unsqueeze(1) + 1.0)
+                        # evt['images'] shape is (4 telescopes, 469 pixels). 
+                        # We must NOT sum them, as that destroys stereoscopic spatial correlations.
+                        # Instead, we treat each telescope as a separate graph for the single-camera GNN.
+                        for tel_idx in range(len(evt['images'])):
+                            img = torch.tensor(evt['images'][tel_idx], dtype=torch.float32)
+                            
+                            # Only train on telescopes that actually triggered / saw the shower
+                            if torch.sum(img) > 20.0:
+                                img_clamped = torch.clamp(img, min=0.0)
+                                charge_feat = torch.log10(img_clamped + 1.0).unsqueeze(1)
+                                
+                                timing_arr = torch.tensor(evt['timing'][tel_idx], dtype=torch.float32)
+                                timing_feat = timing_arr.unsqueeze(1)
+                                
+                                x = torch.cat([charge_feat, timing_feat], dim=1)
                         
-                        y_e = torch.log10(torch.tensor([evt['energy']], dtype=torch.float32))
-                        y_c = torch.tensor([evt['label']], dtype=torch.float32)
-                        
-                        data = Data(x=x, y_energy=y_e, y_class=y_c)
-                        data_list.append(data)
+                                y_e = torch.log10(torch.tensor([evt['energy']], dtype=torch.float32))
+                                y_c = torch.tensor([evt['label']], dtype=torch.float32)
+                                
+                                data = Data(x=x, y_energy=y_e, y_class=y_c)
+                                data_list.append(data)
         
         if self.pre_transform is not None:
             data_list = [self.pre_transform(d) for d in data_list]

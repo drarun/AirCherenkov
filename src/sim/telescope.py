@@ -28,9 +28,10 @@ class Telescope:
         """
         if len(cherenkov_photons['x_ground']) == 0:
             signal = np.zeros(self.camera.n_pixels)
+            timing = np.zeros(self.camera.n_pixels)
         else:
             # Dispatch signal computation to GPU/CPU backend
-            signal = ray_trace_gpu(
+            signal, timing = ray_trace_gpu(
                 cherenkov_photons,
                 self.camera.pixel_x, self.camera.pixel_y, self.camera.pixel_size,
                 self.x_tel, self.y_tel, self.z_tel, self.mirror_radius,
@@ -40,7 +41,7 @@ class Telescope:
         # Apply FADC digitization (NSB, PMT shaping, noise, conversion to ADC counts)
         image = self.fadc.digitize_image(signal, nsb_rate, self.pedestal_std)
         
-        return image
+        return image, timing
 
 class VeritasTelescope(Telescope):
     def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):

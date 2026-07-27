@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, global_max_pool
 
 class EnergyGNN(torch.nn.Module):
-    def __init__(self, num_node_features=1, hidden_channels=32):
+    def __init__(self, num_node_features=2, hidden_channels=32):
         super(EnergyGNN, self).__init__()
         # Graph Attention Layers
         self.conv1 = GATConv(num_node_features, hidden_channels)
@@ -31,7 +31,7 @@ class EnergyGNN(torch.nn.Module):
         return self.energy_head(x)
 
 class ClassGNN(torch.nn.Module):
-    def __init__(self, num_node_features=1, hidden_channels=32):
+    def __init__(self, num_node_features=2, hidden_channels=32):
         super(ClassGNN, self).__init__()
         # Graph Attention Layers
         self.conv1 = GATConv(num_node_features, hidden_channels)

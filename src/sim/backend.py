@@ -449,6 +449,8 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     -------
     signal : numpy array of shape (n_pixels,)
         Number of photoelectrons per pixel (signal only, no noise).
+    timing : numpy array of shape (n_pixels,)
+        Average arrival time of photons in each pixel (in ns).
     """
     device = get_device()
     
@@ -484,6 +486,7 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                 idx += 1
                 
     total_signal = np.zeros(n_pixels, dtype=np.float64)
+    total_time = np.zeros(n_pixels, dtype=np.float64)
     chunk_size = 5_000_000
     
     step = pixel_size
@@ -517,6 +520,13 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         x_hit = x_hit[hit_mask]
         y_hit = y_hit[hit_mask]
         
+        # Compute Time of Flight
+        c_mns = 0.299792458
+        t_emit = (20000.0 - ze) / c_mns
+        dist_photon = torch.sqrt((x_hit - xe)**2 + (y_hit - ye)**2 + (z_tel - ze)**2)
+        v_photon = c_mns / 1.0003
+        t_ground = t_emit + dist_photon / v_photon
+        
         # Survival filter
         survival_prob = mirror_reflectivity * quantum_efficiency
         survived = torch.rand(x_hit.shape[0], device=device) < survival_prob
@@ -529,6 +539,7 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         ze = ze[survived]
         x_hit = x_hit[survived]
         y_hit = y_hit[survived]
+        t_ground = t_ground[survived]
         
         # Project to focal plane
         dx = x_hit - xe
@@ -577,11 +588,19 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         pixel_indices = lookup[q_valid + n_rings, r_valid + n_rings]
         valid_idx = pixel_indices >= 0
         pixel_indices = pixel_indices[valid_idx]
+        t_valid = t_ground[valid][valid_idx]
         
         signal = torch.bincount(pixel_indices, minlength=n_pixels)
-        total_signal += signal.cpu().numpy()
+        sum_t = torch.bincount(pixel_indices, weights=t_valid, minlength=n_pixels)
         
-    return total_signal
+        total_signal += signal.cpu().numpy()
+        total_time += sum_t.cpu().numpy()
+        
+    avg_time = np.zeros_like(total_signal)
+    mask = total_signal > 0
+    avg_time[mask] = total_time[mask] / total_signal[mask]
+        
+    return total_signal, avg_time
 
 
 def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
@@ -606,7 +625,7 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     hit_mask = dist_to_center_sq <= mirror_radius**2
     
     if not np.any(hit_mask):
-        return np.zeros(n_pixels)
+        return np.zeros(n_pixels), np.zeros(n_pixels)
     
     xe = xe[hit_mask]
     ye = ye[hit_mask]
@@ -618,7 +637,7 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     survived_mask = np.random.rand(len(x_hit)) < survival_prob
     
     if not np.any(survived_mask):
-        return np.zeros(n_pixels)
+        return np.zeros(n_pixels), np.zeros(n_pixels)
     
     xe = xe[survived_mask]
     ye = ye[survived_mask]
