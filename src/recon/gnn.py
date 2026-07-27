@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, global_max_pool
+from torch_geometric.nn import GATConv, global_max_pool, global_mean_pool
 
 class EnergyGNN(torch.nn.Module):
     def __init__(self, num_node_features=2, hidden_channels=32):
@@ -40,9 +40,9 @@ class ClassGNN(torch.nn.Module):
         
         # Gamma/Hadron Classification
         self.class_head = nn.Sequential(
-            nn.Linear(hidden_channels, 16),
+            nn.Linear(hidden_channels * 2, 32),
             nn.ReLU(),
-            nn.Linear(16, 1) # Logits for Binary Cross Entropy
+            nn.Linear(32, 1) # Logits for Binary Cross Entropy
         )
 
     def forward(self, x, edge_index, batch):
@@ -53,6 +53,10 @@ class ClassGNN(torch.nn.Module):
         x = self.conv3(x, edge_index)
         x = F.relu(x)
         
-        x = global_max_pool(x, batch)
+        # Use both mean and max pooling to capture both the peak intensity 
+        # and the overall spatial spread of the shower!
+        x_mean = global_mean_pool(x, batch)
+        x_max = global_max_pool(x, batch)
+        x = torch.cat([x_mean, x_max], dim=1)
         
         return self.class_head(x)

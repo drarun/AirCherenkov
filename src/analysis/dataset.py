@@ -125,6 +125,11 @@ class CherenkovDataset(InMemoryDataset):
                                 charge_feat = torch.log10(img_clamped + 1.0).unsqueeze(1)
                                 
                                 timing_arr = torch.tensor(evt['timing'][tel_idx], dtype=torch.float32)
+                                valid_timing = timing_arr > 0
+                                if valid_timing.any():
+                                    t_min = timing_arr[valid_timing].min()
+                                    timing_arr[valid_timing] = timing_arr[valid_timing] - t_min + 1.0
+                                
                                 timing_feat = timing_arr.unsqueeze(1)
                                 
                                 x = torch.cat([charge_feat, timing_feat], dim=1)
