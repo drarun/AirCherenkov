@@ -60,7 +60,7 @@ def train_networks():
     criterion_energy = nn.MSELoss()
     criterion_class = nn.BCEWithLogitsLoss()
     
-    epochs = 10
+    epochs = 25
     print(f"\nTraining on {device} for {epochs} epochs...")
     
     for epoch in range(epochs):

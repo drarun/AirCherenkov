@@ -4,12 +4,13 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, global_max_pool, global_mean_pool
 
 class EnergyGNN(torch.nn.Module):
-    def __init__(self, num_node_features=2, hidden_channels=32):
+    def __init__(self, num_node_features=4, hidden_channels=64):
         super(EnergyGNN, self).__init__()
         # Graph Attention Layers
         self.conv1 = GATConv(num_node_features, hidden_channels)
         self.conv2 = GATConv(hidden_channels, hidden_channels)
         self.conv3 = GATConv(hidden_channels, hidden_channels)
+        self.conv4 = GATConv(hidden_channels, hidden_channels)
         
         # Energy Regression (Log Energy)
         self.energy_head = nn.Sequential(
@@ -25,18 +26,21 @@ class EnergyGNN(torch.nn.Module):
         x = F.relu(x)
         x = self.conv3(x, edge_index)
         x = F.relu(x)
+        x = self.conv4(x, edge_index)
+        x = F.relu(x)
         
         x = global_max_pool(x, batch)
         
         return self.energy_head(x)
 
 class ClassGNN(torch.nn.Module):
-    def __init__(self, num_node_features=2, hidden_channels=32):
+    def __init__(self, num_node_features=4, hidden_channels=64):
         super(ClassGNN, self).__init__()
         # Graph Attention Layers
         self.conv1 = GATConv(num_node_features, hidden_channels)
         self.conv2 = GATConv(hidden_channels, hidden_channels)
         self.conv3 = GATConv(hidden_channels, hidden_channels)
+        self.conv4 = GATConv(hidden_channels, hidden_channels)
         
         # Gamma/Hadron Classification
         self.class_head = nn.Sequential(
@@ -51,6 +55,8 @@ class ClassGNN(torch.nn.Module):
         x = self.conv2(x, edge_index)
         x = F.relu(x)
         x = self.conv3(x, edge_index)
+        x = F.relu(x)
+        x = self.conv4(x, edge_index)
         x = F.relu(x)
         
         # Use both mean and max pooling to capture both the peak intensity 

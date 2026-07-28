@@ -59,6 +59,15 @@ class CherenkovDataset(InMemoryDataset):
     def process(self):
         data_list = []
         
+        from sim.camera import Camera
+        from sim.trigger import CameraTrigger
+        cam = Camera(n_rings=12)
+        pixel_x, pixel_y = cam.pixel_x, cam.pixel_y
+        
+        px_feat = torch.tensor(pixel_x, dtype=torch.float32).unsqueeze(1)
+        py_feat = torch.tensor(pixel_y, dtype=torch.float32).unsqueeze(1)
+        trigger = CameraTrigger(pixel_x, pixel_y)
+        
         for raw_file in self.raw_paths:
             print(f"Processing {raw_file}...")
             
@@ -117,22 +126,27 @@ class CherenkovDataset(InMemoryDataset):
                         # We must NOT sum them, as that destroys stereoscopic spatial correlations.
                         # Instead, we treat each telescope as a separate graph for the single-camera GNN.
                         for tel_idx in range(len(evt['images'])):
-                            img = torch.tensor(evt['images'][tel_idx], dtype=torch.float32)
+                            img_np = evt['images'][tel_idx]
+                            timing_np = evt['timing'][tel_idx]
                             
-                            # Only train on telescopes that actually triggered / saw the shower
-                            if torch.sum(img) > 20.0:
-                                img_clamped = torch.clamp(img, min=0.0)
+                            is_triggered, t0 = trigger.evaluate(img_np, timing_np)
+                            
+                            if is_triggered:
+                                img_clamped = torch.clamp(torch.tensor(img_np, dtype=torch.float32), min=0.0)
                                 charge_feat = torch.log10(img_clamped + 1.0).unsqueeze(1)
                                 
-                                timing_arr = torch.tensor(evt['timing'][tel_idx], dtype=torch.float32)
+                                timing_arr = torch.tensor(timing_np, dtype=torch.float32)
                                 valid_timing = timing_arr > 0
                                 if valid_timing.any():
-                                    t_min = timing_arr[valid_timing].min()
-                                    timing_arr[valid_timing] = timing_arr[valid_timing] - t_min + 1.0
+                                    # Normalize timing to the exact moment the local coincidence trigger fired!
+                                    timing_arr[valid_timing] = timing_arr[valid_timing] - t0 + 1.0
+                                    # Clamp to prevent negative timings if a random NSB pixel fired earlier than T0
+                                    timing_arr[valid_timing] = torch.clamp(timing_arr[valid_timing], min=1e-3)
                                 
                                 timing_feat = timing_arr.unsqueeze(1)
                                 
-                                x = torch.cat([charge_feat, timing_feat], dim=1)
+                                # INJECT PIXEL COORDINATES SO THE GNN IS NO LONGER BLIND TO SHAPE!
+                                x = torch.cat([charge_feat, timing_feat, px_feat, py_feat], dim=1)
                         
                                 y_e = torch.log10(torch.tensor([evt['energy']], dtype=torch.float32))
                                 y_c = torch.tensor([evt['label']], dtype=torch.float32)
