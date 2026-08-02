@@ -12,9 +12,9 @@ def test_ray_trace_empty():
     cherenkov_photons = {
         'x_ground': np.array([]), 'y_ground': np.array([])
     }
-    image, timing = tel.ray_trace(cherenkov_photons)
-    assert image.shape == (tel.camera.n_pixels,)
-    assert timing.shape == (tel.camera.n_pixels,)
+    trace, gain = tel.ray_trace(cherenkov_photons)
+    assert trace.shape == (tel.camera.n_pixels, 16)
+    assert gain.shape == (tel.camera.n_pixels,)
 
 def test_veritas_telescope():
     tel = VeritasTelescope(x_tel=10.0, y_tel=20.0)
@@ -31,8 +31,8 @@ def test_telescope_array():
     cherenkov_photons = {
         'x_ground': np.array([]), 'y_ground': np.array([])
     }
-    images_and_timings = array.ray_trace(cherenkov_photons)
-    assert len(images_and_timings) == 4
-    for i, (img, timing) in enumerate(images_and_timings):
-        assert img.shape == (array.telescopes[i].camera.n_pixels,)
-        assert timing.shape == (array.telescopes[i].camera.n_pixels,)
+    traces_and_gains = array.ray_trace(cherenkov_photons)
+    assert len(traces_and_gains) == 4
+    for i, (trace, gain) in enumerate(traces_and_gains):
+        assert trace.shape == (array.telescopes[i].camera.n_pixels, 16)
+        assert gain.shape == (array.telescopes[i].camera.n_pixels,)
