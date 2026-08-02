@@ -28,6 +28,10 @@ class ShowerSimulation:
         if isinstance(z_starts, (float, int)):
             z_starts = [z_starts]
             
+        # VERITAS typical B-field (approximate Cartesian components in Tesla)
+        # X (North), Y (East), Z (Down)
+        self.B_field = torch.tensor([23.9e-6, 4.1e-6, 40.8e-6], device=self.device)
+            
         batch_size = len(primary_types)
         
         # State tensor [PID, E, x, y, z, px, py, pz, generation, event_id]
@@ -157,6 +161,34 @@ class ShowerSimulation:
                 px[idx_scatter] = p_new_x
                 py[idx_scatter] = p_new_y
                 pz[idx_scatter] = p_new_z
+                
+        # Lorentz Force Geomagnetic Deflection
+        if mask_e.any():
+            c_idx = mask_e.nonzero(as_tuple=True)[0]
+            p_vec = torch.stack([px[c_idx], py[c_idx], pz[c_idx]], dim=1)
+            
+            # Extract charge (+1 for e+, -1 for e-)
+            q = torch.zeros_like(E[c_idx])
+            q[pid[c_idx] == 1] = 1.0
+            q[pid[c_idx] == 2] = -1.0
+            
+            # B-field expanded to match batch
+            B_expanded = self.B_field.unsqueeze(0).expand(len(c_idx), -1)
+            
+            # v x B
+            cross_prod = torch.cross(p_vec, B_expanded, dim=1)
+            
+            # Deflection magnitude: (0.3 * q * dist) / E
+            # 0.3 handles the c conversion for E in GeV, B in Tesla, ds in meters
+            deflection_mag = (0.3 * q * dist[c_idx]) / E[c_idx]
+            
+            dp = cross_prod * deflection_mag.unsqueeze(1)
+            
+            px[c_idx] += dp[:, 0]
+            py[c_idx] += dp[:, 1]
+            pz[c_idx] += dp[:, 2]
+            
+            px[c_idx], py[c_idx], pz[c_idx] = self._norm_dir(px[c_idx], py[c_idx], pz[c_idx])
 
         x_new = x + px * dist
         y_new = y + py * dist
