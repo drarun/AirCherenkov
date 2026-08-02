@@ -125,28 +125,45 @@ class CherenkovDataset(InMemoryDataset):
                         # evt['images'] shape is (4 telescopes, 469 pixels). 
                         # We must NOT sum them, as that destroys stereoscopic spatial correlations.
                         # Instead, we treat each telescope as a separate graph for the single-camera GNN.
-                        for tel_idx in range(len(evt['images'])):
-                            img_np = evt['images'][tel_idx]
-                            timing_np = evt['timing'][tel_idx]
+                        for tel_idx in range(len(evt['fadc_traces'])):
+                            trace_np = evt['fadc_traces'][tel_idx]
+                            gain_np = evt['gain_flags'][tel_idx]
+                            
+                            # Integrate for CoG and Trigger (using max bin for timing)
+                            img_np = np.sum(trace_np, axis=1)
+                            timing_np = np.argmax(trace_np, axis=1) * 2.0
                             
                             is_triggered, t0 = trigger.evaluate(img_np, timing_np)
                             
                             if is_triggered:
-                                img_clamped = torch.clamp(torch.tensor(img_np, dtype=torch.float32), min=0.0)
-                                charge_feat = torch.log10(img_clamped + 1.0).unsqueeze(1)
+                                trace_feat = torch.tensor(trace_np, dtype=torch.float32)
+                                gain_feat = torch.tensor(gain_np, dtype=torch.float32).unsqueeze(1)
                                 
-                                timing_arr = torch.tensor(timing_np, dtype=torch.float32)
-                                valid_timing = timing_arr > 0
-                                if valid_timing.any():
-                                    # Normalize timing to the exact moment the local coincidence trigger fired!
-                                    timing_arr[valid_timing] = timing_arr[valid_timing] - t0 + 1.0
-                                    # Clamp to prevent negative timings if a random NSB pixel fired earlier than T0
-                                    timing_arr[valid_timing] = torch.clamp(timing_arr[valid_timing], min=1e-3)
+                                # Calculate Center of Gravity (Shower Core) for translation invariance
+                                total_charge = np.sum(img_np)
+                                if total_charge > 0:
+                                    cog_x = np.sum(img_np * pixel_x) / total_charge
+                                    cog_y = np.sum(img_np * pixel_y) / total_charge
+                                else:
+                                    cog_x, cog_y = 0.0, 0.0
+                                    
+                                px_shifted = torch.tensor(pixel_x - cog_x, dtype=torch.float32).unsqueeze(1)
+                                py_shifted = torch.tensor(pixel_y - cog_y, dtype=torch.float32).unsqueeze(1)
                                 
-                                timing_feat = timing_arr.unsqueeze(1)
+                                # INJECT SPATIOTEMPORAL FEATURES (16-bin trace + gain + 5 spatial)
+                                px_squared = px_shifted ** 2
+                                py_squared = py_shifted ** 2
+                                pxy = px_shifted * py_shifted
                                 
-                                # INJECT PIXEL COORDINATES SO THE GNN IS NO LONGER BLIND TO SHAPE!
-                                x = torch.cat([charge_feat, timing_feat, px_feat, py_feat], dim=1)
+                                x = torch.cat([
+                                    trace_feat, 
+                                    gain_feat, 
+                                    px_shifted, 
+                                    py_shifted, 
+                                    px_squared, 
+                                    py_squared, 
+                                    pxy
+                                ], dim=1)
                         
                                 y_e = torch.log10(torch.tensor([evt['energy']], dtype=torch.float32))
                                 y_c = torch.tensor([evt['label']], dtype=torch.float32)

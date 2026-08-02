@@ -27,21 +27,19 @@ class Telescope:
         falling back to scipy KDTree on CPU. FADC digitization is applied after.
         """
         if len(cherenkov_photons['x_ground']) == 0:
-            signal = np.zeros(self.camera.n_pixels)
-            timing = np.zeros(self.camera.n_pixels)
+            fadc_traces = np.zeros((self.camera.n_pixels, 16), dtype=np.float32)
+            gain_flags = np.zeros(self.camera.n_pixels, dtype=np.float32)
         else:
-            # Dispatch signal computation to GPU/CPU backend
-            signal, timing = ray_trace_gpu(
+            # The GPU kernel now natively handles the 16-bin FADC digitization, 
+            # Poisson NSB noise, and dual-gain saturation clipping!
+            fadc_traces, gain_flags = ray_trace_gpu(
                 cherenkov_photons,
                 self.camera.pixel_x, self.camera.pixel_y, self.camera.pixel_size,
                 self.x_tel, self.y_tel, self.z_tel, self.mirror_radius,
                 self.mirror_reflectivity, self.quantum_efficiency
             )
         
-        # Apply FADC digitization (NSB, PMT shaping, noise, conversion to ADC counts)
-        image = self.fadc.digitize_image(signal, nsb_rate, self.pedestal_std)
-        
-        return image, timing
+        return fadc_traces, gain_flags
 
 class VeritasTelescope(Telescope):
     def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0):

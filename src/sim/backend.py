@@ -485,8 +485,8 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                     lookup[q + n_rings, r + n_rings] = idx
                 idx += 1
                 
-    total_signal = np.zeros(n_pixels, dtype=np.float64)
-    total_time = np.zeros(n_pixels, dtype=np.float64)
+    all_pixel_indices = []
+    all_t_valid = []
     chunk_size = 5_000_000
     
     step = pixel_size
@@ -590,17 +590,49 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         pixel_indices = pixel_indices[valid_idx]
         t_valid = t_ground[valid][valid_idx]
         
-        signal = torch.bincount(pixel_indices, minlength=n_pixels)
-        sum_t = torch.bincount(pixel_indices, weights=t_valid, minlength=n_pixels)
+        all_pixel_indices.append(pixel_indices)
+        all_t_valid.append(t_valid)
         
-        total_signal += signal.cpu().numpy()
-        total_time += sum_t.cpu().numpy()
+    if len(all_pixel_indices) == 0:
+        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
         
-    avg_time = np.zeros_like(total_signal)
-    mask = total_signal > 0
-    avg_time[mask] = total_time[mask] / total_signal[mask]
+    pixel_indices = torch.cat(all_pixel_indices)
+    t_valid = torch.cat(all_t_valid)
+    
+    if t_valid.numel() == 0:
+        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
+    
+    t_min = t_valid.min()
+    bin_width = 2.0
+    t_start = t_min - 2.0  # Start trace 2ns before first photon
+    
+    bin_idx = torch.floor((t_valid - t_start) / bin_width).to(torch.int64)
+    
+    # Filter photons falling outside the 16-bin (32 ns) window
+    valid_mask = (bin_idx >= 0) & (bin_idx < 16)
+    pixel_indices = pixel_indices[valid_mask]
+    bin_idx = bin_idx[valid_mask]
+    
+    # 2D Histogram flattened
+    flat_idx = pixel_indices * 16 + bin_idx
+    fadc_counts = torch.bincount(flat_idx, minlength=n_pixels * 16).view(n_pixels, 16).float()
+    
+    # NSB Noise (approx 0.1 PE per 2ns bin)
+    nsb_noise = torch.poisson(torch.full_like(fadc_counts, 0.1))
+    fadc_counts += nsb_noise
+    
+    # Dual-gain clipping
+    saturation_limit = 250.0
+    gain_flags = torch.zeros(n_pixels, device=device)
+    
+    saturated = (fadc_counts > saturation_limit).any(dim=1)
+    gain_flags[saturated] = 1.0
+    
+    # Low-gain attenuation factor = 10
+    attenuation = 10.0
+    fadc_counts[saturated] = fadc_counts[saturated] / attenuation
         
-    return total_signal, avg_time
+    return fadc_counts.cpu().numpy(), gain_flags.cpu().numpy()
 
 
 def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
@@ -625,7 +657,7 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     hit_mask = dist_to_center_sq <= mirror_radius**2
     
     if not np.any(hit_mask):
-        return np.zeros(n_pixels), np.zeros(n_pixels)
+        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
     
     xe = xe[hit_mask]
     ye = ye[hit_mask]
@@ -637,7 +669,7 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     survived_mask = np.random.rand(len(x_hit)) < survival_prob
     
     if not np.any(survived_mask):
-        return np.zeros(n_pixels), np.zeros(n_pixels)
+        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
     
     xe = xe[survived_mask]
     ye = ye[survived_mask]
@@ -659,7 +691,9 @@ def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     valid_hits = distances < (pixel_size / 2.0)
     valid_indices = indices[valid_hits]
     
-    signal = np.zeros(n_pixels)
-    np.add.at(signal, valid_indices, 1.0)
+    fadc_counts = np.zeros((n_pixels, 16), dtype=np.float32)
+    gain_flags = np.zeros(n_pixels, dtype=np.float32)
+    # Numpy fallback just returns integrated charge in bin 0 for simplicity
+    np.add.at(fadc_counts[:, 0], valid_indices, 1.0)
     
-    return signal
+    return fadc_counts, gain_flags

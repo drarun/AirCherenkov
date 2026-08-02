@@ -113,15 +113,15 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                 tel.y_tel += iy
                 
             # Hardware Trigger: At least 2 telescopes with > 20 PE
-            trigger_count = sum(1 for img, timing in img_outputs if np.sum(img) > 20)
+            trigger_count = sum(1 for trace, gain in img_outputs if np.sum(trace) > 20)
             if trigger_count >= 2:
                 passed_trigger_count += 1
-                images = [img for img, timing in img_outputs]
-                timings = [timing for img, timing in img_outputs]
+                traces = [trace for trace, gain in img_outputs]
+                gains = [gain for trace, gain in img_outputs]
                 
                 current_chunk.append({
-                    'images': np.array(images, dtype=np.float32),
-                    'timing': np.array(timings, dtype=np.float32),
+                    'fadc_traces': np.array(traces, dtype=np.float32),
+                    'gain_flags': np.array(gains, dtype=np.float32),
                     'energy': energies[i],
                     'label': 1 if pids[i] == 'gamma' else 0,
                     'impact_x': ix,
