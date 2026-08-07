@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aircherenkov"
+version = "0.2.0"
+description = "Air-shower, Cherenkov-camera, visualization, and reconstruction research toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3",
+    "pandas>=1.5,<3",
+    "torch>=2.1,<3",
+    "tqdm>=4.65,<5",
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.7,<4",
+    "plotly>=5.18,<7",
+]
+ml = [
+    "scikit-learn>=1.3,<2",
+    "torch-geometric>=2.4,<3",
+]
+sbi = ["sbi>=0.22,<1"]
+io = ["h5py>=3.9,<4"]
+dev = ["pytest>=7.4,<9"]
+
+[project.scripts]
+aircherenkov-visualize = "generate_visualizations:main"
+aircherenkov-generate = "generate_training_data:main"
+aircherenkov-camera = "run_gamma_camera_pipeline:main"
+aircherenkov-train = "train_gnn:main"
+aircherenkov-evaluate = "analysis.evaluate_gnns:main"
+aircherenkov-event-display = "analysis.event_display:main"
+
+[tool.setuptools]
+packages = ["aircherenkov", "analysis", "recon", "sim"]
+py-modules = [
+    "generate_training_data",
+    "generate_visualizations",
+    "plot_ldf",
+    "regenerate_all",
+    "run_full_sim",
+    "run_gamma_camera_pipeline",
+    "train_gnn",
+]
+
+[tool.setuptools.package-dir]
+aircherenkov = "src/aircherenkov"
+analysis = "src/analysis"
+recon = "src/recon"
+sim = "src/sim"

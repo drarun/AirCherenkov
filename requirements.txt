@@ -1,10 +1,9 @@
-numpy
-matplotlib
-scipy
-scikit-learn
-plotly
-pandas
-pytest
-tqdm
-
-torch
+# Convenience environment for core simulation, visualization, and tests.
+# Optional ML/SBI/I/O dependencies are defined as extras in pyproject.toml.
+numpy>=1.24,<3
+pandas>=1.5,<3
+torch>=2.1,<3
+tqdm>=4.65,<5
+matplotlib>=3.7,<4
+plotly>=5.18,<7
+pytest>=7.4,<9
