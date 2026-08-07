@@ -2,14 +2,14 @@ import torch
 import numpy as np
 
 class CameraTrigger:
-    def __init__(self, pixel_x, pixel_y, threshold_pe=5.0, window_ns=5.0, min_pixels=3):
+    def __init__(self, camera, threshold_pe=5.0, window_ns=5.0, min_pixels=3):
         """
         Simulates a local coincidence Camera Level Trigger (CLT).
         
         Parameters
         ----------
-        pixel_x, pixel_y : array-like
-            Coordinates of the camera pixels.
+        camera : sim.camera.Camera
+            Camera object defining the geometry and adjacency.
         threshold_pe : float
             Discriminator threshold (in photoelectrons) each pixel must cross.
         window_ns : float
@@ -20,16 +20,10 @@ class CameraTrigger:
         self.threshold = threshold_pe
         self.window = window_ns
         self.min_pixels = min_pixels
+        self.camera = camera
         
         # Precompute adjacency matrix based on hexagonal pixel spacing
-        pos = np.stack([pixel_x, pixel_y], axis=1)
-        # Using KDTree or cdist. For 469 pixels, direct cdist is extremely fast.
-        pos_t = torch.tensor(pos, dtype=torch.float32)
-        dist = torch.cdist(pos_t, pos_t)
-        
-        # Hexagonal pixels are typically ~0.1 units apart in our simulation.
-        # We define adjacency as distance < 0.105 (accounting for floating point)
-        self.adj_matrix = (dist > 0.01) & (dist < 0.105)
+        self.adj_matrix = torch.tensor(self.camera.get_neighbor_matrix())
         
         # Precompute all valid "3-pixel compact clusters" (triangles of mutually adjacent pixels)
         self.clusters = self._find_trigger_clusters()

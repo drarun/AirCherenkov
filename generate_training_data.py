@@ -12,12 +12,27 @@ from sim.telescope import TelescopeArray
 
 import argparse
 
-def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, save_every=1000, output_dir='data/train_raw'):
+def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, save_every=1000, 
+                           output_dir='data/train_raw', zenith_deg=0.0, azimuth_deg=0.0,
+                           e_min=100.0, e_max=10000.0, spectral_index=2.0, impact_radius=250.0):
     """
     Generates Monte Carlo simulation data using the batched GPU tensor pipeline.
     Saves in chunks so the process can be safely interrupted and resumed.
     """
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Compute initial direction vector from zenith/azimuth
+    zen_rad = np.radians(zenith_deg)
+    azi_rad = np.radians(azimuth_deg)
+    px_init = np.sin(zen_rad) * np.cos(azi_rad)
+    py_init = np.sin(zen_rad) * np.sin(azi_rad)
+    pz_init = -np.cos(zen_rad)
+    
+    print(f"Shower direction: zenith={zenith_deg:.1f}°, azimuth={azimuth_deg:.1f}°")
+    print(f"  -> (px, py, pz) = ({px_init:.4f}, {py_init:.4f}, {pz_init:.4f})")
+    
+    # Higher z_start for inclined showers (longer slant depth)
+    z_start = 20000.0 if zenith_deg < 25.0 else 25000.0
     
     # 1. Resume Logic
     existing_files = glob.glob(os.path.join(output_dir, "sim_batch_*.pt"))
@@ -47,6 +62,8 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
         return
 
     print(f"Generating {num_gammas} gammas and {num_hadrons} hadrons in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
+    print(f"Energy range: {e_min:.0f} – {e_max:.0f} GeV, spectral index: E^-{spectral_index:.1f}")
+    print(f"Impact radius: {impact_radius:.0f} m")
     
     array = TelescopeArray.veritas_array()
     
@@ -80,15 +97,19 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                 pids.append('proton')
                 num_hadrons -= 1
                 
-            # Power law energy distribution E^-2, roughly 100 to 10000 GeV
-            e_min, e_max = 100.0, 10000.0
+            # Generalized power-law sampling: E^(-alpha) from e_min to e_max
+            # For alpha != 1: E = (u * e_max^(1-alpha) + (1-u) * e_min^(1-alpha))^(1/(1-alpha))
             u = np.random.rand()
-            e_inv = (1.0/e_max) + u * ((1.0/e_min) - (1.0/e_max))
-            energies.append(1.0 / e_inv)
-            z_starts.append(20000.0)
+            alpha = spectral_index
+            E = (u * e_max**(1-alpha) + (1-u) * e_min**(1-alpha)) ** (1.0/(1-alpha))
+            energies.append(E)
+            z_starts.append(z_start)
             
-        # Run fully batched simulation
-        sim = ShowerSimulation(primary_types=pids, energies=energies, z_starts=z_starts)
+        # Run fully batched simulation with direction injection
+        sim = ShowerSimulation(
+            primary_types=pids, energies=energies, z_starts=z_starts,
+            px_init=px_init, py_init=py_init, pz_init=pz_init
+        )
         sim.run(max_generations=16, verbose=False)
         
         for i in range(current_batch_size):
@@ -96,8 +117,8 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
             if len(photons.get('x_ground', [])) == 0:
                 continue
                 
-            # Randomize impact parameter within 250m radius
-            r = np.sqrt(np.random.rand()) * 250.0
+            # Randomize impact parameter within configurable radius
+            r = np.sqrt(np.random.rand()) * impact_radius
             theta = np.random.rand() * 2 * np.pi
             ix = r * np.cos(theta)
             iy = r * np.sin(theta)
@@ -125,7 +146,9 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                     'energy': energies[i],
                     'label': 1 if pids[i] == 'gamma' else 0,
                     'impact_x': ix,
-                    'impact_y': iy
+                    'impact_y': iy,
+                    'zenith_deg': zenith_deg,
+                    'azimuth_deg': azimuth_deg
                 })
         
         events_remaining -= current_batch_size
@@ -148,6 +171,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size for GPU pipeline')
     parser.add_argument('--save_every', type=int, default=1000, help='Save chunk every N events')
     parser.add_argument('--output_dir', type=str, default='data/train_raw', help='Output directory')
+    parser.add_argument('--zenith_deg', type=float, default=0.0, help='Zenith angle in degrees')
+    parser.add_argument('--azimuth_deg', type=float, default=0.0, help='Azimuth angle in degrees (0=N, 90=E, 180=S)')
+    parser.add_argument('--e_min', type=float, default=80.0, help='Min energy in GeV')
+    parser.add_argument('--e_max', type=float, default=30000.0, help='Max energy in GeV')
+    parser.add_argument('--spectral_index', type=float, default=2.0, help='Spectral index for E^-alpha sampling')
+    parser.add_argument('--impact_radius', type=float, default=350.0, help='Max impact parameter radius in meters')
     args = parser.parse_args()
     
     generate_training_data(
@@ -155,5 +184,11 @@ if __name__ == '__main__':
         num_hadrons=args.num_hadrons,
         batch_size=args.batch_size,
         save_every=args.save_every,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        zenith_deg=args.zenith_deg,
+        azimuth_deg=args.azimuth_deg,
+        e_min=args.e_min,
+        e_max=args.e_max,
+        spectral_index=args.spectral_index,
+        impact_radius=args.impact_radius
     )

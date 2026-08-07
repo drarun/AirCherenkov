@@ -18,18 +18,21 @@ def main():
     
     # -- Shower Simulation -------------------------------------------
     print("\n[1/4] Simulating a 5 TeV Gamma-ray shower...")
-    sim = ShowerSimulation('gamma', energy=5000.0, z_start=25000.0)
+    sim = ShowerSimulation(primary_types=['gamma'], energies=[5000.0], z_starts=[25000.0])
     sim.photon_yield_factor = 50.0
     sim.run(max_generations=18)
     
-    n_photons = len(sim.cherenkov_photons['x_ground'])
-    n_particles = len(sim.all_particles)
-    print(f"      Generated {n_particles} particles, {n_photons:,} Cherenkov photons on ground.")
+    photons = sim.cherenkov_photons_by_event[0]
+    n_photons = len(photons.get('x_ground', []))
+    print(f"      Generated {n_photons:,} Cherenkov photons on ground.")
     
     # -- Ray-tracing -------------------------------------------------
     print("\n[2/4] Ray-tracing through telescope optics...")
     tel = Telescope(x_tel=0.0, y_tel=0.0, mirror_radius=6.0, focal_length=15.0)
-    raw_image = tel.ray_trace(sim.cherenkov_photons, nsb_rate=2.0)
+    fadc_traces, gain_flags = tel.ray_trace(photons, nsb_rate=2.0)
+    
+    # Integrate FADC traces to get a charge image for cleaning/Hillas
+    raw_image = np.sum(fadc_traces, axis=1)
     
     n_signal = np.sum(raw_image) - tel.camera.n_pixels * 2.0
     print(f"      Camera: {tel.camera.n_pixels} pixels, ~{n_signal:.0f} signal p.e. above NSB")

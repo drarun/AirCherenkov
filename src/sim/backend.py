@@ -425,7 +425,7 @@ def _cherenkov_numpy(seg_x1, seg_y1, seg_z1,
 
 def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                   x_tel, y_tel, z_tel, mirror_radius,
-                  mirror_reflectivity, quantum_efficiency):
+                  mirror_reflectivity, quantum_efficiency, nsb_rate=0.1):
     """
     GPU-accelerated ray-tracing: projects photons to focal plane and bins
     into camera pixels using torch.cdist instead of scipy KDTree.
@@ -457,16 +457,16 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     if not HAS_TORCH or device is None or device.type != 'cuda':
         return _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                                 x_tel, y_tel, z_tel, mirror_radius,
-                                mirror_reflectivity, quantum_efficiency)
+                                mirror_reflectivity, quantum_efficiency, nsb_rate)
     
     return _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                             x_tel, y_tel, z_tel, mirror_radius,
-                            mirror_reflectivity, quantum_efficiency, device)
+                            mirror_reflectivity, quantum_efficiency, nsb_rate, device)
 
 
 def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                       x_tel, y_tel, z_tel, mirror_radius,
-                      mirror_reflectivity, quantum_efficiency, device):
+                      mirror_reflectivity, quantum_efficiency, nsb_rate, device):
     """Ray-tracing using O(1) vectorized hexagonal binning for GPU, chunked to save VRAM."""
     
     n_pixels = len(pixel_x)
@@ -617,9 +617,36 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
     flat_idx = pixel_indices * 16 + bin_idx
     fadc_counts = torch.bincount(flat_idx, minlength=n_pixels * 16).view(n_pixels, 16).float()
     
-    # NSB Noise (approx 0.1 PE per 2ns bin)
-    nsb_noise = torch.poisson(torch.full_like(fadc_counts, 0.1))
+    # NSB Noise: calculated as nsb_rate * (bin_width / window_size) if we assume nsb_rate is per total window
+    # Actually, nsb_rate is usually rate per pixel per window. So rate per bin is nsb_rate * (bin_width / (16 * bin_width))
+    nsb_per_bin = nsb_rate / 16.0
+    nsb_noise = torch.poisson(torch.full_like(fadc_counts, nsb_per_bin))
     fadc_counts += nsb_noise
+    
+    # PMT Pulse Shaping Convolution
+    # A typical PMT pulse has a width (sigma) of ~2.5 ns. 
+    # With 2ns bins, this spreads the charge across ~3-5 bins.
+    sigma = 2.5 / bin_width  # Width in bins
+    kernel_size = 7
+    x = torch.arange(-kernel_size // 2 + 1, kernel_size // 2 + 1, device=device, dtype=torch.float32)
+    pulse_kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    pulse_kernel /= pulse_kernel.sum()  # Normalize to conserve charge
+    
+    # Reshape for conv1d: [batch=1, in_channels=n_pixels, length=16]
+    # We use grouped convolution where groups=n_pixels to apply it independently per pixel
+    fadc_reshaped = fadc_counts.unsqueeze(0)  # [1, n_pixels, 16]
+    kernel_reshaped = pulse_kernel.view(1, 1, kernel_size).repeat(n_pixels, 1, 1) # [n_pixels, 1, kernel_size]
+    
+    # Pad to keep the 16-bin length
+    padding = kernel_size // 2
+    fadc_smoothed = torch.nn.functional.conv1d(
+        fadc_reshaped, 
+        kernel_reshaped, 
+        padding=padding, 
+        groups=n_pixels
+    ).squeeze(0)
+    
+    fadc_counts = fadc_smoothed
     
     # Dual-gain clipping
     saturation_limit = 250.0
@@ -637,7 +664,7 @@ def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
 
 def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                       x_tel, y_tel, z_tel, mirror_radius,
-                      mirror_reflectivity, quantum_efficiency):
+                      mirror_reflectivity, quantum_efficiency, nsb_rate):
     """Ray-tracing using scipy KDTree (CPU fallback)."""
     from scipy.spatial import KDTree
     

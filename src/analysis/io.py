@@ -46,8 +46,9 @@ class TraceProcessor:
         # Simplistic placeholder logic for integration window
         # In a real implementation, this would be a learnable or dynamic sliding window
         
-        # Pedestal subtraction (assuming a basic fixed baseline for now)
-        baseline = fadc_traces[:, :10].mean(dim=1, keepdim=True)
+        # Pedestal subtraction: Average the LAST 3 bins to avoid eating the main Cherenkov pulse 
+        # (which typically arrives around bin 1 or 2 since the window starts just 2ns before the first photon)
+        baseline = fadc_traces[:, -3:].mean(dim=1, keepdim=True)
         cleaned_traces = fadc_traces - baseline
         
         # Zero out negative fluctuations

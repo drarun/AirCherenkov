@@ -66,7 +66,7 @@ class CherenkovDataset(InMemoryDataset):
         
         px_feat = torch.tensor(pixel_x, dtype=torch.float32).unsqueeze(1)
         py_feat = torch.tensor(pixel_y, dtype=torch.float32).unsqueeze(1)
-        trigger = CameraTrigger(pixel_x, pixel_y)
+        trigger = CameraTrigger(cam)
         
         for raw_file in self.raw_paths:
             print(f"Processing {raw_file}...")
@@ -80,49 +80,22 @@ class CherenkovDataset(InMemoryDataset):
                     processed = self.processor.process(event["fadc_traces"])
                     
                     if self.graph_builder:
-                        data = self.graph_builder.build_graph(processed["charge"], processed["timing"])
+                        data = self.graph_builder.build_graph(event["fadc_traces"])
                     else:
-                        data = Data(x=torch.stack([processed["charge"], processed["timing"]], dim=-1))
+                        data = Data(x=event["fadc_traces"])
                     
                     # Dummy labels since it's real unlabeled data
                     data.y_energy = torch.tensor([0.0], dtype=torch.float32)
                     data.y_class = torch.tensor([0.0], dtype=torch.float32)
                     data_list.append(data)
             else:
-                # Process simulation `.pt` files
-                # Assumes files were saved by `benchmark_sim.py` or `generate_training_data.py`
-                # which save list of dicts: [{'images': ..., 'energy': ..., 'label': ...}]
+                # Process simulation `.pt` files (saved by `generate_training_data.py`)
+                # which save list of dicts: [{'fadc_traces': ..., 'energy': ..., 'label': ...}]
                 sim_data = torch.load(raw_file, weights_only=False)
                 
-                # Support both old dictionary format and new list format
-                if isinstance(sim_data, dict) and 'images' in sim_data:
-                    # Old batched format from generate_training_data.py
-                    images = sim_data['images']
-                    energies = sim_data['energies']
-                    labels = sim_data['labels']
-                    pixel_x = sim_data['pixel_x']
-                    pixel_y = sim_data['pixel_y']
-                    
-                    for i in range(len(images)):
-                        # Just take the first telescope image for simplistic training
-                        img = torch.tensor(images[i][0] if len(images[i].shape) > 1 else images[i], dtype=torch.float32)
-                        img_clamped = torch.clamp(img, min=0.0)
-                        x = torch.log10(img_clamped.unsqueeze(1) + 1.0)
-                        
-                        y_e = torch.log10(torch.tensor([energies[i]], dtype=torch.float32))
-                        y_c = torch.tensor([labels[i]], dtype=torch.float32)
-                        
-                        # Fallback edge index generation if graph_builder not provided
-                        if self.graph_builder:
-                            data = self.graph_builder.build_graph(img_clamped, torch.zeros_like(img_clamped))
-                        else:
-                            data = Data(x=x, y_energy=y_e, y_class=y_c)
-                        data_list.append(data)
-                        
-                elif isinstance(sim_data, list):
-                    # New format from benchmark_sim.py
+                if isinstance(sim_data, list):
                     for evt in sim_data:
-                        # evt['images'] shape is (4 telescopes, 469 pixels). 
+                        # evt['fadc_traces'] shape is (4 telescopes, 469 pixels, 16 bins).
                         # We must NOT sum them, as that destroys stereoscopic spatial correlations.
                         # Instead, we treat each telescope as a separate graph for the single-camera GNN.
                         for tel_idx in range(len(evt['fadc_traces'])):

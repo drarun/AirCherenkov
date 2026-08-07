@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import RegularPolygon
@@ -17,6 +18,7 @@ class Camera:
         self.pixel_size = pixel_size
         self.pixel_x, self.pixel_y = self._generate_hex_grid()
         self.n_pixels = len(self.pixel_x)
+        self._edge_index = None
         
     def _generate_hex_grid(self):
         """Generates x and y coordinates for a hexagonal grid of pixels."""
@@ -50,6 +52,14 @@ class Camera:
         # We use 1.1 as a tolerance margin due to floating point math
         is_neighbor = (dist_sq > 0) & (dist_sq < (self.pixel_size * 1.1)**2)
         return is_neighbor
+        
+    @property
+    def edge_index(self):
+        """Returns the PyTorch Geometric edge_index tensor for this camera."""
+        if self._edge_index is None:
+            adj = self.get_neighbor_matrix()
+            self._edge_index = torch.tensor(adj).nonzero(as_tuple=False).t().contiguous()
+        return self._edge_index
 
     def plot_image(self, image_amplitudes, ax=None, title="Camera Image", cmap="viridis"):
         """

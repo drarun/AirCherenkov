@@ -1,7 +1,6 @@
 import numpy as np
 from sim.camera import Camera
 from sim.backend import ray_trace_gpu, device_info
-from sim.fadc import FADC
 
 class Telescope:
     def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, mirror_radius=6.0, focal_length=15.0, 
@@ -17,7 +16,6 @@ class Telescope:
         self.pedestal_std = pedestal_std
         
         self.camera = Camera(n_rings=n_rings, pixel_size=pixel_size)
-        self.fadc = FADC()
         
     def ray_trace(self, cherenkov_photons, nsb_rate=2.0):
         """
@@ -36,7 +34,7 @@ class Telescope:
                 cherenkov_photons,
                 self.camera.pixel_x, self.camera.pixel_y, self.camera.pixel_size,
                 self.x_tel, self.y_tel, self.z_tel, self.mirror_radius,
-                self.mirror_reflectivity, self.quantum_efficiency
+                self.mirror_reflectivity, self.quantum_efficiency, nsb_rate=nsb_rate
             )
         
         return fadc_traces, gain_flags

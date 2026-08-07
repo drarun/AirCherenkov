@@ -3,11 +3,39 @@ import pandas as pd
 import torch
 import time
 
+# --- JIT Compiled Physics Utilities ---
+@torch.jit.script
+def atmospheric_density(z: torch.Tensor) -> torch.Tensor:
+    return 1.225e-3 * torch.exp(-z / 7640.0)
+
+@torch.jit.script
+def mean_free_path(z: torch.Tensor, X_length: float) -> torch.Tensor:
+    rho = atmospheric_density(z)
+    return X_length / (rho * 100.0)
+
+@torch.jit.script
+def norm_dir(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor):
+    norm = torch.sqrt(px**2 + py**2 + pz**2)
+    safe = norm > 0
+    return (torch.where(safe, px/norm, px),
+            torch.where(safe, py/norm, py),
+            torch.where(safe, pz/norm, pz))
+
 class ShowerSimulation:
-    def __init__(self, primary_types=['gamma'], energies=[1000.0], z_starts=[20000.0]):
+    def __init__(self, primary_types=['gamma'], energies=[1000.0], z_starts=[20000.0],
+                 site="VERITAS", px_init=0.0, py_init=0.0, pz_init=-1.0):
         """
         A 3D toy Monte Carlo using fully tensorized PyTorch operations.
         Supports batch processing of multiple independent showers.
+        
+        Parameters
+        ----------
+        px_init, py_init, pz_init : float
+            Initial direction vector components. Default (0, 0, -1) = straight down.
+            For a shower arriving at zenith angle θ and azimuth φ:
+                px_init = sin(θ) * cos(φ)
+                py_init = sin(θ) * sin(φ)
+                pz_init = -cos(θ)
         """
         self.critical_energy = 0.085 # 85 MeV
         self.photon_yield_factor = 1.0 
@@ -27,19 +55,32 @@ class ShowerSimulation:
             energies = [energies]
         if isinstance(z_starts, (float, int)):
             z_starts = [z_starts]
+        self.dtype = torch.float32
             
-        # VERITAS typical B-field (approximate Cartesian components in Tesla)
-        # X (North), Y (East), Z (Down)
-        self.B_field = torch.tensor([23.9e-6, 4.1e-6, 40.8e-6], device=self.device)
+        # Magnetic field vectors (X: North, Y: East, Z: Down) in Tesla
+        if site == "VERITAS":
+            self.B_field = torch.tensor([23.9e-6, 4.1e-6, 40.8e-6], device=self.device, dtype=self.dtype)
+        elif site == "HESS":
+            # H.E.S.S. Namibia (Southern hemisphere, Z is upwards relative to field lines)
+            self.B_field = torch.tensor([10.5e-6, -3.2e-6, -25.8e-6], device=self.device, dtype=self.dtype)
+        elif site == "CTA_NORTH":
+            # CTA La Palma
+            self.B_field = torch.tensor([24.2e-6, 1.2e-6, 30.8e-6], device=self.device, dtype=self.dtype)
+        else:
+            self.B_field = torch.tensor([0.0, 0.0, 0.0], device=self.device, dtype=self.dtype)
             
         batch_size = len(primary_types)
+        
+        # Pre-allocate Entropy Pool (50 Million random numbers in bfloat16) to avoid random overhead in loop
+        self.entropy_pool = torch.rand(50_000_000, device=self.device, dtype=self.dtype)
+        self.entropy_idx = 0
         
         # State tensor [PID, E, x, y, z, px, py, pz, generation, event_id]
         init_state = []
         for i in range(batch_size):
-            init_state.append([self.PID_MAP[primary_types[i]], energies[i], 0.0, 0.0, z_starts[i], 0.0, 0.0, -1.0, 0.0, float(i)])
+            init_state.append([self.PID_MAP[primary_types[i]], energies[i], 0.0, 0.0, z_starts[i], px_init, py_init, pz_init, 0.0, float(i)])
             
-        self.active = torch.tensor(init_state, dtype=torch.float32, device=self.device)
+        self.active = torch.tensor(init_state, dtype=self.dtype, device=self.device)
         self.batch_size = batch_size
         
         # Cherenkov segment accumulators
@@ -51,21 +92,15 @@ class ShowerSimulation:
         
         # Output dictionary mapping event_id to its Cherenkov photons
         self.cherenkov_photons_by_event = {i: {'x_ground': np.array([]), 'y_ground': np.array([])} for i in range(batch_size)}
-
-    def _atmospheric_density(self, z):
-        return 1.225e-3 * torch.exp(-z / 7640.0)
-
-    def _mean_free_path(self, z, X_length):
-        rho = self._atmospheric_density(z)
-        return X_length / (rho * 100.0)
-        
-    def _norm_dir(self, px, py, pz):
-        norm = torch.sqrt(px**2 + py**2 + pz**2)
-        safe = norm > 0
-        return (torch.where(safe, px/norm, px),
-                torch.where(safe, py/norm, py),
-                torch.where(safe, pz/norm, pz))
-
+    def _get_rand(self, size):
+        """Consume random numbers from the pre-allocated entropy pool."""
+        if self.entropy_idx + size > self.entropy_pool.numel():
+            # Refill pool if exhausted (rare)
+            self.entropy_pool = torch.rand(50_000_000, device=self.device, dtype=self.dtype)
+            self.entropy_idx = 0
+        out = self.entropy_pool[self.entropy_idx:self.entropy_idx + size]
+        self.entropy_idx += size
+        return out
     def step(self):
         """Advance the simulation by one generation using batched tensor ops."""
         if self.active.shape[0] == 0:
@@ -86,7 +121,7 @@ class ShowerSimulation:
         gen = p[:, 8]
         evt = p[:, 9]
         N = p.shape[0]
-        dist = torch.zeros(N, device=self.device, dtype=torch.float32)
+        dist = torch.zeros(N, device=self.device, dtype=self.dtype)
         
         # Mean free paths
         mask_em = (pid == 0) | (pid == 1) | (pid == 2)
@@ -95,9 +130,9 @@ class ShowerSimulation:
         mask_mu = (pid == 6)
         
         if mask_em.any():
-            dist[mask_em] = torch.empty(mask_em.sum(), device=self.device).exponential_() * self._mean_free_path(z[mask_em], 36.62)
+            dist[mask_em] = torch.empty(mask_em.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_em], 36.62)
         if mask_had.any():
-            dist[mask_had] = torch.empty(mask_had.sum(), device=self.device).exponential_() * self._mean_free_path(z[mask_had], 90.0)
+            dist[mask_had] = torch.empty(mask_had.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_had], 90.0)
         if mask_pi0.any():
             dist[mask_pi0] = 10.0
         if mask_mu.any():
@@ -109,7 +144,7 @@ class ShowerSimulation:
             z_e = z[mask_e]
             dist_e = dist[mask_e]
             E_e = E[mask_e]
-            x_gcm2 = dist_e * self._atmospheric_density(z_e) * 100.0
+            x_gcm2 = dist_e * atmospheric_density(z_e) * 100.0
             
             valid_scatter = x_gcm2 > 0
             if valid_scatter.any():
@@ -157,10 +192,10 @@ class ShowerSimulation:
                 p_new_y = v_y + theta1 * e1_y + theta2 * e2_y
                 p_new_z = v_z + theta1 * e1_z + theta2 * e2_z
                 
-                p_new_x, p_new_y, p_new_z = self._norm_dir(p_new_x, p_new_y, p_new_z)
-                px[idx_scatter] = p_new_x
-                py[idx_scatter] = p_new_y
-                pz[idx_scatter] = p_new_z
+                p_new_x, p_new_y, p_new_z = norm_dir(p_new_x, p_new_y, p_new_z)
+                px[idx_scatter] = p_new_x.to(self.dtype)
+                py[idx_scatter] = p_new_y.to(self.dtype)
+                pz[idx_scatter] = p_new_z.to(self.dtype)
                 
         # Lorentz Force Geomagnetic Deflection
         if mask_e.any():
@@ -184,11 +219,14 @@ class ShowerSimulation:
             
             dp = cross_prod * deflection_mag.unsqueeze(1)
             
-            px[c_idx] += dp[:, 0]
-            py[c_idx] += dp[:, 1]
-            pz[c_idx] += dp[:, 2]
+            px[c_idx] = (px[c_idx] + dp[:, 0]).to(self.dtype)
+            py[c_idx] = (py[c_idx] + dp[:, 1]).to(self.dtype)
+            pz[c_idx] = (pz[c_idx] + dp[:, 2]).to(self.dtype)
             
-            px[c_idx], py[c_idx], pz[c_idx] = self._norm_dir(px[c_idx], py[c_idx], pz[c_idx])
+            p_nx, p_ny, p_nz = norm_dir(px[c_idx], py[c_idx], pz[c_idx])
+            px[c_idx] = p_nx.to(self.dtype)
+            py[c_idx] = p_ny.to(self.dtype)
+            pz[c_idx] = p_nz.to(self.dtype)
 
         x_new = x + px * dist
         y_new = y + py * dist
@@ -209,7 +247,7 @@ class ShowerSimulation:
         # Ionization
         mask_ion = mask_e | (pid == 3) | (pid == 4)
         if mask_ion.any():
-            x_gcm2 = dist[mask_ion] * self._atmospheric_density(z_new[mask_ion]) * 100.0
+            x_gcm2 = dist[mask_ion] * atmospheric_density(z_new[mask_ion]) * 100.0
             E[mask_ion] -= 0.0021 * x_gcm2
             
         # Re-filter alive
@@ -222,14 +260,14 @@ class ShowerSimulation:
         if mask_g.any():
             idx_g = idx_alive[mask_g]
             N_g = idx_g.shape[0]
-            u = torch.rand(N_g, device=self.device) * 0.8 + 0.1
+            u = self._get_rand(N_g) * 0.8 + 0.1
             e1_E = u * E[idx_g]
             e2_E = (1 - u) * E[idx_g]
             
-            phi = torch.rand(N_g, device=self.device) * 2 * np.pi
+            phi = self._get_rand(N_g) * 2 * np.pi
             pt = 0.0005
-            px1, py1, pz1 = self._norm_dir(px[idx_g] + pt*torch.cos(phi), py[idx_g] + pt*torch.sin(phi), pz[idx_g])
-            px2, py2, pz2 = self._norm_dir(px[idx_g] - pt*torch.cos(phi), py[idx_g] - pt*torch.sin(phi), pz[idx_g])
+            px1, py1, pz1 = norm_dir(px[idx_g] + pt*torch.cos(phi), py[idx_g] + pt*torch.sin(phi), pz[idx_g])
+            px2, py2, pz2 = norm_dir(px[idx_g] - pt*torch.cos(phi), py[idx_g] - pt*torch.sin(phi), pz[idx_g])
             
             gen_new = gen[idx_g] + 1
             evt_new = evt[idx_g]
@@ -248,17 +286,17 @@ class ShowerSimulation:
             N_b = idx_b.shape[0]
             E_b = E[idx_b]
             min_u = self.critical_energy / E_b
-            rand_val = torch.rand(N_b, device=self.device)
+            rand_val = self._get_rand(N_b)
             u = torch.pow(min_u, rand_val)
             u = torch.max(min_u, u)
             
             g_E = u * E_b
             e_E = (1 - u) * E_b
             
-            phi = torch.rand(N_b, device=self.device) * 2 * np.pi
+            phi = self._get_rand(N_b) * 2 * np.pi
             pt = 0.0005
-            px1, py1, pz1 = self._norm_dir(px[idx_b] - pt*torch.cos(phi), py[idx_b] - pt*torch.sin(phi), pz[idx_b])
-            px2, py2, pz2 = self._norm_dir(px[idx_b] + pt*torch.cos(phi), py[idx_b] + pt*torch.sin(phi), pz[idx_b])
+            px1, py1, pz1 = norm_dir(px[idx_b] - pt*torch.cos(phi), py[idx_b] - pt*torch.sin(phi), pz[idx_b])
+            px2, py2, pz2 = norm_dir(px[idx_b] + pt*torch.cos(phi), py[idx_b] + pt*torch.sin(phi), pz[idx_b])
             
             gen_new = gen[idx_b] + 1
             evt_new = evt[idx_b]
@@ -286,8 +324,8 @@ class ShowerSimulation:
             z_h = z_new[idx_h]
             
             for i in range(5):
-                phi = torch.rand(N_h, device=self.device) * 2 * np.pi
-                px_c, py_c, pz_c = self._norm_dir(px[idx_h] + pt*torch.cos(phi), py[idx_h] + pt*torch.sin(phi), pz[idx_h])
+                phi = self._get_rand(N_h) * 2 * np.pi
+                px_c, py_c, pz_c = norm_dir(px[idx_h] + pt*torch.cos(phi), py[idx_h] + pt*torch.sin(phi), pz[idx_h])
                 c_pid = 5 if i < 2 else 4
                 child = torch.stack([torch.full_like(e_split, c_pid), e_split, x_h, y_h, z_h, px_c, py_c, pz_c, gen_new, evt_new], dim=1)
                 new_particles.append(child)
@@ -299,10 +337,10 @@ class ShowerSimulation:
             N_p0 = idx_p0.shape[0]
             E_p0 = E[idx_p0]
             pt = 0.135 / E_p0
-            phi = torch.rand(N_p0, device=self.device) * 2 * np.pi
+            phi = self._get_rand(N_p0) * 2 * np.pi
             
-            px1, py1, pz1 = self._norm_dir(px[idx_p0] + pt*torch.cos(phi), py[idx_p0] + pt*torch.sin(phi), pz[idx_p0])
-            px2, py2, pz2 = self._norm_dir(px[idx_p0] - pt*torch.cos(phi), py[idx_p0] - pt*torch.sin(phi), pz[idx_p0])
+            px1, py1, pz1 = norm_dir(px[idx_p0] + pt*torch.cos(phi), py[idx_p0] + pt*torch.sin(phi), pz[idx_p0])
+            px2, py2, pz2 = norm_dir(px[idx_p0] - pt*torch.cos(phi), py[idx_p0] - pt*torch.sin(phi), pz[idx_p0])
             
             gen_new = gen[idx_p0] + 1
             evt_new = evt[idx_p0]
