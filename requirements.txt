@@ -7,3 +7,4 @@ tqdm>=4.65,<5
 matplotlib>=3.7,<4
 plotly>=5.18,<7
 pytest>=7.4,<9
+scipy>=1.10,<2
