@@ -119,12 +119,88 @@ function TelescopeCamera({ index, pixelX, pixelY, charges, maxCharge, onPixelCli
   );
 }
 
+function OverlapCamera({ pixelX, pixelY, charges, hillasParams }) {
+  const r = useMemo(() => {
+    if (!pixelX || pixelX.length < 2) return 1;
+    let minD = Infinity;
+    for (let i = 1; i < pixelX.length; i++) {
+      const d = Math.hypot(pixelX[i] - pixelX[0], pixelY[i] - pixelY[0]);
+      if (d > 0 && d < minD) minD = d;
+    }
+    return minD / 1.732;
+  }, [pixelX, pixelY]);
+
+  const viewBox = useMemo(() => {
+    if (!pixelX || pixelX.length === 0) return "0 0 100 100";
+    const minX = Math.min(...pixelX) - r * 1.5;
+    const maxX = Math.max(...pixelX) + r * 1.5;
+    const minY = Math.min(...pixelY) - r * 1.5;
+    const maxY = Math.max(...pixelY) + r * 1.5;
+    return `${minX} ${minY} ${maxX - minX} ${maxY - minY}`;
+  }, [pixelX, pixelY, r]);
+
+  const combinedCharge = useMemo(() => {
+    return charges[0].map((_, i) => charges.reduce((sum, c) => sum + (c[i] || 0), 0));
+  }, [charges]);
+
+  const maxCharge = Math.max(...combinedCharge, 1);
+
+  // Line colors for the 4 telescopes
+  const telColors = ['#f87171', '#34d399', '#60a5fa', '#fbbf24'];
+
+  return (
+    <div className="camera-view glass" style={{ gridColumn: '1 / -1', height: '600px' }}>
+      <div className="camera-title" style={{display: 'flex', justifyContent: 'space-between'}}>
+        <span>Superimposed Array View</span>
+        <span style={{fontSize: '0.8em', color: 'var(--text-muted)'}}>Intersecting Hillas Major Axes</span>
+      </div>
+      <div className="camera-svg-container" style={{height: 'calc(100% - 40px)'}}>
+        <svg viewBox={viewBox} preserveAspectRatio="xMidYMid meet" className="camera-svg">
+          {/* 1. Draw overlapping charge hexagons */}
+          {pixelX.map((x, i) => {
+            const charge = combinedCharge[i];
+            const fill = charge > 0 ? getViridisColor(charge, maxCharge) : 'rgba(255,255,255,0.02)';
+            return <Hexagon key={`hex-${i}`} cx={x} cy={pixelY[i]} r={r*0.95} fill={fill} />;
+          })}
+          
+          {/* 2. Draw Hillas Major Axes */}
+          {hillasParams && hillasParams.map((h, i) => {
+            if (!h) return null;
+            // Line length of 2 degrees should easily span the camera
+            const L = 2.0; 
+            const x1 = h.centroid_x - L * Math.cos(h.psi);
+            const y1 = h.centroid_y - L * Math.sin(h.psi);
+            const x2 = h.centroid_x + L * Math.cos(h.psi);
+            const y2 = h.centroid_y + L * Math.sin(h.psi);
+            
+            return (
+              <g key={`axis-${i}`}>
+                {/* Centroid dot */}
+                <circle cx={h.centroid_x} cy={h.centroid_y} r={0.03} fill={telColors[i]} />
+                {/* Major axis line */}
+                <line 
+                  x1={x1} y1={y1} x2={x2} y2={y2} 
+                  stroke={telColors[i]} 
+                  strokeWidth="0.015" 
+                  strokeDasharray="0.05, 0.05"
+                  opacity="0.8"
+                />
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState(null);
   const [eventId, setEventId] = useState(0);
   const [eventData, setEventData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selectedPixel, setSelectedPixel] = useState(null);
+  const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'overlap'
 
   useEffect(() => {
     axios.get(`${API_BASE}/config`).then(res => {
@@ -208,6 +284,9 @@ export default function App() {
           <span style={{ color: 'var(--text-muted)' }}>
             Event {eventId + 1} / {config.num_events}
           </span>
+          <button className="btn" onClick={() => setViewMode(v => v === 'grid' ? 'overlap' : 'grid')}>
+            {viewMode === 'grid' ? 'Overlap View' : 'Grid View'}
+          </button>
           <button className="btn" onClick={handlePrev} disabled={eventId === 0 || loading}>
             <ChevronLeft size={18} /> Prev
           </button>
@@ -256,8 +335,8 @@ export default function App() {
           ) : null}
         </aside>
 
-        <main className="cameras-grid">
-          {eventData && [0, 1, 2, 3].map((i) => (
+        <main className="cameras-grid" style={viewMode === 'overlap' ? { display: 'flex' } : {}}>
+          {eventData && viewMode === 'grid' && [0, 1, 2, 3].map((i) => (
             <TelescopeCamera 
               key={i}
               index={i}
@@ -268,6 +347,14 @@ export default function App() {
               onPixelClick={(tel, pix) => setSelectedPixel({tel, pix})}
             />
           ))}
+          {eventData && viewMode === 'overlap' && (
+            <OverlapCamera 
+              pixelX={config.pixel_x}
+              pixelY={config.pixel_y}
+              charges={eventData.charge}
+              hillasParams={eventData.hillas}
+            />
+          )}
         </main>
       </div>
     </div>

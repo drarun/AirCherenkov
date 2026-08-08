@@ -28,6 +28,9 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
     os.makedirs(output_dir, exist_ok=True)
     
     # Compute initial direction vector from zenith/azimuth
+    # TODO: For diffuse cosmic-ray background simulations (to test background subtraction methods),
+    # we should modify this to allow per-event random solid-angle pointing (isotropic distribution)
+    # instead of a perfectly parallel beam for the entire batch.
     zen_rad = np.radians(zenith_deg)
     azi_rad = np.radians(azimuth_deg)
     px_init = np.sin(zen_rad) * np.cos(azi_rad)

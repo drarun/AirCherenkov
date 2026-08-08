@@ -10,13 +10,19 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 from sim.camera import Camera
 from recon.hillas import compute_hillas
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_dir", type=str, default="data/train_raw")
+    args = parser.parse_args()
+    
     diagnostics_dir = "DiagnosticPlots"
     os.makedirs(diagnostics_dir, exist_ok=True)
     
-    files = sorted(glob.glob('data/train_raw/sim_batch_*.pt'))
+    files = sorted(glob.glob(os.path.join(args.input_dir, 'sim_batch_*.pt')))
     if not files:
-        print("No simulation files found in data/train_raw/")
+        print(f"No simulation files found in {args.input_dir}")
         return
 
     print(f"Loading {len(files)} chunks...")
