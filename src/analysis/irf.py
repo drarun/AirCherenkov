@@ -23,9 +23,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import torch
 
-from recon.gnn import SpatiotemporalGNN
-from analysis.dataset import CherenkovDataset
-from torch_geometric.loader import DataLoader
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +203,9 @@ def run_gnn_inference(test_data_root, model_path, batch_size=128):
         pred_class_score – (N,) array  (sigmoid output, 0–1)
     """
     from sim.camera import Camera
+    from recon.gnn import SpatiotemporalGNN
+    from analysis.dataset import CherenkovDataset
+    from torch_geometric.loader import DataLoader
 
     cam = Camera(n_rings=12)
     edge_index = cam.edge_index
