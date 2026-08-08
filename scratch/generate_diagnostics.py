@@ -11,7 +11,7 @@ from sim.camera import Camera
 from recon.hillas import compute_hillas
 
 def main():
-    diagnostics_dir = "AirCherenkov_Diagnostics"
+    diagnostics_dir = "DiagnosticPlots"
     os.makedirs(diagnostics_dir, exist_ok=True)
     
     files = sorted(glob.glob('data/train_raw/sim_batch_*.pt'))

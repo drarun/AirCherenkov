@@ -9,4 +9,4 @@ data/
 *.json
 .vscode/
 
-AirCherenkov_Diagnostics/
+DiagnosticPlots/
