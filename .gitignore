@@ -8,3 +8,5 @@ data/
 *.png
 *.json
 .vscode/
+
+AirCherenkov_Diagnostics/

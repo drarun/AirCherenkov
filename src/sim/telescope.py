@@ -178,7 +178,7 @@ class Telescope:
 
 
 class VeritasTelescope(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, **kwargs):
+    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=1268.0, **kwargs):
         super().__init__(
             x_tel=x_tel,
             y_tel=y_tel,
@@ -186,7 +186,7 @@ class VeritasTelescope(Telescope):
             mirror_radius=6.0,
             focal_length=12.0,
             n_rings=12,
-            pixel_size=0.1,
+            pixel_size=0.15,
             **kwargs,
         )
 
@@ -258,9 +258,9 @@ class TelescopeArray:
         return TelescopeArray(
             [
                 VeritasTelescope(x_tel=0.0, y_tel=0.0, **telescope_kwargs),
-                VeritasTelescope(x_tel=100.0, y_tel=0.0, **telescope_kwargs),
-                VeritasTelescope(x_tel=0.0, y_tel=100.0, **telescope_kwargs),
-                VeritasTelescope(x_tel=100.0, y_tel=100.0, **telescope_kwargs),
+                VeritasTelescope(x_tel=85.04, y_tel=32.31, **telescope_kwargs),
+                VeritasTelescope(x_tel=34.12, y_tel=107.03, **telescope_kwargs),
+                VeritasTelescope(x_tel=-41.31, y_tel=53.94, **telescope_kwargs),
             ]
         )
 

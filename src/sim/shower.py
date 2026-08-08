@@ -449,7 +449,8 @@ class ShowerSimulation:
                 e_starts[:, 0], e_starts[:, 1], e_starts[:, 2],
                 e_ends[:, 0], e_ends[:, 1], e_ends[:, 2],
                 e_ps[:, 0], e_ps[:, 1], e_ps[:, 2],
-                e_Es, self.photon_yield_factor
+                e_Es, self.photon_yield_factor,
+                target_photons_per_packet=100.0
             )
 
     def get_cherenkov_dataframe(self, event_idx=0):

@@ -6,6 +6,7 @@ falling back to CPU tensors. All heavy array operations go through
 this module so the rest of the codebase stays backend-agnostic.
 """
 
+import os
 import numpy as np
 
 try:
@@ -181,8 +182,11 @@ def _validate_generator(generator, device):
 def _packet_chunk_limit(device):
     """Conservative bound for packet construction temporaries."""
     if device.type == 'cuda':
-        free_bytes, _ = torch.cuda.mem_get_info(device)
-        return max(1, min(5_000_000, int(free_bytes * 0.35) // 128))
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            return max(1_000_000, min(5_000_000, int(free_bytes * 0.35) // 128))
+        except Exception:
+            return 1_000_000
     return 1_000_000
 
 
@@ -282,6 +286,8 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
     segment_start = 0
     base_packets = 0
     n_valid_segments = packet_counts.numel()
+    if os.environ.get('AIRCHERENKOV_DEBUG', '0') == '1':
+        print(f"[DEBUG] n_valid_segments: {n_valid_segments}, total_packets: {total_packets}, packet_limit: {packet_limit}")
 
     with torch.no_grad():
         while segment_start < n_valid_segments:
@@ -937,6 +943,9 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
 
 def _ray_pair_chunk_limit(device):
     if device.type == 'cuda':
-        free_bytes, _ = torch.cuda.mem_get_info(device)
-        return max(1, min(5_000_000, int(free_bytes * 0.25) // 64))
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            return max(1_000_000, min(5_000_000, int(free_bytes * 0.25) // 64))
+        except Exception:
+            return 1_000_000
     return 1_000_000

@@ -14,11 +14,16 @@ import argparse
 
 def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, save_every=1000, 
                            output_dir='data/train_raw', zenith_deg=0.0, azimuth_deg=0.0,
-                           e_min=100.0, e_max=10000.0, spectral_index=2.0, impact_radius=250.0):
+                           e_min=100.0, e_max=10000.0, spectral_index=2.0, impact_radius=250.0,
+                           debug=False):
     """
     Generates Monte Carlo simulation data using the batched GPU tensor pipeline.
     Saves in chunks so the process can be safely interrupted and resumed.
     """
+    if debug:
+        os.environ['AIRCHERENKOV_DEBUG'] = '1'
+    else:
+        os.environ['AIRCHERENKOV_DEBUG'] = '0'
     os.makedirs(output_dir, exist_ok=True)
     
     # Compute initial direction vector from zenith/azimuth
@@ -81,6 +86,10 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
     passed_trigger_count = 0
     
     # Main generation loop
+    total_target_events = events_remaining
+    events_completed_session = 0
+    last_pct_reported = 0
+    
     pbar = tqdm(total=events_remaining, desc="MC Generation")
     
     try:
@@ -142,8 +151,13 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                     tel.x_tel += ix
                     tel.y_tel += iy
                     
-                # Hardware Trigger: At least 2 telescopes with > 20 PE
-                trigger_count = sum(1 for trace, gain in img_outputs if np.sum(trace) > 20)
+                # Hardware Trigger: At least 2 telescopes with >= 3 pixels having > 5 PE in a single time bin
+                trigger_count = 0
+                for trace, gain in img_outputs:
+                    max_pe_per_pixel = np.max(trace, axis=1)
+                    if np.sum(max_pe_per_pixel > 5.0) >= 3:
+                        trigger_count += 1
+                        
                 if trigger_count >= 2:
                     passed_trigger_count += 1
                     traces = [trace for trace, gain in img_outputs]
@@ -161,7 +175,14 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                     })
             
             events_remaining -= current_batch_size
+            events_completed_session += current_batch_size
             pbar.update(current_batch_size)
+            
+            current_pct = int((events_completed_session / total_target_events) * 100)
+            if current_pct > last_pct_reported:
+                for p in range(last_pct_reported + 1, current_pct + 1):
+                    pbar.write(f"[Progress {p}%] {events_completed_session}/{total_target_events} showers simulated ({passed_trigger_count} triggered)")
+                last_pct_reported = current_pct
             
             # Save chunk
             if len(current_chunk) >= save_every or events_remaining == 0:
@@ -194,6 +215,7 @@ if __name__ == '__main__':
     parser.add_argument('--e_max', type=float, default=30000.0, help='Max energy in GeV')
     parser.add_argument('--spectral_index', type=float, default=2.0, help='Spectral index for E^-alpha sampling')
     parser.add_argument('--impact_radius', type=float, default=350.0, help='Max impact parameter radius in meters')
+    parser.add_argument('--debug', action='store_true', help='Enable verbose DEBUG output')
     args = parser.parse_args()
     
     generate_training_data(
@@ -207,5 +229,6 @@ if __name__ == '__main__':
         e_min=args.e_min,
         e_max=args.e_max,
         spectral_index=args.spectral_index,
-        impact_radius=args.impact_radius
+        impact_radius=args.impact_radius,
+        debug=args.debug
     )
