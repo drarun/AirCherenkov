@@ -368,6 +368,39 @@ class ShowerSimulation:
             self.active = torch.cat(new_particles, dim=0)
         else:
             self.active = torch.empty((0, 10), device=self.device)
+            
+    def save_state(self, filepath="shower_checkpoint.pt"):
+        state = {
+            'active': self.active,
+            'entropy_pool': self.entropy_pool,
+            'entropy_idx': self.entropy_idx,
+            'c_segs_start': self.c_segs_start,
+            'c_segs_end': self.c_segs_end,
+            'c_segs_p': self.c_segs_p,
+            'c_segs_E': self.c_segs_E,
+            'c_segs_event_id': self.c_segs_event_id,
+            'cherenkov_photons_by_event': self.cherenkov_photons_by_event,
+            'batch_size': self.batch_size,
+            'critical_energy': self.critical_energy,
+            'photon_yield_factor': self.photon_yield_factor
+        }
+        torch.save(state, filepath)
+        
+    def load_state(self, filepath="shower_checkpoint.pt"):
+        state = torch.load(filepath, map_location=self.device)
+        self.active = state['active']
+        self.entropy_pool = state['entropy_pool']
+        self.entropy_idx = state['entropy_idx']
+        self.c_segs_start = state['c_segs_start']
+        self.c_segs_end = state['c_segs_end']
+        self.c_segs_p = state['c_segs_p']
+        self.c_segs_E = state['c_segs_E']
+        self.c_segs_event_id = state['c_segs_event_id']
+        self.cherenkov_photons_by_event = state['cherenkov_photons_by_event']
+        self.batch_size = state['batch_size']
+        self.critical_energy = state['critical_energy']
+        self.photon_yield_factor = state['photon_yield_factor']
+
         
     def run(self, max_generations=12, verbose=True):
         t0 = time.time()
