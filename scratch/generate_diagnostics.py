@@ -139,17 +139,75 @@ def main():
     plt.savefig(os.path.join(diagnostics_dir, "03_hillas_width_length.png"), bbox_inches='tight')
     plt.close()
 
-    # 4. Lateral Distribution of Size (Size vs Impact Radius)
+    gamma_size = np.array(gamma_size)
+    hadron_size = np.array(hadron_size)
+
+    # 4. Lateral Distribution of Size (Size vs Impact Radius) Profile
     plt.figure(figsize=(8, 6), dpi=150)
-    plt.scatter(gamma_r, gamma_size, color='#38BDF8', alpha=0.2, s=5, label='Gammas')
+    # Scatter plot background
+    plt.scatter(gamma_r, gamma_size, color='#38BDF8', alpha=0.1, s=2, label='Gammas (All)')
+    
+    # Calculate profile (mean in bins)
+    bins = np.arange(0, 800, 25.0)
+    bin_centers = (bins[:-1] + bins[1:]) / 2.0
+    
+    # Compute mean size in each bin
+    gamma_mean_size = np.zeros_like(bin_centers)
+    hadron_mean_size = np.zeros_like(bin_centers)
+    
+    for i in range(len(bins)-1):
+        # Gammas
+        mask_g = (gamma_r >= bins[i]) & (gamma_r < bins[i+1])
+        if np.any(mask_g):
+            gamma_mean_size[i] = np.mean(gamma_size[mask_g])
+        else:
+            gamma_mean_size[i] = np.nan
+            
+        # Hadrons
+        mask_h = (hadron_r >= bins[i]) & (hadron_r < bins[i+1])
+        if np.any(mask_h):
+            hadron_mean_size[i] = np.mean(hadron_size[mask_h])
+        else:
+            hadron_mean_size[i] = np.nan
+            
+    plt.plot(bin_centers, gamma_mean_size, color='#38BDF8', lw=3, label='Gammas (Mean LDF)')
+    plt.plot(bin_centers, hadron_mean_size, color='#F43F5E', lw=3, label='Hadrons (Mean LDF)')
+
     plt.yscale('log')
     plt.xlim(0, 800)
-    plt.xlabel('Impact Radius [m]')
-    plt.ylabel('Total Size [PE]')
-    plt.title('Lateral Distribution (Size vs Core Distance) for Gammas')
-    plt.grid(True, alpha=0.1)
+    plt.xlabel('Impact Radius $r$ [m]')
+    plt.ylabel('Total Size (Photoelectrons) [PE]')
+    plt.title('Lateral Density Function (Size Profile vs Radius)')
+    plt.grid(True, alpha=0.2)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(diagnostics_dir, "04_lateral_distribution_size.png"), bbox_inches='tight')
+    plt.close()
+    
+    # 5. Hillas Length 1D Distribution
+    plt.figure(figsize=(8, 6), dpi=150)
+    bins_length = np.linspace(0, 0.3, 50)
+    plt.hist(gamma_length, bins=bins_length, alpha=0.5, color='#38BDF8', label='Gammas', density=True)
+    plt.hist(hadron_length, bins=bins_length, alpha=0.5, color='#F43F5E', label='Hadrons', density=True)
+    plt.xlabel('Hillas Length [deg]')
+    plt.ylabel('Density')
+    plt.title('Hillas Length Distribution (Gammas vs Hadrons)')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(diagnostics_dir, "05_hillas_length_dist.png"), bbox_inches='tight')
+    plt.close()
+
+    # 6. Hillas Width 1D Distribution
+    plt.figure(figsize=(8, 6), dpi=150)
+    bins_width = np.linspace(0, 0.15, 50)
+    plt.hist(gamma_width, bins=bins_width, alpha=0.5, color='#38BDF8', label='Gammas', density=True)
+    plt.hist(hadron_width, bins=bins_width, alpha=0.5, color='#F43F5E', label='Hadrons', density=True)
+    plt.xlabel('Hillas Width [deg]')
+    plt.ylabel('Density')
+    plt.title('Hillas Width Distribution (Gammas vs Hadrons)')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(diagnostics_dir, "06_hillas_width_dist.png"), bbox_inches='tight')
     plt.close()
     
     print(f"Successfully generated all diagnostic plots in {diagnostics_dir}")
