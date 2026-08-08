@@ -16,19 +16,48 @@ except ImportError:
 
 # ── Device selection ──────────────────────────────────────────────────────────
 
-def get_device():
-    """Returns the best available torch device, or None if torch is unavailable."""
-    if not HAS_TORCH:
-        return None
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    return torch.device('cpu')
+def get_device(requested='auto'):
+    """Resolve an explicitly requested Torch device.
 
-def device_info():
+    ``requested`` may be ``"auto"`` (the historical CUDA-then-CPU policy),
+    ``"cpu"``, ``"cuda"``, or a :class:`torch.device`.  Asking for CUDA on a
+    host where it is unavailable is an error rather than a silent CPU fallback.
+    Calls without an argument retain the original behavior.
+    """
+    if requested is None:
+        requested = 'auto'
+
+    if not HAS_TORCH:
+        if isinstance(requested, str) and requested.lower() in ('auto', 'cpu'):
+            return None
+        raise RuntimeError("PyTorch is required for the requested compute device")
+
+    if isinstance(requested, str):
+        normalized = requested.lower()
+        if normalized == 'auto':
+            return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if normalized not in ('cpu', 'cuda'):
+            raise ValueError("device must be 'auto', 'cpu', 'cuda', or torch.device")
+        device = torch.device(normalized)
+    elif isinstance(requested, torch.device):
+        device = requested
+    else:
+        raise ValueError("device must be 'auto', 'cpu', 'cuda', or torch.device")
+
+    if device.type not in ('cpu', 'cuda'):
+        raise ValueError("Only CPU and CUDA devices are supported")
+    if device.type == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError(f"CUDA device index {device.index} is not available")
+    return device
+
+def device_info(requested='auto'):
     """Returns a human-readable string describing the compute backend."""
     if not HAS_TORCH:
         return "NumPy (CPU only — install PyTorch for GPU acceleration)"
-    dev = get_device()
+    dev = get_device(requested)
     if dev.type == 'cuda':
         name = torch.cuda.get_device_name(0)
         mem = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -53,674 +82,861 @@ def to_numpy(tensor):
         return tensor
     return tensor.detach().cpu().numpy()
 
+
+def _resolve_requested_device(requested):
+    # Calling get_device() without an argument for auto also preserves callers
+    # that monkeypatch the historical zero-argument helper.
+    if requested is None or (
+        isinstance(requested, str) and requested.lower() == 'auto'
+    ):
+        return get_device()
+    return get_device(requested)
+
 # ── Cherenkov pool computation (the main GPU kernel) ──────────────────────────
 
 def compute_cherenkov_pool_gpu(seg_x1, seg_y1, seg_z1,
                                 seg_x2, seg_y2, seg_z2,
                                 seg_px, seg_py, seg_pz,
                                 seg_energy, photon_yield_factor,
-                                max_photons_per_segment=50000):
-    """
-    Fully vectorized Cherenkov photon generation on GPU (or CPU fallback).
-    
-    Takes flat arrays of track segment endpoints and energies,
-    returns dict of numpy arrays with photon emission and ground positions.
-    
-    Parameters
-    ----------
-    seg_x1, seg_y1, seg_z1 : array-like
-        Start positions of each track segment (meters).
-    seg_x2, seg_y2, seg_z2 : array-like
-        End positions of each track segment (meters).
-    seg_px, seg_py, seg_pz : array-like
-        Particle direction at each segment (normalized).
-    seg_energy : array-like
-        Particle energy for each segment (GeV).
-    photon_yield_factor : float
-        Multiplicative factor on the Frank-Tamm yield.
-    max_photons_per_segment : int
-        Cap on photons per segment to prevent OOM.
-        
-    Returns
-    -------
-    dict with keys 'x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground',
-    each a numpy array.
-    """
-    H = 7640.0
-    eta_0 = 0.000293
-    m_e = 0.000511
+                                max_photons_per_segment=50000,
+                                seg_event_id=None,
+                                target_photons_per_packet=1.0,
+                                max_packets_per_segment=None,
+                                device='auto', generator=None):
+    """Generate weighted Cherenkov photon packets and trace them to ground.
 
-    device = get_device()
+    The five historical position arrays are retained.  ``weight`` gives the
+    physical photon multiplicity represented by each returned packet, so
+    limiting packet count no longer silently loses light.  If
+    ``seg_event_id`` is supplied, a corresponding int32 ``event_id`` array is
+    returned as well.
 
-    if HAS_TORCH and device is not None:
-        return _cherenkov_torch(seg_x1, seg_y1, seg_z1,
-                                seg_x2, seg_y2, seg_z2,
-                                seg_px, seg_py, seg_pz,
-                                seg_energy, photon_yield_factor,
-                                max_photons_per_segment,
-                                H, eta_0, m_e, device)
+    Packet emission locations and azimuths are stratified within each segment.
+    The local refractive index and the electron beta-dependent Cherenkov angle
+    are evaluated at each packet's emission altitude.  The packet weights are
+    a stratified quadrature of the segment's Frank--Tamm yield.
+
+    ``max_photons_per_segment`` remains as the legacy positional packet cap.
+    New code may use ``max_packets_per_segment`` to state that intent directly.
+    """
+    if not np.isfinite(photon_yield_factor) or photon_yield_factor < 0:
+        raise ValueError("photon_yield_factor must be finite and non-negative")
+    if not np.isfinite(target_photons_per_packet) or target_photons_per_packet <= 0:
+        raise ValueError("target_photons_per_packet must be finite and greater than zero")
+
+    packet_cap = (
+        max_photons_per_segment
+        if max_packets_per_segment is None
+        else max_packets_per_segment
+    )
+    if not isinstance(packet_cap, (int, np.integer)) or packet_cap <= 0:
+        raise ValueError("max_packets_per_segment must be a positive integer")
+
+    resolved_device = _resolve_requested_device(device)
+    if HAS_TORCH and resolved_device is not None:
+        return _cherenkov_packets_torch(
+            seg_x1, seg_y1, seg_z1,
+            seg_x2, seg_y2, seg_z2,
+            seg_px, seg_py, seg_pz,
+            seg_energy, photon_yield_factor,
+            int(packet_cap), seg_event_id,
+            float(target_photons_per_packet), resolved_device, generator,
+        )
+
+    return _cherenkov_packets_numpy(
+        seg_x1, seg_y1, seg_z1,
+        seg_x2, seg_y2, seg_z2,
+        seg_px, seg_py, seg_pz,
+        seg_energy, photon_yield_factor,
+        int(packet_cap), seg_event_id,
+        float(target_photons_per_packet), generator,
+    )
+
+
+_PHOTON_POSITION_KEYS = ('x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground')
+
+
+def _empty_photon_packets(include_event_id=False):
+    result = {
+        key: np.empty(0, dtype=np.float32)
+        for key in (*_PHOTON_POSITION_KEYS, 'weight')
+    }
+    if include_event_id:
+        result['event_id'] = np.empty(0, dtype=np.int32)
+    return result
+
+
+def _validate_generator(generator, device):
+    if generator is None:
+        return
+    if not isinstance(generator, torch.Generator):
+        raise TypeError("generator must be a torch.Generator")
+    generator_device = torch.device(generator.device)
+    if generator_device.type != device.type:
+        raise ValueError(
+            f"generator is on {generator_device.type}, but computation is on {device.type}"
+        )
+
+
+def _packet_chunk_limit(device):
+    """Conservative bound for packet construction temporaries."""
+    if device.type == 'cuda':
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        return max(1, min(5_000_000, int(free_bytes * 0.35) // 128))
+    return 1_000_000
+
+
+def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
+                               seg_x2, seg_y2, seg_z2,
+                               seg_px, seg_py, seg_pz,
+                               seg_energy, photon_yield_factor,
+                               max_packets_per_segment, seg_event_id,
+                               target_photons_per_packet, device, generator):
+    dtype = torch.float32
+    _validate_generator(generator, device)
+
+    raw_values = (
+        seg_x1, seg_y1, seg_z1, seg_x2, seg_y2, seg_z2,
+        seg_px, seg_py, seg_pz, seg_energy,
+    )
+    tensors = [
+        torch.as_tensor(value, dtype=dtype, device=device).reshape(-1)
+        for value in raw_values
+    ]
+    lengths = {tensor.numel() for tensor in tensors}
+    if len(lengths) != 1:
+        raise ValueError("All segment arrays must have the same length")
+    n_segments = tensors[0].numel()
+    include_event_id = seg_event_id is not None
+    if n_segments == 0:
+        return _empty_photon_packets(include_event_id)
+
+    if include_event_id:
+        event_ids = torch.as_tensor(
+            seg_event_id, dtype=torch.int32, device=device
+        ).reshape(-1)
+        if event_ids.numel() != n_segments:
+            raise ValueError("seg_event_id must have the same length as segment arrays")
     else:
-        return _cherenkov_numpy(seg_x1, seg_y1, seg_z1,
-                                seg_x2, seg_y2, seg_z2,
-                                seg_px, seg_py, seg_pz,
-                                seg_energy, photon_yield_factor,
-                                max_photons_per_segment,
-                                H, eta_0, m_e)
+        event_ids = None
 
+    x1, y1, z1, x2, y2, z2, px, py, pz, energies = tensors
+    delta = torch.stack((x2 - x1, y2 - y1, z2 - z1), dim=1)
+    segment_length = torch.linalg.vector_norm(delta, dim=1)
+    z_mid = 0.5 * (z1 + z2)
 
-def _cherenkov_torch(seg_x1, seg_y1, seg_z1,
-                      seg_x2, seg_y2, seg_z2,
-                      seg_px, seg_py, seg_pz,
-                      seg_energy, photon_yield_factor,
-                      max_photons_per_segment,
-                      H, eta_0, m_e, device):
-    """Cherenkov pool computation using PyTorch tensors with chunked processing.
-    
-    Uses float32 for photon positions to halve memory usage, and applies
-    proportional thinning if the total photon count exceeds a budget
-    (similar to CORSIKA thinning).
-    """
-    DTYPE = torch.float32
-    MAX_TOTAL_PHOTONS = 50_000_000  # 50M photon budget (~1 GB total)
-    
-    # Compute segment properties on GPU (these are small — one per track segment)
-    x1 = torch.as_tensor(seg_x1, dtype=DTYPE, device=device)
-    y1 = torch.as_tensor(seg_y1, dtype=DTYPE, device=device)
-    z1 = torch.as_tensor(seg_z1, dtype=DTYPE, device=device)
-    x2 = torch.as_tensor(seg_x2, dtype=DTYPE, device=device)
-    y2 = torch.as_tensor(seg_y2, dtype=DTYPE, device=device)
-    z2 = torch.as_tensor(seg_z2, dtype=DTYPE, device=device)
-    px = torch.as_tensor(seg_px, dtype=DTYPE, device=device)
-    py = torch.as_tensor(seg_py, dtype=DTYPE, device=device)
-    pz = torch.as_tensor(seg_pz, dtype=DTYPE, device=device)
-    energies = torch.as_tensor(seg_energy, dtype=DTYPE, device=device)
+    # Electron beta and midpoint yield are used only to choose packet count.
+    # The actual local angle and yield are recomputed at each packet altitude.
+    scale_height = 7640.0
+    eta_0 = 0.000293
+    electron_mass_gev = 0.000511
+    beta_sq = torch.clamp(
+        1.0 - (electron_mass_gev / torch.clamp(energies, min=electron_mass_gev)) ** 2,
+        min=0.0,
+        max=1.0,
+    )
+    n_mid = 1.0 + eta_0 * torch.exp(-torch.clamp(z_mid, min=0.0) / scale_height)
+    sin2_mid = torch.clamp(
+        1.0 - 1.0 / torch.clamp(beta_sq * n_mid.square(), min=1e-20),
+        min=0.0,
+        max=1.0,
+    )
+    estimated_yield = (
+        segment_length * sin2_mid * 37000.0 * float(photon_yield_factor)
+    )
+    candidate = (
+        (segment_length > 0)
+        & (torch.maximum(z1, z2) > 0)
+        & (estimated_yield > 0)
+    )
+    if not bool(torch.any(candidate)):
+        return _empty_photon_packets(include_event_id)
 
-    # Midpoints and segment lengths
-    z_mid = (z1 + z2) / 2.0
-    x_mid = (x1 + x2) / 2.0
-    y_mid = (y1 + y2) / 2.0
-    ds = torch.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
+    x1 = x1[candidate]
+    y1 = y1[candidate]
+    z1 = z1[candidate]
+    x2 = x2[candidate]
+    y2 = y2[candidate]
+    z2 = z2[candidate]
+    segment_length = segment_length[candidate]
+    beta_sq = beta_sq[candidate]
+    estimated_yield = estimated_yield[candidate]
+    directions = torch.stack((px[candidate], py[candidate], pz[candidate]), dim=1)
+    directions = directions / torch.clamp(
+        torch.linalg.vector_norm(directions, dim=1, keepdim=True), min=1e-12
+    )
+    if event_ids is not None:
+        event_ids = event_ids[candidate]
 
-    # Atmospheric optics
-    eta_z = eta_0 * torch.exp(-z_mid / H)
-    E_thresh = m_e / torch.sqrt(2 * eta_z)
-    theta_c = torch.sqrt(2 * eta_z)
+    packet_counts = torch.ceil(
+        estimated_yield / target_photons_per_packet
+    ).clamp(min=1, max=max_packets_per_segment).to(torch.int64)
+    cumulative = torch.cumsum(packet_counts, dim=0)
+    total_packets = int(cumulative[-1].item())
+    if total_packets == 0:
+        return _empty_photon_packets(include_event_id)
 
-    # Photon counts per segment
-    n_phot = (ds * theta_c**2 * 37000 * photon_yield_factor).to(torch.int64)
-    n_phot = torch.clamp(n_phot, max=max_photons_per_segment)
+    packet_limit = _packet_chunk_limit(device)
+    packet_chunks = []
+    event_chunks = []
+    segment_start = 0
+    base_packets = 0
+    n_valid_segments = packet_counts.numel()
 
-    # Valid mask
-    valid = (z_mid > 0) & (energies > E_thresh) & (n_phot > 0)
-    
-    if not torch.any(valid):
-        empty = np.array([], dtype=np.float32)
-        return {k: empty for k in ['x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground']}
+    with torch.no_grad():
+        while segment_start < n_valid_segments:
+            target_end = base_packets + packet_limit
+            segment_end = int(
+                torch.searchsorted(
+                    cumulative, torch.tensor(target_end, device=device), right=True
+                ).item()
+            )
+            segment_end = max(segment_start + 1, min(segment_end, n_valid_segments))
 
-    x_mid_v = x_mid[valid].cpu()
-    y_mid_v = y_mid[valid].cpu()
-    z_mid_v = z_mid[valid].cpu()
-    theta_c_v = theta_c[valid].cpu()
-    px_v = px[valid].cpu()
-    py_v = py[valid].cpu()
-    pz_v = pz[valid].cpu()
-    n_phot_v = n_phot[valid].cpu()
+            counts = packet_counts[segment_start:segment_end]
+            local_segment = torch.repeat_interleave(
+                torch.arange(counts.numel(), device=device), counts
+            )
+            n_chunk = local_segment.numel()
+            offsets = torch.cumsum(counts, dim=0) - counts
+            ordinal = torch.arange(n_chunk, device=device) - torch.repeat_interleave(
+                offsets, counts
+            )
+            count_per_packet = counts[local_segment]
 
-    # Free GPU memory from the segment-level computation
-    del x1, y1, z1, x2, y2, z2, px, py, pz, energies, z_mid, x_mid, y_mid, ds
-    del eta_z, E_thresh, theta_c, n_phot, valid
-    torch.cuda.empty_cache()
+            longitudinal_jitter = torch.rand(
+                n_chunk, dtype=dtype, device=device, generator=generator
+            )
+            fraction = (
+                ordinal.to(dtype) + longitudinal_jitter
+            ) / count_per_packet.to(dtype)
 
-    total_photons = int(torch.sum(n_phot_v).item())
-    
-    # Apply proportional thinning if over budget
-    if total_photons > MAX_TOTAL_PHOTONS:
-        thin_factor = MAX_TOTAL_PHOTONS / total_photons
-        n_phot_v = (n_phot_v.float() * thin_factor).to(torch.int64)
-        n_phot_v = torch.clamp(n_phot_v, min=0)
-        # Remove segments that got thinned to zero
-        keep = n_phot_v > 0
-        x_mid_v = x_mid_v[keep]
-        y_mid_v = y_mid_v[keep]
-        z_mid_v = z_mid_v[keep]
-        theta_c_v = theta_c_v[keep]
-        px_v = px_v[keep]
-        py_v = py_v[keep]
-        pz_v = pz_v[keep]
-        n_phot_v = n_phot_v[keep]
-        total_photons = int(torch.sum(n_phot_v).item())
+            sx1 = x1[segment_start:segment_end]
+            sy1 = y1[segment_start:segment_end]
+            sz1 = z1[segment_start:segment_end]
+            sx2 = x2[segment_start:segment_end]
+            sy2 = y2[segment_start:segment_end]
+            sz2 = z2[segment_start:segment_end]
+            xe = sx1[local_segment] + fraction * (sx2 - sx1)[local_segment]
+            ye = sy1[local_segment] + fraction * (sy2 - sy1)[local_segment]
+            ze = sz1[local_segment] + fraction * (sz2 - sz1)[local_segment]
 
-    n_segments = len(n_phot_v)
-    
-    # Determine chunk size based on available GPU memory
-    gpu_mem = torch.cuda.get_device_properties(0).total_memory
-    safe_mem = int(gpu_mem * 0.6)  # Use 60% of VRAM
-    bytes_per_photon = 100  # Updated estimate for extra arrays
-    max_photons_per_chunk = safe_mem // bytes_per_photon
+            local_n = 1.0 + eta_0 * torch.exp(
+                -torch.clamp(ze, min=0.0) / scale_height
+            )
+            local_beta_sq = beta_sq[segment_start:segment_end][local_segment]
+            local_sin2 = torch.clamp(
+                1.0 - 1.0 / torch.clamp(
+                    local_beta_sq * local_n.square(), min=1e-20
+                ),
+                min=0.0,
+                max=1.0,
+            )
+            cos_theta = torch.rsqrt(torch.clamp(
+                local_beta_sq * local_n.square(), min=1.0
+            ))
+            cos_theta = torch.clamp(cos_theta, min=-1.0, max=1.0)
+            sin_theta = torch.sqrt(local_sin2)
 
-    # Accumulate results on CPU
-    result_xe, result_ye, result_ze = [], [], []
-    result_xg, result_yg = [], []
+            chunk_directions = directions[segment_start:segment_end]
+            reference = torch.zeros_like(chunk_directions)
+            reference[:, 0] = 1.0
+            parallel = torch.abs(chunk_directions[:, 0]) > 0.9
+            reference[parallel, 0] = 0.0
+            reference[parallel, 1] = 1.0
+            basis1 = torch.linalg.cross(chunk_directions, reference, dim=1)
+            basis1 = basis1 / torch.clamp(
+                torch.linalg.vector_norm(basis1, dim=1, keepdim=True), min=1e-12
+            )
+            basis2 = torch.linalg.cross(chunk_directions, basis1, dim=1)
 
-    # Process segments in chunks that fit in GPU memory
-    seg_start = 0
-    while seg_start < n_segments:
-        # Find how many segments fit in this chunk
-        cumsum = torch.cumsum(n_phot_v[seg_start:], dim=0)
-        fits = cumsum <= max_photons_per_chunk
-        if not torch.any(fits):
-            # Single segment exceeds chunk — process it alone
-            seg_end = seg_start + 1
-        else:
-            seg_end = seg_start + int(fits.sum().item())
-        
-        # Slice this chunk's segment data
-        chunk_x = x_mid_v[seg_start:seg_end].to(device)
-        chunk_y = y_mid_v[seg_start:seg_end].to(device)
-        chunk_z = z_mid_v[seg_start:seg_end].to(device)
-        chunk_theta_c = theta_c_v[seg_start:seg_end].to(device)
-        chunk_px = px_v[seg_start:seg_end].to(device)
-        chunk_py = py_v[seg_start:seg_end].to(device)
-        chunk_pz = pz_v[seg_start:seg_end].to(device)
-        chunk_n = n_phot_v[seg_start:seg_end].to(device)
+            azimuth_jitter = torch.rand(
+                n_chunk, dtype=dtype, device=device, generator=generator
+            )
+            phi = 2.0 * torch.pi * (
+                ordinal.to(dtype) + azimuth_jitter
+            ) / count_per_packet.to(dtype)
+            direction = chunk_directions[local_segment]
+            e1 = basis1[local_segment]
+            e2 = basis2[local_segment]
+            photon_direction = (
+                direction * cos_theta[:, None]
+                + e1 * (sin_theta * torch.cos(phi))[:, None]
+                + e2 * (sin_theta * torch.sin(phi))[:, None]
+            )
 
-        # Generate photons for this chunk on GPU
-        xe = torch.repeat_interleave(chunk_x, chunk_n)
-        ye = torch.repeat_interleave(chunk_y, chunk_n)
-        ze = torch.repeat_interleave(chunk_z, chunk_n)
-        tc = torch.repeat_interleave(chunk_theta_c, chunk_n)
-        dx = torch.repeat_interleave(chunk_px, chunk_n)
-        dy = torch.repeat_interleave(chunk_py, chunk_n)
-        dz = torch.repeat_interleave(chunk_pz, chunk_n)
+            distance_to_ground = -ze / photon_direction[:, 2]
+            reaches_ground = (
+                (ze > 0)
+                & (photon_direction[:, 2] < 0)
+                & torch.isfinite(distance_to_ground)
+                & (distance_to_ground >= 0)
+                & (local_sin2 > 0)
+            )
+            x_ground = xe + distance_to_ground * photon_direction[:, 0]
+            y_ground = ye + distance_to_ground * photon_direction[:, 1]
 
-        # Normalize direction vector
-        norm = torch.sqrt(dx**2 + dy**2 + dz**2)
-        dx = dx / norm
-        dy = dy / norm
-        dz = dz / norm
+            # Stratified quadrature of the Frank--Tamm yield along the segment.
+            # This preserves the local altitude/beta dependence instead of
+            # forcing every long segment to use its midpoint refractivity.
+            packet_weight = (
+                segment_length[segment_start:segment_end][local_segment]
+                * 37000.0
+                * float(photon_yield_factor)
+                * local_sin2
+                / count_per_packet.to(dtype)
+            )
+            packet_values = torch.stack(
+                (xe, ye, ze, x_ground, y_ground, packet_weight), dim=1
+            )[reaches_ground]
+            packet_chunks.append(packet_values.cpu().numpy())
+            if event_ids is not None:
+                chunk_events = event_ids[segment_start:segment_end][local_segment]
+                event_chunks.append(chunk_events[reaches_ground].cpu().numpy())
 
-        # Orthonormal basis
-        ref_x = torch.ones_like(dx)
-        ref_y = torch.zeros_like(dx)
-        ref_z = torch.zeros_like(dx)
+            segment_start = segment_end
+            base_packets = int(cumulative[segment_end - 1].item())
 
-        parallel_x = torch.abs(dx) > 0.9
-        ref_x[parallel_x] = 0.0
-        ref_y[parallel_x] = 1.0
-
-        e1x = dy * ref_z - dz * ref_y
-        e1y = dz * ref_x - dx * ref_z
-        e1z = dx * ref_y - dy * ref_x
-        
-        e1_norm = torch.sqrt(e1x**2 + e1y**2 + e1z**2)
-        e1x = e1x / e1_norm
-        e1y = e1y / e1_norm
-        e1z = e1z / e1_norm
-
-        e2x = dy * e1z - dz * e1y
-        e2y = dz * e1x - dx * e1z
-        e2z = dx * e1y - dy * e1x
-
-        chunk_total = int(chunk_n.sum().item())
-        phis = torch.rand(chunk_total, dtype=DTYPE, device=device) * (2 * torch.pi)
-
-        cos_tc = torch.cos(tc)
-        sin_tc = torch.sin(tc)
-        cos_phi = torch.cos(phis)
-        sin_phi = torch.sin(phis)
-
-        photon_dx = dx * cos_tc + e1x * sin_tc * cos_phi + e2x * sin_tc * sin_phi
-        photon_dy = dy * cos_tc + e1y * sin_tc * cos_phi + e2y * sin_tc * sin_phi
-        photon_dz = dz * cos_tc + e1z * sin_tc * cos_phi + e2z * sin_tc * sin_phi
-
-        # Trace to ground z=0
-        t = -ze / photon_dz
-        valid_photon = (photon_dz < 0) & (t >= 0)
-
-        xg = xe + t * photon_dx
-        yg = ye + t * photon_dy
-
-        # Filter out photons that never reach ground
-        xg = xg[valid_photon]
-        yg = yg[valid_photon]
-        xe_v = xe[valid_photon]
-        ye_v = ye[valid_photon]
-        ze_v = ze[valid_photon]
-
-        # Transfer to CPU and append to prevent VRAM overflow (OOM paging)
-        result_xe.append(xe_v.cpu().numpy())
-        result_ye.append(ye_v.cpu().numpy())
-        result_ze.append(ze_v.cpu().numpy())
-        result_xg.append(xg.cpu().numpy())
-        result_yg.append(yg.cpu().numpy())
-
-        # Free GPU memory for next chunk
-        del xe, ye, ze, tc, dx, dy, dz, ref_x, ref_y, ref_z, e1x, e1y, e1z
-        del e2x, e2y, e2z, phis, cos_tc, sin_tc, cos_phi, sin_phi
-        del photon_dx, photon_dy, photon_dz, t, valid_photon, xg, yg
-        del xe_v, ye_v, ze_v
-        del chunk_x, chunk_y, chunk_z, chunk_theta_c, chunk_px, chunk_py, chunk_pz, chunk_n
-        torch.cuda.empty_cache()
-
-        seg_start = seg_end
-
-    return {
-        'x_emit': np.concatenate(result_xe) if result_xe else np.array([], dtype=np.float32),
-        'y_emit': np.concatenate(result_ye) if result_ye else np.array([], dtype=np.float32),
-        'z_emit': np.concatenate(result_ze) if result_ze else np.array([], dtype=np.float32),
-        'x_ground': np.concatenate(result_xg) if result_xg else np.array([], dtype=np.float32),
-        'y_ground': np.concatenate(result_yg) if result_yg else np.array([], dtype=np.float32),
+    if not packet_chunks:
+        return _empty_photon_packets(include_event_id)
+    packed = np.concatenate(packet_chunks, axis=0).astype(np.float32, copy=False)
+    result = {
+        key: packed[:, column]
+        for column, key in enumerate((*_PHOTON_POSITION_KEYS, 'weight'))
     }
+    if include_event_id:
+        result['event_id'] = np.concatenate(event_chunks).astype(np.int32, copy=False)
+    return result
 
 
-def _cherenkov_numpy(seg_x1, seg_y1, seg_z1,
-                      seg_x2, seg_y2, seg_z2,
-                      seg_px, seg_py, seg_pz,
-                      seg_energy, photon_yield_factor,
-                      max_photons_per_segment,
-                      H, eta_0, m_e):
-    """Cherenkov pool computation using NumPy (CPU fallback)."""
-    
-    x1 = np.array(seg_x1)
-    y1 = np.array(seg_y1)
-    z1 = np.array(seg_z1)
-    x2 = np.array(seg_x2)
-    y2 = np.array(seg_y2)
-    z2 = np.array(seg_z2)
-    px = np.array(seg_px)
-    py = np.array(seg_py)
-    pz = np.array(seg_pz)
-    energies = np.array(seg_energy)
+def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
+                               seg_x2, seg_y2, seg_z2,
+                               seg_px, seg_py, seg_pz,
+                               seg_energy, photon_yield_factor,
+                               max_packets_per_segment, seg_event_id,
+                               target_photons_per_packet, generator):
+    """NumPy fallback with the same weighted-packet contract."""
+    arrays = [
+        np.asarray(value, dtype=np.float32).reshape(-1)
+        for value in (
+            seg_x1, seg_y1, seg_z1, seg_x2, seg_y2, seg_z2,
+            seg_px, seg_py, seg_pz, seg_energy,
+        )
+    ]
+    if len({len(value) for value in arrays}) != 1:
+        raise ValueError("All segment arrays must have the same length")
+    include_event_id = seg_event_id is not None
+    if len(arrays[0]) == 0:
+        return _empty_photon_packets(include_event_id)
+    if generator is not None and not isinstance(generator, np.random.Generator):
+        raise TypeError("Without PyTorch, generator must be numpy.random.Generator")
+    rng = generator if generator is not None else np.random
 
-    z_mid = (z1 + z2) / 2.0
-    x_mid = (x1 + x2) / 2.0
-    y_mid = (y1 + y2) / 2.0
-    ds = np.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
-
-    eta_z = eta_0 * np.exp(-z_mid / H)
-    E_thresh = m_e / np.sqrt(2 * eta_z)
-    theta_c = np.sqrt(2 * eta_z)
-
-    n_phot = (ds * theta_c**2 * 37000 * photon_yield_factor).astype(int)
-    n_phot = np.minimum(n_phot, max_photons_per_segment)
-
-    valid = (z_mid > 0) & (energies > E_thresh) & (n_phot > 0)
-    
+    x1, y1, z1, x2, y2, z2, px, py, pz, energies = arrays
+    ds = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
+    beta_sq = np.clip(1.0 - (0.000511 / np.maximum(energies, 0.000511)) ** 2, 0, 1)
+    n_mid = 1.0 + 0.000293 * np.exp(-np.maximum(0.5 * (z1 + z2), 0) / 7640.0)
+    sin2_mid = np.clip(1.0 - 1.0 / np.maximum(beta_sq * n_mid ** 2, 1e-20), 0, 1)
+    estimated = ds * sin2_mid * 37000.0 * photon_yield_factor
+    valid = (ds > 0) & (np.maximum(z1, z2) > 0) & (estimated > 0)
     if not np.any(valid):
-        empty = np.array([])
-        return {k: empty for k in ['x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground']}
+        return _empty_photon_packets(include_event_id)
 
-    x_mid_v = x_mid[valid]
-    y_mid_v = y_mid[valid]
-    z_mid_v = z_mid[valid]
-    theta_c_v = theta_c[valid]
-    px_v = px[valid]
-    py_v = py[valid]
-    pz_v = pz[valid]
-    n_phot_v = n_phot[valid]
+    x1, y1, z1, x2, y2, z2, px, py, pz, ds, beta_sq, estimated = [
+        value[valid]
+        for value in (x1, y1, z1, x2, y2, z2, px, py, pz, ds, beta_sq, estimated)
+    ]
+    events = None
+    if include_event_id:
+        events = np.asarray(seg_event_id, dtype=np.int32).reshape(-1)
+        if len(events) != len(valid):
+            raise ValueError("seg_event_id must have the same length as segment arrays")
+        events = events[valid]
 
-    total_photons = int(np.sum(n_phot_v))
+    counts = np.clip(
+        np.ceil(estimated / target_photons_per_packet), 1, max_packets_per_segment
+    ).astype(np.int64)
+    segment_index = np.repeat(np.arange(len(counts)), counts)
+    offsets = np.cumsum(counts) - counts
+    ordinal = np.arange(len(segment_index)) - np.repeat(offsets, counts)
+    packet_count = counts[segment_index]
+    fraction = (ordinal + rng.random(len(segment_index))) / packet_count
+    xe = x1[segment_index] + fraction * (x2 - x1)[segment_index]
+    ye = y1[segment_index] + fraction * (y2 - y1)[segment_index]
+    ze = z1[segment_index] + fraction * (z2 - z1)[segment_index]
 
-    xe = np.repeat(x_mid_v, n_phot_v)
-    ye = np.repeat(y_mid_v, n_phot_v)
-    ze = np.repeat(z_mid_v, n_phot_v)
-    tc = np.repeat(theta_c_v, n_phot_v)
-    dx = np.repeat(px_v, n_phot_v)
-    dy = np.repeat(py_v, n_phot_v)
-    dz = np.repeat(pz_v, n_phot_v)
+    local_n = 1.0 + 0.000293 * np.exp(-np.maximum(ze, 0) / 7640.0)
+    local_sin2 = np.clip(
+        1.0 - 1.0 / np.maximum(beta_sq[segment_index] * local_n ** 2, 1e-20), 0, 1
+    )
+    cos_theta = np.clip(
+        1.0 / np.sqrt(np.maximum(beta_sq[segment_index] * local_n ** 2, 1.0)), -1, 1
+    )
+    sin_theta = np.sqrt(local_sin2)
 
-    norm = np.sqrt(dx**2 + dy**2 + dz**2)
-    dx = dx / norm
-    dy = dy / norm
-    dz = dz / norm
-
-    ref_x = np.ones_like(dx)
-    ref_y = np.zeros_like(dx)
-    ref_z = np.zeros_like(dx)
-
-    parallel_x = np.abs(dx) > 0.9
-    ref_x[parallel_x] = 0.0
-    ref_y[parallel_x] = 1.0
-
-    e1x = dy * ref_z - dz * ref_y
-    e1y = dz * ref_x - dx * ref_z
-    e1z = dx * ref_y - dy * ref_x
-
-    e1_norm = np.sqrt(e1x**2 + e1y**2 + e1z**2)
-    e1x = e1x / e1_norm
-    e1y = e1y / e1_norm
-    e1z = e1z / e1_norm
-
-    e2x = dy * e1z - dz * e1y
-    e2y = dz * e1x - dx * e1z
-    e2z = dx * e1y - dy * e1x
-
-    phis = np.random.uniform(0, 2 * np.pi, total_photons)
-
-    cos_tc = np.cos(tc)
-    sin_tc = np.sin(tc)
-    cos_phi = np.cos(phis)
-    sin_phi = np.sin(phis)
-
-    photon_dx = dx * cos_tc + e1x * sin_tc * cos_phi + e2x * sin_tc * sin_phi
-    photon_dy = dy * cos_tc + e1y * sin_tc * cos_phi + e2y * sin_tc * sin_phi
-    photon_dz = dz * cos_tc + e1z * sin_tc * cos_phi + e2z * sin_tc * sin_phi
-
-    t = -ze / photon_dz
-    valid_photon = (photon_dz < 0) & (t >= 0)
-
-    xg = xe + t * photon_dx
-    yg = ye + t * photon_dy
-
-    return {
-        'x_emit': xe[valid_photon],
-        'y_emit': ye[valid_photon],
-        'z_emit': ze[valid_photon],
-        'x_ground': xg[valid_photon],
-        'y_ground': yg[valid_photon],
+    directions = np.column_stack((px, py, pz))
+    directions /= np.maximum(np.linalg.norm(directions, axis=1, keepdims=True), 1e-12)
+    reference = np.zeros_like(directions)
+    reference[:, 0] = 1
+    parallel = np.abs(directions[:, 0]) > 0.9
+    reference[parallel] = (0, 1, 0)
+    basis1 = np.cross(directions, reference)
+    basis1 /= np.maximum(np.linalg.norm(basis1, axis=1, keepdims=True), 1e-12)
+    basis2 = np.cross(directions, basis1)
+    phi = 2 * np.pi * (ordinal + rng.random(len(segment_index))) / packet_count
+    photon_direction = (
+        directions[segment_index] * cos_theta[:, None]
+        + basis1[segment_index] * (sin_theta * np.cos(phi))[:, None]
+        + basis2[segment_index] * (sin_theta * np.sin(phi))[:, None]
+    )
+    distance = -ze / photon_direction[:, 2]
+    reaches_ground = (
+        (ze > 0) & (photon_direction[:, 2] < 0) & np.isfinite(distance)
+        & (distance >= 0) & (local_sin2 > 0)
+    )
+    weight = (
+        ds[segment_index]
+        * 37000.0
+        * photon_yield_factor
+        * local_sin2
+        / packet_count
+    )
+    packed = np.column_stack((
+        xe, ye, ze,
+        xe + distance * photon_direction[:, 0],
+        ye + distance * photon_direction[:, 1],
+        weight,
+    ))[reaches_ground].astype(np.float32, copy=False)
+    result = {
+        key: packed[:, column]
+        for column, key in enumerate((*_PHOTON_POSITION_KEYS, 'weight'))
     }
+    if include_event_id:
+        result['event_id'] = events[segment_index][reaches_ground].astype(np.int32, copy=False)
+    return result
 
 
 # ── Ray-tracing computation (GPU-accelerated pixel lookup) ────────────────────
 
+def _camera_axial_coordinates(pixel_x, pixel_y, pixel_size):
+    """Recover integer axial coordinates from the camera's pixel centers."""
+    if pixel_size <= 0:
+        raise ValueError("pixel_size must be greater than zero")
+
+    pixel_x = np.asarray(pixel_x, dtype=np.float64)
+    pixel_y = np.asarray(pixel_y, dtype=np.float64)
+    height = np.sqrt(3.0) / 2.0 * pixel_size
+
+    axial_r = np.rint(pixel_y / height).astype(np.int64)
+    axial_q = np.rint((pixel_x / pixel_size) - axial_r / 2.0).astype(np.int64)
+
+    reconstructed_x = pixel_size * (axial_q + axial_r / 2.0)
+    reconstructed_y = height * axial_r
+    tolerance = max(1e-9, pixel_size * 1e-6)
+    if not (
+        np.allclose(pixel_x, reconstructed_x, atol=tolerance, rtol=0.0)
+        and np.allclose(pixel_y, reconstructed_y, atol=tolerance, rtol=0.0)
+    ):
+        raise ValueError("Camera pixels do not lie on the expected hexagonal grid")
+
+    n_rings = int(np.max(np.abs(np.concatenate([
+        axial_q, axial_r, axial_q + axial_r,
+    ])))) if len(axial_q) else 0
+    return axial_q, axial_r, n_rings
+
+
 def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                   x_tel, y_tel, z_tel, mirror_radius,
-                  mirror_reflectivity, quantum_efficiency, nsb_rate=0.1):
+                  mirror_reflectivity, quantum_efficiency, *,
+                  n_time_bins=16, bin_width_ns=2.0, nsb_rate=2.0,
+                  pedestal_std=0.5, saturation_limit=250.0,
+                  low_gain_factor=10.0, shower_start_altitude=20000.0,
+                  device='auto', generator=None):
+    """Compatibility wrapper for one telescope.
+
+    The implementation is the same shared Torch core used by
+    :func:`ray_trace_array` on both CPU and CUDA.  Its return shapes remain
+    ``(n_pixels, n_time_bins)`` and ``(n_pixels,)``.
     """
-    GPU-accelerated ray-tracing: projects photons to focal plane and bins
-    into camera pixels using torch.cdist instead of scipy KDTree.
-    
-    Parameters
-    ----------
-    cherenkov_photons : dict
-        Must contain 'x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground'.
-    pixel_x, pixel_y : array-like
-        Camera pixel positions in degrees.
-    pixel_size : float
-        Pixel diameter in degrees.
-    x_tel, y_tel, z_tel : float
-        Telescope position on ground (meters).
-    mirror_radius : float
-        Mirror radius (meters).
-    mirror_reflectivity, quantum_efficiency : float
-        Optical efficiency factors.
-        
+    traces, gain_flags = ray_trace_array(
+        cherenkov_photons,
+        pixel_x, pixel_y, pixel_size,
+        [x_tel], [y_tel], [z_tel], [mirror_radius],
+        [mirror_reflectivity], [quantum_efficiency],
+        n_time_bins=n_time_bins,
+        bin_width_ns=bin_width_ns,
+        nsb_rate=nsb_rate,
+        pedestal_std=pedestal_std,
+        saturation_limit=saturation_limit,
+        low_gain_factor=low_gain_factor,
+        shower_start_altitude=shower_start_altitude,
+        device=device,
+        generator=generator,
+    )
+    return traces[0], gain_flags[0]
+
+
+def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
+                    telescope_x, telescope_y, telescope_z, mirror_radius,
+                    mirror_reflectivity, quantum_efficiency, *,
+                    n_time_bins=16, bin_width_ns=2.0, nsb_rate=2.0,
+                    pedestal_std=0.5, saturation_limit=250.0,
+                    low_gain_factor=10.0, shower_start_altitude=20000.0,
+                    device='auto', generator=None):
+    """Trace a photon pool through several telescopes sharing one camera.
+
+    Telescope parameters may be scalars or one-dimensional arrays; scalar
+    values broadcast to the longest array.  Weighted packets are converted to
+    photoelectrons with binomial detection statistics.  ``nsb_rate`` is the
+    mean number of NSB photoelectrons per pixel over the complete window.
+    ``pedestal_std`` is the RMS of the integrated window, distributed as
+    independent Gaussian noise across its time bins.
+
     Returns
     -------
-    signal : numpy array of shape (n_pixels,)
-        Number of photoelectrons per pixel (signal only, no noise).
-    timing : numpy array of shape (n_pixels,)
-        Average arrival time of photons in each pixel (in ns).
+    traces, gain_flags : numpy.ndarray
+        Float32 arrays shaped ``(telescopes, pixels, time_bins)`` and
+        ``(telescopes, pixels)`` respectively.
     """
-    device = get_device()
-    
-    if not HAS_TORCH or device is None or device.type != 'cuda':
-        return _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                                x_tel, y_tel, z_tel, mirror_radius,
-                                mirror_reflectivity, quantum_efficiency, nsb_rate)
-    
-    return _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                            x_tel, y_tel, z_tel, mirror_radius,
-                            mirror_reflectivity, quantum_efficiency, nsb_rate, device)
+    if not HAS_TORCH:
+        raise RuntimeError("PyTorch is required for ray tracing")
+    resolved_device = _resolve_requested_device(device)
+    _validate_generator(generator, resolved_device)
+    _validate_detector_configuration(
+        n_time_bins, bin_width_ns, nsb_rate, pedestal_std,
+        saturation_limit, low_gain_factor,
+    )
+
+    pixel_q, pixel_r, n_rings = _camera_axial_coordinates(
+        pixel_x, pixel_y, pixel_size
+    )
+    n_pixels = len(pixel_q)
+    if n_pixels == 0:
+        raise ValueError("Camera must contain at least one pixel")
+
+    telescope_parameters = _broadcast_telescope_parameters(
+        resolved_device,
+        telescope_x=telescope_x,
+        telescope_y=telescope_y,
+        telescope_z=telescope_z,
+        mirror_radius=mirror_radius,
+        mirror_reflectivity=mirror_reflectivity,
+        quantum_efficiency=quantum_efficiency,
+    )
+    _validate_telescope_parameters(telescope_parameters)
+
+    with torch.no_grad():
+        traces, gain_flags = _ray_trace_torch_core(
+            cherenkov_photons,
+            pixel_q, pixel_r, n_rings, float(pixel_size),
+            telescope_parameters,
+            int(n_time_bins), float(bin_width_ns), float(nsb_rate),
+            float(pedestal_std), float(saturation_limit),
+            float(low_gain_factor), float(shower_start_altitude),
+            resolved_device, generator,
+        )
+    return (
+        traces.detach().cpu().numpy().astype(np.float32, copy=False),
+        gain_flags.detach().cpu().numpy().astype(np.float32, copy=False),
+    )
 
 
-def _ray_trace_torch(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                      x_tel, y_tel, z_tel, mirror_radius,
-                      mirror_reflectivity, quantum_efficiency, nsb_rate, device):
-    """Ray-tracing using O(1) vectorized hexagonal binning for GPU, chunked to save VRAM."""
-    
-    n_pixels = len(pixel_x)
-    total_photons = len(cherenkov_photons['x_ground'])
-    
-    # Precompute lookup table for mapping (q, r) to pixel index
-    n_rings = int((n_pixels / 3)**0.5) + 2 
+def _validate_detector_configuration(n_time_bins, bin_width_ns, nsb_rate,
+                                     pedestal_std, saturation_limit,
+                                     low_gain_factor):
+    if not isinstance(n_time_bins, (int, np.integer)) or n_time_bins <= 0:
+        raise ValueError("n_time_bins must be a positive integer")
+    for name, value, allow_zero in (
+        ('bin_width_ns', bin_width_ns, False),
+        ('nsb_rate', nsb_rate, True),
+        ('pedestal_std', pedestal_std, True),
+        ('saturation_limit', saturation_limit, False),
+        ('low_gain_factor', low_gain_factor, False),
+    ):
+        if not np.isfinite(value) or value < 0 or (not allow_zero and value == 0):
+            qualifier = 'non-negative' if allow_zero else 'greater than zero'
+            raise ValueError(f"{name} must be finite and {qualifier}")
+
+
+def _broadcast_telescope_parameters(device, **parameters):
+    tensors = {
+        name: torch.as_tensor(value, dtype=torch.float32, device=device).reshape(-1)
+        for name, value in parameters.items()
+    }
+    if any(value.numel() == 0 for value in tensors.values()):
+        raise ValueError("Telescope parameter arrays cannot be empty")
+    n_telescopes = max(value.numel() for value in tensors.values())
+    for name, value in tuple(tensors.items()):
+        if value.numel() == 1:
+            tensors[name] = value.expand(n_telescopes)
+        elif value.numel() != n_telescopes:
+            raise ValueError(
+                f"{name} must be scalar or contain {n_telescopes} values"
+            )
+    return tensors
+
+
+def _validate_telescope_parameters(parameters):
+    for name, value in parameters.items():
+        if not bool(torch.all(torch.isfinite(value))):
+            raise ValueError(f"{name} must contain only finite values")
+    if bool(torch.any(parameters['mirror_radius'] <= 0)):
+        raise ValueError("mirror_radius must be greater than zero")
+    for name in ('mirror_reflectivity', 'quantum_efficiency'):
+        value = parameters[name]
+        if bool(torch.any((value < 0) | (value > 1))):
+            raise ValueError(f"{name} values must lie in [0, 1]")
+
+
+def _photon_tensor(photons, key, n_packets, device, *, default=None,
+                   dtype=None):
+    if key not in photons:
+        if default is None:
+            raise KeyError(f"cherenkov_photons is missing required key {key!r}")
+        value = default
+    else:
+        value = photons[key]
+    tensor = torch.as_tensor(
+        value, dtype=dtype or torch.float32, device=device
+    ).reshape(-1)
+    if tensor.numel() == 1 and n_packets != 1:
+        tensor = tensor.expand(n_packets)
+    elif tensor.numel() != n_packets:
+        raise ValueError(f"Photon field {key!r} must contain {n_packets} values")
+    return tensor
+
+
+def _detected_packet_charge(weights, probability, generator):
+    """Unbiased packet-to-photoelectron conversion, exact for integer weight."""
+    weights = torch.clamp(weights, min=0.0)
+    probability = torch.clamp(probability, min=0.0, max=1.0)
+    whole_photons = torch.floor(weights)
+    detected = torch.binomial(whole_photons, probability, generator=generator)
+    fractional_probability = (weights - whole_photons) * probability
+    detected += (
+        torch.rand(
+            fractional_probability.shape,
+            dtype=fractional_probability.dtype,
+            device=fractional_probability.device,
+            generator=generator,
+        ) < fractional_probability
+    ).to(detected.dtype)
+    return detected
+
+
+def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
+                          pixel_size, telescope, n_time_bins, bin_width_ns,
+                          nsb_rate, pedestal_std, saturation_limit,
+                          low_gain_factor, shower_start_altitude,
+                          device, generator):
+    """Shared CPU/CUDA geometry, timing, noise, and gain implementation."""
+    n_telescopes = telescope['telescope_x'].numel()
+    n_pixels = len(pixel_q)
+    traces = torch.zeros(
+        (n_telescopes, n_pixels, n_time_bins),
+        dtype=torch.float32, device=device,
+    )
+
     grid_size = 2 * n_rings + 1
-    lookup = torch.full((grid_size, grid_size), -1, dtype=torch.int64, device=device)
-    
-    idx = 0
-    for q in range(-n_rings, n_rings + 1):
-        for r in range(-n_rings, n_rings + 1):
-            if -n_rings <= q + r <= n_rings:
-                if idx < n_pixels:
-                    lookup[q + n_rings, r + n_rings] = idx
-                idx += 1
-                
-    all_pixel_indices = []
-    all_t_valid = []
-    chunk_size = 5_000_000
-    
-    step = pixel_size
-    height = (3**0.5) / 2.0 * step
-    
-    for start in range(0, total_photons, chunk_size):
-        end = min(start + chunk_size, total_photons)
-        
-        # Load chunk to GPU
-        xg = torch.tensor(cherenkov_photons['x_ground'][start:end], dtype=torch.float32, device=device)
-        yg = torch.tensor(cherenkov_photons['y_ground'][start:end], dtype=torch.float32, device=device)
-        xe = torch.tensor(cherenkov_photons['x_emit'][start:end], dtype=torch.float32, device=device)
-        ye = torch.tensor(cherenkov_photons['y_emit'][start:end], dtype=torch.float32, device=device)
-        ze = torch.tensor(cherenkov_photons['z_emit'][start:end], dtype=torch.float32, device=device)
-        
-        # Project to z_tel
-        frac = (z_tel - ze) / (-ze)
-        x_hit = xe + frac * (xg - xe)
-        y_hit = ye + frac * (yg - ye)
-        
-        # Mirror hit test
-        dist_sq = (x_hit - x_tel)**2 + (y_hit - y_tel)**2
-        hit_mask = dist_sq <= mirror_radius**2
-        
-        if not torch.any(hit_mask):
-            continue
-            
-        xe = xe[hit_mask]
-        ye = ye[hit_mask]
-        ze = ze[hit_mask]
-        x_hit = x_hit[hit_mask]
-        y_hit = y_hit[hit_mask]
-        
-        # Compute Time of Flight
-        c_mns = 0.299792458
-        t_emit = (20000.0 - ze) / c_mns
-        dist_photon = torch.sqrt((x_hit - xe)**2 + (y_hit - ye)**2 + (z_tel - ze)**2)
-        v_photon = c_mns / 1.0003
-        t_ground = t_emit + dist_photon / v_photon
-        
-        # Survival filter
-        survival_prob = mirror_reflectivity * quantum_efficiency
-        survived = torch.rand(x_hit.shape[0], device=device) < survival_prob
-        
-        if not torch.any(survived):
-            continue
-            
-        xe = xe[survived]
-        ye = ye[survived]
-        ze = ze[survived]
-        x_hit = x_hit[survived]
-        y_hit = y_hit[survived]
-        t_ground = t_ground[survived]
-        
-        # Project to focal plane
-        dx = x_hit - xe
-        dy = y_hit - ye
-        dz = z_tel - ze
-        
-        u_deg = torch.rad2deg(torch.atan2(-dx, -dz))
-        v_deg = torch.rad2deg(torch.atan2(-dy, -dz))
-        
-        r_float = v_deg / height
-        q_float = (u_deg / step) - (r_float / 2.0)
-        
-        x = q_float
-        z = r_float
-        y = -x - z
-        
-        rx = torch.round(x)
-        ry = torch.round(y)
-        rz = torch.round(z)
-        
-        x_diff = torch.abs(rx - x)
-        y_diff = torch.abs(ry - y)
-        z_diff = torch.abs(rz - z)
-        
-        mask_x = (x_diff > y_diff) & (x_diff > z_diff)
-        mask_y = (~mask_x) & (y_diff > z_diff)
-        mask_z = ~(mask_x | mask_y)
-        
-        rx = torch.where(mask_x, -ry - rz, rx)
-        ry = torch.where(mask_y, -rx - rz, ry)
-        rz = torch.where(mask_z, -rx - ry, rz)
-        
-        q_int = rx.to(torch.int32)
-        r_int = rz.to(torch.int32)
-        
-        valid = (q_int >= -n_rings) & (q_int <= n_rings) & \
-                (r_int >= -n_rings) & (r_int <= n_rings) & \
-                ((q_int + r_int) >= -n_rings) & ((q_int + r_int) <= n_rings)
-                
-        q_valid = q_int[valid]
-        r_valid = r_int[valid]
-        
-        if q_valid.shape[0] == 0:
-            continue
-            
-        pixel_indices = lookup[q_valid + n_rings, r_valid + n_rings]
-        valid_idx = pixel_indices >= 0
-        pixel_indices = pixel_indices[valid_idx]
-        t_valid = t_ground[valid][valid_idx]
-        
-        all_pixel_indices.append(pixel_indices)
-        all_t_valid.append(t_valid)
-        
-    if len(all_pixel_indices) == 0:
-        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
-        
-    pixel_indices = torch.cat(all_pixel_indices)
-    t_valid = torch.cat(all_t_valid)
-    
-    if t_valid.numel() == 0:
-        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
-    
-    t_min = t_valid.min()
-    bin_width = 2.0
-    t_start = t_min - 2.0  # Start trace 2ns before first photon
-    
-    bin_idx = torch.floor((t_valid - t_start) / bin_width).to(torch.int64)
-    
-    # Filter photons falling outside the 16-bin (32 ns) window
-    valid_mask = (bin_idx >= 0) & (bin_idx < 16)
-    pixel_indices = pixel_indices[valid_mask]
-    bin_idx = bin_idx[valid_mask]
-    
-    # 2D Histogram flattened
-    flat_idx = pixel_indices * 16 + bin_idx
-    fadc_counts = torch.bincount(flat_idx, minlength=n_pixels * 16).view(n_pixels, 16).float()
-    
-    # NSB Noise: calculated as nsb_rate * (bin_width / window_size) if we assume nsb_rate is per total window
-    # Actually, nsb_rate is usually rate per pixel per window. So rate per bin is nsb_rate * (bin_width / (16 * bin_width))
-    nsb_per_bin = nsb_rate / 16.0
-    nsb_noise = torch.poisson(torch.full_like(fadc_counts, nsb_per_bin))
-    fadc_counts += nsb_noise
-    
-    # PMT Pulse Shaping Convolution
-    # A typical PMT pulse has a width (sigma) of ~2.5 ns. 
-    # With 2ns bins, this spreads the charge across ~3-5 bins.
-    sigma = 2.5 / bin_width  # Width in bins
-    kernel_size = 7
-    x = torch.arange(-kernel_size // 2 + 1, kernel_size // 2 + 1, device=device, dtype=torch.float32)
-    pulse_kernel = torch.exp(-0.5 * (x / sigma) ** 2)
-    pulse_kernel /= pulse_kernel.sum()  # Normalize to conserve charge
-    
-    # Reshape for conv1d: [batch=1, in_channels=n_pixels, length=16]
-    # We use grouped convolution where groups=n_pixels to apply it independently per pixel
-    fadc_reshaped = fadc_counts.unsqueeze(0)  # [1, n_pixels, 16]
-    kernel_reshaped = pulse_kernel.view(1, 1, kernel_size).repeat(n_pixels, 1, 1) # [n_pixels, 1, kernel_size]
-    
-    # Pad to keep the 16-bin length
-    padding = kernel_size // 2
-    fadc_smoothed = torch.nn.functional.conv1d(
-        fadc_reshaped, 
-        kernel_reshaped, 
-        padding=padding, 
-        groups=n_pixels
-    ).squeeze(0)
-    
-    fadc_counts = fadc_smoothed
-    
-    # Dual-gain clipping
-    saturation_limit = 250.0
-    gain_flags = torch.zeros(n_pixels, device=device)
-    
-    saturated = (fadc_counts > saturation_limit).any(dim=1)
-    gain_flags[saturated] = 1.0
-    
-    # Low-gain attenuation factor = 10
-    attenuation = 10.0
-    fadc_counts[saturated] = fadc_counts[saturated] / attenuation
-        
-    return fadc_counts.cpu().numpy(), gain_flags.cpu().numpy()
+    lookup = torch.full(
+        (grid_size, grid_size), -1, dtype=torch.int64, device=device
+    )
+    pixel_q_t = torch.as_tensor(pixel_q + n_rings, dtype=torch.int64, device=device)
+    pixel_r_t = torch.as_tensor(pixel_r + n_rings, dtype=torch.int64, device=device)
+    lookup[pixel_q_t, pixel_r_t] = torch.arange(
+        n_pixels, dtype=torch.int64, device=device
+    )
+
+    if 'x_ground' not in cherenkov_photons:
+        raise KeyError("cherenkov_photons is missing required key 'x_ground'")
+    n_packets = len(cherenkov_photons['x_ground'])
+    hit_telescopes = []
+    hit_pixels = []
+    hit_times = []
+    hit_charges = []
+
+    if n_packets:
+        xe = _photon_tensor(cherenkov_photons, 'x_emit', n_packets, device)
+        ye = _photon_tensor(cherenkov_photons, 'y_emit', n_packets, device)
+        ze = _photon_tensor(cherenkov_photons, 'z_emit', n_packets, device)
+        xg = _photon_tensor(cherenkov_photons, 'x_ground', n_packets, device)
+        yg = _photon_tensor(cherenkov_photons, 'y_ground', n_packets, device)
+        weights = _photon_tensor(
+            cherenkov_photons, 'weight', n_packets, device, default=1.0
+        )
+        if bool(torch.any(~torch.isfinite(weights))) or bool(torch.any(weights < 0)):
+            raise ValueError("Photon weights must be finite and non-negative")
+
+        if 'emission_time_ns' in cherenkov_photons:
+            emission_time = _photon_tensor(
+                cherenkov_photons, 'emission_time_ns', n_packets, device
+            )
+        else:
+            packet_start_altitude = _photon_tensor(
+                cherenkov_photons,
+                'shower_start_altitude',
+                n_packets,
+                device,
+                default=shower_start_altitude,
+            )
+            emission_time = (packet_start_altitude - ze) / 0.299792458
+
+        pair_limit = _ray_pair_chunk_limit(device)
+        packet_chunk_size = max(1, pair_limit // n_telescopes)
+        height = np.sqrt(3.0) * 0.5 * pixel_size
+
+        for start in range(0, n_packets, packet_chunk_size):
+            end = min(start + packet_chunk_size, n_packets)
+            c_xe, c_ye, c_ze = xe[start:end], ye[start:end], ze[start:end]
+            c_xg, c_yg = xg[start:end], yg[start:end]
+
+            tel_z = telescope['telescope_z'][:, None]
+            denominator = -c_ze[None, :]
+            projection = (tel_z - c_ze[None, :]) / denominator
+            x_hit = c_xe[None, :] + projection * (c_xg - c_xe)[None, :]
+            y_hit = c_ye[None, :] + projection * (c_yg - c_ye)[None, :]
+            mirror_distance_sq = (
+                (x_hit - telescope['telescope_x'][:, None]).square()
+                + (y_hit - telescope['telescope_y'][:, None]).square()
+            )
+            mirror_hit = (
+                torch.isfinite(x_hit)
+                & torch.isfinite(y_hit)
+                & (c_ze[None, :] > tel_z)
+                & (mirror_distance_sq <= telescope['mirror_radius'][:, None].square())
+            )
+            telescope_index, local_packet_index = torch.nonzero(
+                mirror_hit, as_tuple=True
+            )
+            if telescope_index.numel() == 0:
+                continue
+
+            hit_x = x_hit[telescope_index, local_packet_index]
+            hit_y = y_hit[telescope_index, local_packet_index]
+            emit_x = c_xe[local_packet_index]
+            emit_y = c_ye[local_packet_index]
+            emit_z = c_ze[local_packet_index]
+            hit_z = telescope['telescope_z'][telescope_index]
+            dx = hit_x - emit_x
+            dy = hit_y - emit_y
+            dz = hit_z - emit_z
+
+            u_deg = torch.rad2deg(torch.atan2(-dx, -dz))
+            v_deg = torch.rad2deg(torch.atan2(-dy, -dz))
+            r_float = v_deg / height
+            q_float = (u_deg / pixel_size) - 0.5 * r_float
+            cube_x = q_float
+            cube_z = r_float
+            cube_y = -cube_x - cube_z
+            rounded_x = torch.round(cube_x)
+            rounded_y = torch.round(cube_y)
+            rounded_z = torch.round(cube_z)
+            diff_x = torch.abs(rounded_x - cube_x)
+            diff_y = torch.abs(rounded_y - cube_y)
+            diff_z = torch.abs(rounded_z - cube_z)
+            adjust_x = (diff_x > diff_y) & (diff_x > diff_z)
+            adjust_y = (~adjust_x) & (diff_y > diff_z)
+            adjust_z = ~(adjust_x | adjust_y)
+            rounded_x = torch.where(adjust_x, -rounded_y - rounded_z, rounded_x)
+            rounded_y = torch.where(adjust_y, -rounded_x - rounded_z, rounded_y)
+            rounded_z = torch.where(adjust_z, -rounded_x - rounded_y, rounded_z)
+            q_int = rounded_x.to(torch.int64)
+            r_int = rounded_z.to(torch.int64)
+            in_camera = (
+                (q_int >= -n_rings) & (q_int <= n_rings)
+                & (r_int >= -n_rings) & (r_int <= n_rings)
+                & (q_int + r_int >= -n_rings)
+                & (q_int + r_int <= n_rings)
+            )
+            if not bool(torch.any(in_camera)):
+                continue
+
+            telescope_index = telescope_index[in_camera]
+            local_packet_index = local_packet_index[in_camera]
+            q_int = q_int[in_camera]
+            r_int = r_int[in_camera]
+            pixel_index = lookup[q_int + n_rings, r_int + n_rings]
+            mapped = pixel_index >= 0
+            if not bool(torch.any(mapped)):
+                continue
+            telescope_index = telescope_index[mapped]
+            local_packet_index = local_packet_index[mapped]
+            pixel_index = pixel_index[mapped]
+            emit_x = c_xe[local_packet_index]
+            emit_y = c_ye[local_packet_index]
+            emit_z = c_ze[local_packet_index]
+            hit_x = x_hit[telescope_index, local_packet_index]
+            hit_y = y_hit[telescope_index, local_packet_index]
+            hit_z = telescope['telescope_z'][telescope_index]
+            photon_distance = torch.sqrt(
+                (hit_x - emit_x).square()
+                + (hit_y - emit_y).square()
+                + (hit_z - emit_z).square()
+            )
+            arrival_time = (
+                emission_time[start:end][local_packet_index]
+                + photon_distance / (0.299792458 / 1.0003)
+            )
+
+            probability = (
+                telescope['mirror_reflectivity'][telescope_index]
+                * telescope['quantum_efficiency'][telescope_index]
+            )
+            charge = _detected_packet_charge(
+                weights[start:end][local_packet_index], probability, generator
+            )
+            detected = charge > 0
+            if not bool(torch.any(detected)):
+                continue
+            hit_telescopes.append(telescope_index[detected])
+            hit_pixels.append(pixel_index[detected])
+            hit_times.append(arrival_time[detected])
+            hit_charges.append(charge[detected])
+
+    if hit_telescopes:
+        telescope_index = torch.cat(hit_telescopes)
+        pixel_index = torch.cat(hit_pixels)
+        arrival_time = torch.cat(hit_times)
+        charge = torch.cat(hit_charges)
+        # All telescopes in an array share one event clock. Using a separate
+        # first-photon origin for each telescope would erase array timing and
+        # make a telescope-coincidence window meaningless.
+        trace_start = torch.min(arrival_time) - bin_width_ns
+        time_bin = torch.floor(
+            (arrival_time - trace_start) / bin_width_ns
+        ).to(torch.int64)
+        in_window = (time_bin >= 0) & (time_bin < n_time_bins)
+        flat_index = (
+            (telescope_index[in_window] * n_pixels + pixel_index[in_window])
+            * n_time_bins
+            + time_bin[in_window]
+        )
+        signal = torch.bincount(
+            flat_index,
+            weights=charge[in_window],
+            minlength=n_telescopes * n_pixels * n_time_bins,
+        ).reshape(n_telescopes, n_pixels, n_time_bins)
+        traces += signal
+
+    if nsb_rate > 0:
+        traces += torch.poisson(
+            torch.full_like(traces, nsb_rate / n_time_bins), generator=generator
+        )
+    if pedestal_std > 0:
+        traces += torch.randn(
+            traces.shape, dtype=traces.dtype, device=device, generator=generator
+        ) * (pedestal_std / np.sqrt(n_time_bins))
+
+    saturated = torch.any(traces > saturation_limit, dim=2)
+    gain_flags = saturated.to(torch.float32)
+    traces = torch.where(
+        saturated[:, :, None], traces / low_gain_factor, traces
+    )
+    return traces.to(torch.float32), gain_flags
 
 
-def _ray_trace_numpy(cherenkov_photons, pixel_x, pixel_y, pixel_size,
-                      x_tel, y_tel, z_tel, mirror_radius,
-                      mirror_reflectivity, quantum_efficiency, nsb_rate):
-    """Ray-tracing using scipy KDTree (CPU fallback)."""
-    from scipy.spatial import KDTree
-    
-    n_pixels = len(pixel_x)
-    
-    xg = cherenkov_photons['x_ground']
-    yg = cherenkov_photons['y_ground']
-    xe = cherenkov_photons['x_emit']
-    ye = cherenkov_photons['y_emit']
-    ze = cherenkov_photons['z_emit']
-    
-    frac = (z_tel - ze) / (-ze)
-    x_hit = xe + frac * (xg - xe)
-    y_hit = ye + frac * (yg - ye)
-    
-    dist_to_center_sq = (x_hit - x_tel)**2 + (y_hit - y_tel)**2
-    hit_mask = dist_to_center_sq <= mirror_radius**2
-    
-    if not np.any(hit_mask):
-        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
-    
-    xe = xe[hit_mask]
-    ye = ye[hit_mask]
-    ze = ze[hit_mask]
-    x_hit = x_hit[hit_mask]
-    y_hit = y_hit[hit_mask]
-    
-    survival_prob = mirror_reflectivity * quantum_efficiency
-    survived_mask = np.random.rand(len(x_hit)) < survival_prob
-    
-    if not np.any(survived_mask):
-        return np.zeros((n_pixels, 16), dtype=np.float32), np.zeros(n_pixels, dtype=np.float32)
-    
-    xe = xe[survived_mask]
-    ye = ye[survived_mask]
-    ze = ze[survived_mask]
-    x_hit = x_hit[survived_mask]
-    y_hit = y_hit[survived_mask]
-    
-    dx = x_hit - xe
-    dy = y_hit - ye
-    dz = z_tel - ze
-    
-    u_deg = np.degrees(np.arctan2(-dx, -dz))
-    v_deg = np.degrees(np.arctan2(-dy, -dz))
-    
-    tree = KDTree(np.column_stack((pixel_x, pixel_y)))
-    points = np.column_stack((u_deg, v_deg))
-    distances, indices = tree.query(points)
-    
-    valid_hits = distances < (pixel_size / 2.0)
-    valid_indices = indices[valid_hits]
-    
-    fadc_counts = np.zeros((n_pixels, 16), dtype=np.float32)
-    gain_flags = np.zeros(n_pixels, dtype=np.float32)
-    # Numpy fallback just returns integrated charge in bin 0 for simplicity
-    np.add.at(fadc_counts[:, 0], valid_indices, 1.0)
-    
-    return fadc_counts, gain_flags
+def _ray_pair_chunk_limit(device):
+    if device.type == 'cuda':
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        return max(1, min(5_000_000, int(free_bytes * 0.25) // 64))
+    return 1_000_000

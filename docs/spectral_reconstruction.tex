@@ -1,0 +1,63 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\title{Spectral Reconstruction Methodology using Forward-Folding}
+\author{AirCherenkov Pipeline Documentation}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+This document outlines the methodology for reconstructing the energy spectrum of a gamma-ray source (such as the Crab Nebula) using Monte Carlo (MC) simulations and our Spatiotemporal Graph Neural Network (GNN). 
+
+\section{Instrument Response Functions (IRFs)}
+To forward-fold a spectrum, we must derive two key response functions from our GNN's performance on the MC gamma-ray dataset.
+
+\subsection{Effective Area ($A_{\text{eff}}$)}
+The effective area represents the equivalent physical area the telescope array ``sees'' for a given true energy. 
+It is defined as:
+\begin{equation}
+A_{\text{eff}}(E_{\text{true}}) = A_{\text{sim}} \times \frac{N_{\text{selected}}(E_{\text{true}})}{N_{\text{simulated}}(E_{\text{true}})}
+\end{equation}
+where:
+\begin{itemize}
+    \item $A_{\text{sim}}$ is the total thrown physical area. For a simulation radius of $R = 350$\,m, $A_{\text{sim}} = \pi (350)^2 \approx 3.8 \times 10^5 \text{ m}^2$.
+    \item $N_{\text{selected}}(E_{\text{true}})$ is the number of MC gamma events in the true energy bin that triggered the array AND passed the GNN gamma-classification cut.
+    \item $N_{\text{simulated}}(E_{\text{true}})$ is the total number of events originally thrown in that true energy bin, calculable analytically from the $E^{-2}$ generation spectrum.
+\end{itemize}
+
+\subsection{Energy Migration Matrix ($M$)}
+The energy migration matrix is a 2D probability matrix capturing the energy resolution and bias of the GNN. We construct a 2D histogram of $E_{\text{true}}$ versus $E_{\text{reco}}$ for all surviving gammas, and normalize each row (true energy bin) such that it sums to $1.0$:
+\begin{equation}
+\sum_{j} M(E_{\text{reco}, j} | E_{\text{true}, i}) = 1.0
+\end{equation}
+This provides the conditional probability $P(E_{\text{reco}} | E_{\text{true}})$.
+
+\section{Forward-Folding Spectral Fit}
+With the IRFs constructed, we use an optimizer to reconstruct the underlying physical spectrum from a set of observations.
+
+\subsection{The Spectral Model}
+We define a parameterized flux model, such as a power law:
+\begin{equation}
+\frac{dN}{dE} = f_0 \left(\frac{E}{1 \text{ TeV}}\right)^{-\alpha}
+\end{equation}
+
+\subsection{The Prediction}
+For a given set of test parameters $(f_0, \alpha)$, the predicted number of gamma-ray counts in reconstructed energy bin $j$ for an observation time $T_{\text{obs}}$ is the convolution of the model with the IRFs:
+\begin{equation}
+N_{\text{pred}}(j) = T_{\text{obs}} \sum_{i} \left[ \frac{dN}{dE}(E_i) \times A_{\text{eff}}(E_i) \times M(j | i) \times \Delta E_i \right] + B(j)
+\end{equation}
+where $B(j)$ is the estimated residual hadronic background in bin $j$.
+
+\subsection{The Fit}
+We use an optimization algorithm to maximize the Poisson log-likelihood (or minimize the negative log-likelihood) between our predicted counts $N_{\text{pred}}$ and the actual observed counts $N_{\text{obs}}$:
+\begin{equation}
+-\ln \mathcal{L} = \sum_{j} \left( N_{\text{pred}}(j) - N_{\text{obs}}(j) \ln(N_{\text{pred}}(j)) \right)
+\end{equation}
+The parameters $(f_0, \alpha)$ that minimize this function represent our reconstructed spectral index and flux normalization.
+
+\end{document}

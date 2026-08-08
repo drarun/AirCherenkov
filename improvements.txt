@@ -1,0 +1,94 @@
+The best improvement is architectural: stop materializing every Cherenkov photon and build one scientifically consistent detector pipeline shared by CPU and CUDA.
+
+```text
+shower segments
+      ↓
+weighted photon bunches
+      ↓
+batched event × telescope × pixel × time-bin accumulation
+      ├─→ FADC / trigger output
+      └─→ bounded sample for visualization
+```
+
+A local CPU benchmark illustrates why: for 50 mixed 100 GeV events, the cascade took about 0.03 seconds, while photon-pool generation took 4.5 seconds and produced 84 million photons—at least 1.7 GB for the five output arrays alone.
+
+## Highest-priority changes
+
+| Priority | Change | Main benefit |
+|---|---|---|
+| P0 | Weighted photon bunches and streaming camera accumulation | Much lower memory, potentially order-of-magnitude throughput, unbiased thinning |
+| P0 | Identical CPU/CUDA detector response | Accurate and portable results |
+| P0 | Fix trigger, event accounting, and ML splitting | Trustworthy training data |
+| P1 | Batch events and telescopes on-device | Eliminate repeated transfers and scans |
+| P1 | Versioned configuration, RNG, and data schema | Reproducibility and resumability |
+| P1 | Installable package with optional dependencies | Run reliably outside the repository |
+| P2 | Validated atmosphere, EM transport, optics, and electronics | Scientific fidelity |
+| P2 | CORSIKA integration for hadronic showers | Defensible gamma/hadron studies |
+
+## Performance
+
+The current hot path copies segment data GPU→CPU, expands it into individual photons, and uploads all those photons again for every telescope: [backend.py](/home/brandon/AirCherenkov/src/sim/backend.py:160), [backend.py](/home/brandon/AirCherenkov/src/sim/backend.py:530). Telescopes are then processed serially: [telescope.py](/home/brandon/AirCherenkov/src/sim/telescope.py:77).
+
+I would:
+
+- Represent many equivalent photons with one record containing position, direction, time, wavelength band, and weight.
+- Preserve statistical fluctuations by sampling detected counts from binomial/Poisson distributions.
+- Stream chunks directly into an `(event, telescope, pixel, time_bin)` histogram and discard them afterward.
+- Process every telescope position simultaneously.
+- Retain only a bounded reservoir sample for visualizations.
+- Carry event IDs through the kernel instead of rescanning every segment once per event at [shower.py](/home/brandon/AirCherenkov/src/sim/shower.py:482).
+- Cache camera lookup geometry rather than rebuilding it for each call.
+- Remove routine `torch.cuda.empty_cache()` calls and keep tensors resident on the selected device.
+- Use adaptive batches based on estimated photon load, not just event count.
+
+Only after these changes would I consider `torch.compile`; dynamic branching and photon allocation currently dominate.
+
+## Accuracy
+
+The current simulation should be considered qualitative. Several issues directly bias its outputs:
+
+- Photon thinning drops photons without retaining weights, making camera brightness nonlinear at large shower sizes: [backend.py](/home/brandon/AirCherenkov/src/sim/backend.py:178).
+- CPU and CUDA simulate different detectors. CUDA includes timing, NSB, and gain switching; CPU puts all signal in bin zero with none of those effects: [backend.py](/home/brandon/AirCherenkov/src/sim/backend.py:640), [backend.py](/home/brandon/AirCherenkov/src/sim/backend.py:673).
+- `nsb_rate`, `pedestal_std`, `focal_length`, and the existing `FADC` object are effectively unused: [telescope.py](/home/brandon/AirCherenkov/src/sim/telescope.py:7).
+- Training uses total camera charge greater than 20 as a “hardware trigger,” instead of the existing spatial/time coincidence trigger: [generate_training_data.py](/home/brandon/AirCherenkov/generate_training_data.py:115).
+- The hadronic model’s fixed five-pion branching is too artificial for credible gamma/proton classification.
+- Long tracks emit all their photons from the segment midpoint, while atmospheric density and refractive index can change substantially along them.
+- One particle cutoff and heavily simplified interaction distributions are applied across unlike particle species.
+
+A sensible accuracy roadmap is:
+
+1. Establish explicit units, coordinate conventions, observation altitude, pointing, and per-particle thresholds.
+2. Make CPU the reference implementation and require statistical CUDA parity.
+3. Add weighted, time- and wavelength-aware photon bunches.
+4. Use column-depth transport with a layered or tabulated atmosphere.
+5. Correct Cherenkov threshold and yield using particle velocity rather than the ultra-relativistic approximation everywhere.
+6. Connect one calibrated waveform, NSB, pedestal, gain, saturation, and trigger model to both backends.
+7. Validate distributions—longitudinal development, lateral photon density, arrival timing, camera charge, and trigger efficiency—against analytic expectations and established simulation output.
+
+For genuinely quantitative proton showers, I would import CORSIKA events and treat this project as the fast detector/reconstruction layer. Extending the current five-pion toy model into a validated hadronic generator would be a much larger undertaking.
+
+## Training-data correctness
+
+There are also issues that can invalidate ML results even if the simulator is improved:
+
+- Generation writes to `data/train_raw`, while training expects `data/train/raw`: [generate_training_data.py](/home/brandon/AirCherenkov/generate_training_data.py:15), [train_gnn.py](/home/brandon/AirCherenkov/train_gnn.py:35).
+- Resume accounting treats saved triggered events as attempted events, producing incorrect class quotas: [generate_training_data.py](/home/brandon/AirCherenkov/generate_training_data.py:22).
+- Telescope views from one shower become separate examples and can be split across training and validation: [dataset.py](/home/brandon/AirCherenkov/src/analysis/dataset.py:122), [train_gnn.py](/home/brandon/AirCherenkov/train_gnn.py:42).
+
+Store all thrown events, trigger decisions, event weights, configuration, and event IDs. Split datasets by shower/event ID and preserve the stereo telescope set as one sample.
+
+## Portability
+
+The practical portability work is straightforward:
+
+- Move the code under `src/aircherenkov/` and add a `pyproject.toml`.
+- Provide installed commands such as `aircherenkov visualize`, `generate`, `train`, and `evaluate`.
+- Remove `sys.path.insert(...)` usage from scripts.
+- Define dependency extras such as `viz`, `ml`, `sbi`, `io`, and `dev`; the current unbounded [requirements.txt](/home/brandon/AirCherenkov/requirements.txt:1) does not reproduce an environment.
+- Provide separate constrained CPU and CUDA environments.
+- Replace Python-object `.pt` chunks with versioned HDF5 or Zarr data containing units, schema version, geometry hash, configuration, seeds, and provenance.
+- Add explicit `--device auto|cpu|cuda`.
+- Generate RNG streams from `(root_seed, event_id, stage)` so results do not depend on batch or chunk size.
+- Expand CI beyond one Ubuntu/Python 3.10 job to package installation and CPU smoke tests on Linux, macOS, and Windows, with CUDA parity tested separately.
+
+My recommended first implementation milestone is: weighted photon streaming, batched telescope tracing, and one common CPU/CUDA FADC/trigger contract. That single redesign improves performance, accuracy, and portability simultaneously.

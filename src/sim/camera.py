@@ -1,8 +1,5 @@
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import RegularPolygon
-from matplotlib.collections import PatchCollection
 
 class Camera:
     def __init__(self, n_rings=10, pixel_size=0.1):
@@ -71,6 +68,10 @@ class Camera:
             title (str): Title of the plot.
             cmap (str): Matplotlib colormap.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import PatchCollection
+        from matplotlib.patches import RegularPolygon
+
         if len(image_amplitudes) != self.n_pixels:
             raise ValueError(f"Expected {self.n_pixels} pixel values, got {len(image_amplitudes)}")
 
@@ -103,6 +104,8 @@ class Camera:
         return ax
 
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
     # Test the camera with a dummy image (e.g. Night Sky Background noise)
     cam = Camera(n_rings=15, pixel_size=0.1) # VERITAS-like camera size
     

@@ -16,11 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libhdf5-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install
-COPY requirements.txt .
-# Add torch-geometric and h5py which were used in the analysis pipeline
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir torch-geometric h5py
+# Install the project and the optional analysis stacks through the same
+# versioned package metadata used outside the container.
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY generate_training_data.py generate_visualizations.py plot_ldf.py ./
+COPY regenerate_all.py run_full_sim.py run_gamma_camera_pipeline.py train_gnn.py ./
+RUN pip install --no-cache-dir ".[viz,ml,io]"
 
 # Copy the rest of the codebase
 COPY . .

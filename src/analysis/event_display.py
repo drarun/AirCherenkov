@@ -1,88 +1,188 @@
-import os
-import sys
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
+"""Render one camera graph with current energy and class predictions."""
 
-# Add project root and src to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from __future__ import annotations
 
-from analysis.dataset import CherenkovDataset
-from recon.gnn import HexCameraGNN
-from sim.camera import Camera
+import argparse
+from pathlib import Path
 
-def main():
-    print("Loading dataset...")
-    # Add edge_index transform as in train_gnn.py
-    cam = Camera(n_rings=12)
-    pos = torch.stack([torch.tensor(cam.pixel_x, dtype=torch.float32), 
-                       torch.tensor(cam.pixel_y, dtype=torch.float32)], dim=1)
-    dist = torch.cdist(pos, pos)
-    adj_matrix = (dist > 0.01) & (dist < 0.105)
-    edge_index = adj_matrix.nonzero(as_tuple=False).t().contiguous()
-    
-    class AddEdgeIndex(object):
-        def __init__(self, edge_idx):
-            self.edge_idx = edge_idx
-        def __call__(self, data):
-            data.edge_index = self.edge_idx
-            return data
-            
-    dataset = CherenkovDataset(root='data', pre_transform=AddEdgeIndex(edge_index))
-    if len(dataset) == 0:
-        print("No events in dataset.")
-        return
+from analysis._gnn_cli import (
+    AddEdgeIndex,
+    DEFAULT_CAMERA_RINGS,
+    OptionalDependencyError,
+    camera_edge_index,
+    load_checkpoint,
+    load_runtime,
+    resolve_device,
+    validate_dataset_root,
+    validate_graph,
+)
 
-    # Take the first event
-    data = dataset[0]
 
-    print("Loading model...")
-    device = torch.device('cpu')
-    model = HexCameraGNN().to(device)
-    model.load_state_dict(torch.load('data/gnn_model.pt', map_location=device))
-    model.eval()
+def render_event(
+    *,
+    dataset_root: Path | str = Path("data/test"),
+    event_index: int = 0,
+    energy_checkpoint: Path | str = Path("data/energy_gnn.pt"),
+    class_checkpoint: Path | str = Path("data/class_gnn.pt"),
+    output: Path | str = Path("data/event_display.png"),
+    device: str = "auto",
+    camera_rings: int = DEFAULT_CAMERA_RINGS,
+) -> dict[str, float | int | str]:
+    """Run both supported models and save a display for one camera graph."""
+    if event_index < 0:
+        raise ValueError("event_index must be non-negative")
+    if camera_rings < 0:
+        raise ValueError("camera_rings must be non-negative")
 
-    print("Running inference...")
-    with torch.no_grad():
-        # Add batch dimension for global pooling
-        batch = torch.zeros(data.x.shape[0], dtype=torch.long)
-        
-        energy_pred, class_logits = model(data.x, data.edge_index, batch)
-        
-        # Probabilities
-        prob = torch.sigmoid(class_logits).item()
-        
-        # Energies are in log10 scale
-        pred_energy = 10 ** energy_pred.item()
-        true_energy = 10 ** data.y_energy.item()
-        
-        true_class = data.y_class.item()
+    runtime = load_runtime(metrics=False)
+    torch = runtime.torch
+    plt = runtime.pyplot
 
-    print("Plotting...")
-    # The image features are in data.x
-    # In dataset.py, it's x = torch.log10(img_clamped.unsqueeze(1) + 1.0)
-    image_amplitudes = data.x[:, 0].numpy()
-    
-    # We can invert log10 to show real PE, or just plot log10(PE).
-    # Camera.plot_image typically plots PE
-    pe_amplitudes = (10 ** image_amplitudes) - 1.0
+    from analysis.dataset import CherenkovDataset
+    from recon.gnn import ClassGNN, EnergyGNN
+    from sim.camera import Camera
 
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111)
-    
-    class_name = "Gamma" if true_class == 1.0 else "Proton"
-    title = (
-        f"Simulated Event Display\n"
-        f"True Class: {class_name} | Pred Gamma Prob: {prob:.1%}\n"
-        f"True Energy: {true_energy:.2f} TeV | Pred Energy: {pred_energy:.2f} TeV"
+    dataset_root = validate_dataset_root(Path(dataset_root))
+    camera = Camera(n_rings=camera_rings)
+    edge_index = camera_edge_index(torch, camera)
+    dataset = CherenkovDataset(
+        root=str(dataset_root),
+        transform=AddEdgeIndex(edge_index),
     )
-    cam.plot_image(pe_amplitudes, ax=ax, title=title)
-    
-    plt.tight_layout()
-    output_path = 'data/event_display.png'
-    plt.savefig(output_path, dpi=150)
-    print(f"Plot saved to {output_path}")
+    if event_index >= len(dataset):
+        raise ValueError(
+            f"event_index {event_index} is outside a dataset containing "
+            f"{len(dataset)} camera graphs"
+        )
 
-if __name__ == '__main__':
-    main()
+    data = dataset[event_index]
+    validate_graph(data, expected_pixels=camera.n_pixels)
+    # The current feature contract stores 16 FADC samples first.  Summing those
+    # samples displays the integrated trace actually consumed by both models.
+    image_amplitudes = data.x[:, :16].detach().sum(dim=1).cpu().numpy()
+
+    selected_device = resolve_device(torch, device)
+    energy_model = EnergyGNN()
+    class_model = ClassGNN()
+    load_checkpoint(
+        torch,
+        energy_model,
+        Path(energy_checkpoint),
+        model_name="EnergyGNN",
+    )
+    load_checkpoint(
+        torch,
+        class_model,
+        Path(class_checkpoint),
+        model_name="ClassGNN",
+    )
+    energy_model = energy_model.to(selected_device).eval()
+    class_model = class_model.to(selected_device).eval()
+    data = data.to(selected_device)
+    batch = torch.zeros(data.x.shape[0], dtype=torch.long, device=selected_device)
+
+    with torch.inference_mode():
+        predicted_log_energy = energy_model(
+            data.x, data.edge_index, batch
+        ).view(-1)[0]
+        class_logit = class_model(data.x, data.edge_index, batch).view(-1)[0]
+
+    predicted_gamma_probability = float(torch.sigmoid(class_logit).cpu())
+    predicted_energy_gev = float(torch.pow(10.0, predicted_log_energy).cpu())
+    true_log_energy = data.y_energy.detach().view(-1)[0]
+    true_energy_gev = float(torch.pow(10.0, true_log_energy).cpu())
+    true_class = float(data.y_class.detach().view(-1)[0].cpu())
+    class_name = "Gamma" if true_class == 1.0 else "Proton"
+
+    figure, axis = plt.subplots(figsize=(10, 8))
+    title = (
+        "Simulated event display\n"
+        f"True class: {class_name} | Predicted gamma probability: "
+        f"{predicted_gamma_probability:.1%}\n"
+        f"True energy: {true_energy_gev:.2f} GeV | "
+        f"Gamma-trained energy estimate: {predicted_energy_gev:.2f} GeV"
+    )
+    camera.plot_image(image_amplitudes, ax=axis, title=title)
+
+    output = Path(output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(output, dpi=150)
+    plt.close(figure)
+
+    return {
+        "event_index": int(event_index),
+        "true_class": class_name.lower(),
+        "true_energy_gev": true_energy_gev,
+        "predicted_energy_gev": predicted_energy_gev,
+        "predicted_gamma_probability": predicted_gamma_probability,
+        "device": str(selected_device),
+        "output": str(output),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="aircherenkov-event-display",
+        description=(
+            "Render one camera graph using the separate EnergyGNN and ClassGNN "
+            "checkpoints written by train_gnn.py."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("data/test"),
+        help="PyG dataset root containing raw/ or processed/data_v2.pt (default: %(default)s)",
+    )
+    parser.add_argument("--event-index", type=int, default=0)
+    parser.add_argument(
+        "--energy-checkpoint",
+        type=Path,
+        default=Path("data/energy_gnn.pt"),
+        help="EnergyGNN state dictionary written by train_gnn.py (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--class-checkpoint",
+        type=Path,
+        default=Path("data/class_gnn.pt"),
+        help="ClassGNN state dictionary written by train_gnn.py (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/event_display.png"),
+        help="Destination PNG (default: %(default)s)",
+    )
+    parser.add_argument("--camera-rings", type=int, default=DEFAULT_CAMERA_RINGS)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = render_event(
+            dataset_root=args.dataset_root,
+            event_index=args.event_index,
+            energy_checkpoint=args.energy_checkpoint,
+            class_checkpoint=args.class_checkpoint,
+            output=args.output,
+            device=args.device,
+            camera_rings=args.camera_rings,
+        )
+    except (FileNotFoundError, OptionalDependencyError, RuntimeError, ValueError) as exc:
+        parser.exit(2, f"{parser.prog}: error: {exc}\n")
+
+    print(
+        f"Rendered graph {result['event_index']} on {result['device']}: "
+        f"P(gamma)={result['predicted_gamma_probability']:.1%}, "
+        f"energy estimate={result['predicted_energy_gev']:.2f} GeV."
+    )
+    print(f"Saved event display to {result['output']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

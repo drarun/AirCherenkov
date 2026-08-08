@@ -1,105 +1,227 @@
+from typing import Any, Optional
+
 import numpy as np
 
-def tail_cut_clean(camera, image, picture_thresh=5.0, boundary_thresh=2.5, min_neighbors=1):
+
+def _validated_image(image: Any) -> np.ndarray:
+    try:
+        array = np.asarray(image, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("image must be a one-dimensional numeric array") from exc
+    if array.ndim != 1:
+        raise ValueError("image must be one-dimensional")
+    if not np.all(np.isfinite(array)):
+        raise ValueError("image must contain only finite values")
+    return array
+
+
+def _validated_threshold(value: Any, name: str) -> float:
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite nonnegative number") from exc
+    if not np.isfinite(threshold) or threshold < 0.0:
+        raise ValueError(f"{name} must be a finite nonnegative number")
+    return threshold
+
+
+def _validated_neighbors(camera: Any, n_pixels: int) -> np.ndarray:
+    neighbors = np.asarray(camera.get_neighbor_matrix())
+    if neighbors.shape != (n_pixels, n_pixels):
+        raise ValueError(
+            f"camera neighbor matrix must have shape {(n_pixels, n_pixels)}"
+        )
+    if not (
+        np.issubdtype(neighbors.dtype, np.bool_)
+        or np.issubdtype(neighbors.dtype, np.number)
+    ):
+        raise ValueError("camera neighbor matrix must be boolean or numeric")
+    if np.issubdtype(neighbors.dtype, np.number) and not np.all(
+        np.isfinite(neighbors)
+    ):
+        raise ValueError("camera neighbor matrix must contain only finite values")
+
+    neighbors = neighbors.astype(bool, copy=True)
+    np.fill_diagonal(neighbors, False)
+    # Camera adjacency is physically undirected.  Treat either reported edge
+    # direction as evidence of a connection, which is robust to sparse-matrix
+    # construction details while retaining deterministic cleaning.
+    return neighbors | neighbors.T
+
+
+def _validated_geometry(camera: Any, n_pixels: int) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        pixel_x = np.asarray(camera.pixel_x, dtype=np.float64)
+        pixel_y = np.asarray(camera.pixel_y, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("camera coordinates must be numeric arrays") from exc
+    if pixel_x.shape != (n_pixels,) or pixel_y.shape != (n_pixels,):
+        raise ValueError("camera coordinates and image must have the same shape")
+    if not np.all(np.isfinite(pixel_x)) or not np.all(np.isfinite(pixel_y)):
+        raise ValueError("camera coordinates must contain only finite values")
+    return pixel_x, pixel_y
+
+
+def _connected_to_seed(
+    neighbors: np.ndarray, eligible: np.ndarray, seed: np.ndarray
+) -> np.ndarray:
+    """Return eligible pixels graph-connected to any seed pixel."""
+    connected = seed.copy()
+    allowed = eligible | seed
+    frontier = seed.copy()
+    while np.any(frontier):
+        adjacent = np.any(neighbors[frontier], axis=0)
+        frontier = adjacent & allowed & ~connected
+        connected |= frontier
+    return connected
+
+
+def tail_cut_clean(
+    camera: Any,
+    image: np.ndarray,
+    picture_thresh: float = 5.0,
+    boundary_thresh: float = 2.5,
+    min_neighbors: int = 1,
+) -> np.ndarray:
+    """Perform standard two-level tail-cut image cleaning.
+
+    Finite baseline-subtracted camera charges are accepted, including negative
+    pedestal fluctuations.  With nonnegative thresholds those fluctuations
+    cannot enter the cleaned mask.  NaN, infinity, and malformed camera
+    adjacency are rejected.
     """
-    Standard Two-Level Tail-Cut Image Cleaning.
-    
-    Args:
-        camera (Camera): The camera object containing pixel geometries.
-        image (np.ndarray): The raw pixel amplitudes (photoelectrons).
-        picture_thresh (float): Threshold for core shower pixels.
-        boundary_thresh (float): Threshold for fringe pixels adjacent to a picture pixel.
-        min_neighbors (int): Minimum number of adjacent picture pixels required for core pixels.
-        
-    Returns:
-        np.ndarray: A boolean mask of the same length as the image, where True means the pixel is retained.
-    """
-    neighbors = camera.get_neighbor_matrix()
-    
-    # 1. Identify picture pixels
-    # Must be > picture_thresh AND have at least `min_neighbors` adjacent pixels also > picture_thresh
-    is_above_pic = image >= picture_thresh
-    
-    # Count how many neighbors are also above picture threshold
-    pic_neighbor_counts = np.sum(neighbors & is_above_pic[None, :], axis=1)
-    
-    picture_mask = is_above_pic & (pic_neighbor_counts >= min_neighbors)
-    
-    # 2. Identify boundary pixels
-    # Must be > boundary_thresh AND adjacent to at least one picture pixel
-    is_above_bnd = image >= boundary_thresh
-    
-    # Check if any neighbor is a valid picture pixel
-    adjacent_to_pic = np.any(neighbors & picture_mask[None, :], axis=1)
-    
-    boundary_mask = is_above_bnd & adjacent_to_pic & (~picture_mask)
-    
-    # Final cleaned mask
+    image_array = _validated_image(image)
+    picture_thresh = _validated_threshold(picture_thresh, "picture_thresh")
+    boundary_thresh = _validated_threshold(boundary_thresh, "boundary_thresh")
+    if isinstance(min_neighbors, (bool, np.bool_)) or not isinstance(
+        min_neighbors, (int, np.integer)
+    ):
+        raise ValueError("min_neighbors must be a nonnegative integer")
+    if min_neighbors < 0:
+        raise ValueError("min_neighbors must be a nonnegative integer")
+
+    neighbors = _validated_neighbors(camera, image_array.size)
+    is_above_picture = image_array >= picture_thresh
+    picture_neighbor_counts = np.sum(
+        neighbors & is_above_picture[None, :], axis=1
+    )
+    picture_mask = is_above_picture & (
+        picture_neighbor_counts >= min_neighbors
+    )
+
+    is_above_boundary = image_array >= boundary_thresh
+    adjacent_to_picture = np.any(neighbors & picture_mask[None, :], axis=1)
+    boundary_mask = is_above_boundary & adjacent_to_picture & ~picture_mask
     return picture_mask | boundary_mask
 
 
-def double_pass_clean(camera, image, 
-                      pic1=5.0, bnd1=2.5, 
-                      pic2=2.0, bnd2=1.0, 
-                      dist_tolerance=0.15):
-    """
-    Double-Pass Image Cleaning.
-    
+def double_pass_clean(
+    camera: Any,
+    image: np.ndarray,
+    pic1: float = 5.0,
+    bnd1: float = 2.5,
+    pic2: float = 2.0,
+    bnd2: float = 1.0,
+    dist_tolerance: float = 0.15,
+    longitudinal_tolerance: Optional[float] = None,
+) -> np.ndarray:
+    """Clean an image twice while recovering only a connected faint fringe.
+
+    The second pass must satisfy three conditions: the lower tail cuts, the
+    perpendicular distance from the first-pass major axis, and graph
+    connectivity to the first-pass core.  It is also restricted to the core's
+    finite longitudinal interval plus ``longitudinal_tolerance`` on each end.
+    If omitted, that margin is the larger of ``dist_tolerance`` and two camera
+    pixel spacings.  Timing is not applied because it is not part of this API.
+
     Args:
-        camera (Camera): The camera object.
-        image (np.ndarray): The raw pixel amplitudes.
-        pic1, bnd1: Thresholds for the first pass (standard cleaning).
-        pic2, bnd2: Lower thresholds for the second pass to recover faint fringes.
-        dist_tolerance: Maximum perpendicular distance (in degrees) from the shower axis to accept 2nd pass pixels.
-        
+        camera: Camera geometry with coordinates and a neighbor matrix.
+        image: Finite raw pixel amplitudes. Baseline-subtracted pedestal
+            fluctuations may be negative.
+        pic1, bnd1: First-pass picture and boundary thresholds.
+        pic2, bnd2: Second-pass picture and boundary thresholds.
+        dist_tolerance: Maximum perpendicular distance from the core axis.
+        longitudinal_tolerance: Maximum extension beyond each end of the core.
+
     Returns:
-        np.ndarray: A boolean mask of retained pixels after both passes.
+        Boolean retained-pixel mask.
     """
-    # PASS 1: Standard tight cleaning to find the core
-    mask_pass1 = tail_cut_clean(camera, image, pic1, bnd1)
-    
-    if np.sum(mask_pass1) < 3:
-        # If the first pass failed to find a shower core, return the empty mask
+    image_array = _validated_image(image)
+    dist_tolerance = _validated_threshold(dist_tolerance, "dist_tolerance")
+    if longitudinal_tolerance is not None:
+        longitudinal_tolerance = _validated_threshold(
+            longitudinal_tolerance, "longitudinal_tolerance"
+        )
+
+    # tail_cut_clean also validates all four threshold arguments.
+    mask_pass1 = tail_cut_clean(camera, image_array, pic1, bnd1)
+    if np.count_nonzero(mask_pass1) < 3:
         return mask_pass1
-        
-    # Calculate the principal axis (major axis) of the Pass 1 image
-    x_core = camera.pixel_x[mask_pass1]
-    y_core = camera.pixel_y[mask_pass1]
-    w_core = image[mask_pass1]
-    
-    # Center of gravity
-    sum_w = np.sum(w_core)
-    cg_x = np.sum(x_core * w_core) / sum_w
-    cg_y = np.sum(y_core * w_core) / sum_w
-    
-    # Covariance matrix for the core pixels
-    dx = x_core - cg_x
-    dy = y_core - cg_y
-    Sxx = np.sum(w_core * dx**2) / sum_w
-    Syy = np.sum(w_core * dy**2) / sum_w
-    Sxy = np.sum(w_core * dx * dy) / sum_w
-    
-    # Angle of the major axis (delta)
-    # tan(2 * delta) = 2*Sxy / (Sxx - Syy)
-    diff = Sxx - Syy
-    if diff == 0: diff = 1e-10 # prevent division by zero
-    delta = 0.5 * np.arctan2(2 * Sxy, diff)
-    
-    # Unit vector of the major axis
-    vx = np.cos(delta)
-    vy = np.sin(delta)
-    
-    # PASS 2: Lower threshold cleaning
-    mask_pass2_candidates = tail_cut_clean(camera, image, pic2, bnd2)
-    
-    # Filter Pass 2 candidates: they must be close to the Pass 1 major axis
-    # Perpendicular distance from a point (x, y) to the line passing through (cg_x, cg_y) with direction (vx, vy):
-    # d = |(x - cg_x)*vy - (y - cg_y)*vx|
-    all_dx = camera.pixel_x - cg_x
-    all_dy = camera.pixel_y - cg_y
-    perp_dist = np.abs(all_dx * vy - all_dy * vx)
-    
-    valid_pass2_mask = mask_pass2_candidates & (perp_dist <= dist_tolerance)
-    
-    # Final mask is Pass 1 combined with the valid Pass 2 pixels
-    return mask_pass1 | valid_pass2_mask
+
+    pixel_x, pixel_y = _validated_geometry(camera, image_array.size)
+    neighbors = _validated_neighbors(camera, image_array.size)
+    x_core = pixel_x[mask_pass1]
+    y_core = pixel_y[mask_pass1]
+    weights = image_array[mask_pass1]
+    weight_sum = float(np.sum(weights, dtype=np.float64))
+    if weight_sum <= 0.0:
+        return np.zeros_like(mask_pass1)
+
+    centroid_x = float(np.dot(x_core, weights) / weight_sum)
+    centroid_y = float(np.dot(y_core, weights) / weight_sum)
+    centered_x = x_core - centroid_x
+    centered_y = y_core - centroid_y
+    covariance_xx = float(np.dot(weights, centered_x**2) / weight_sum)
+    covariance_yy = float(np.dot(weights, centered_y**2) / weight_sum)
+    covariance_xy = float(np.dot(weights, centered_x * centered_y) / weight_sum)
+    axis_angle = 0.5 * np.arctan2(
+        2.0 * covariance_xy, covariance_xx - covariance_yy
+    )
+    axis_x = float(np.cos(axis_angle))
+    axis_y = float(np.sin(axis_angle))
+
+    mask_pass2_candidates = tail_cut_clean(camera, image_array, pic2, bnd2)
+    all_centered_x = pixel_x - centroid_x
+    all_centered_y = pixel_y - centroid_y
+    perpendicular_distance = np.abs(
+        all_centered_x * axis_y - all_centered_y * axis_x
+    )
+    longitudinal_position = (
+        all_centered_x * axis_x + all_centered_y * axis_y
+    )
+    core_longitudinal = longitudinal_position[mask_pass1]
+
+    if longitudinal_tolerance is None:
+        pixel_spacing = getattr(camera, "pixel_size", None)
+        try:
+            pixel_spacing = float(pixel_spacing)
+        except (TypeError, ValueError):
+            pixel_spacing = np.nan
+        if not np.isfinite(pixel_spacing) or pixel_spacing <= 0.0:
+            edge_rows, edge_columns = np.nonzero(np.triu(neighbors, k=1))
+            if edge_rows.size:
+                edge_lengths = np.hypot(
+                    pixel_x[edge_rows] - pixel_x[edge_columns],
+                    pixel_y[edge_rows] - pixel_y[edge_columns],
+                )
+                positive_lengths = edge_lengths[edge_lengths > 0.0]
+                pixel_spacing = (
+                    float(np.median(positive_lengths))
+                    if positive_lengths.size
+                    else dist_tolerance
+                )
+            else:
+                pixel_spacing = dist_tolerance
+        longitudinal_tolerance = max(dist_tolerance, 2.0 * pixel_spacing)
+
+    within_axis_band = perpendicular_distance <= dist_tolerance
+    within_longitudinal_extent = (
+        longitudinal_position >= np.min(core_longitudinal) - longitudinal_tolerance
+    ) & (
+        longitudinal_position <= np.max(core_longitudinal) + longitudinal_tolerance
+    )
+    eligible_pass2 = (
+        mask_pass2_candidates & within_axis_band & within_longitudinal_extent
+    )
+
+    return _connected_to_seed(neighbors, eligible_pass2, mask_pass1)
