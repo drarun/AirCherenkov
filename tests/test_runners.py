@@ -70,10 +70,31 @@ def test_visualization_runner_rejects_invalid_configuration(kwargs):
         generate_visualizations.generate_visualizations(**kwargs)
 
 
-def test_run_full_sim_reports_rename_and_delegates(monkeypatch, capsys):
-    monkeypatch.setattr(run_full_sim, '_run_gamma_camera_pipeline', lambda: 'done')
-    assert run_full_sim.main() == 'done'
-    assert 'run_gamma_camera_pipeline.py' in capsys.readouterr().out
+def test_run_full_sim_executes(monkeypatch, tmp_path):
+    import os
+    class FakeSimulation:
+        def __init__(self, **kwargs):
+            self.cherenkov_photons_by_event = {0: {
+                'x_emit': np.array([0.0], dtype=np.float32),
+                'y_emit': np.array([0.0], dtype=np.float32),
+                'z_emit': np.array([10000.0], dtype=np.float32),
+                'x_ground': np.array([10.0], dtype=np.float32),
+                'y_ground': np.array([20.0], dtype=np.float32),
+                'weight': np.array([1.0], dtype=np.float32),
+                'shower_start_altitude': np.array([20000.0], dtype=np.float32)
+            }}
+            self.photon_yield_factor = 1.0
+        def run(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(run_full_sim, 'ShowerSimulation', FakeSimulation)
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        run_full_sim.main()
+        assert os.path.exists("camera_cleaning_comparison.png")
+    finally:
+        os.chdir(cwd)
 
 
 def test_directory_plotly_mode_shares_offline_bundle(tmp_path):

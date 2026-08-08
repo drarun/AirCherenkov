@@ -48,13 +48,24 @@ class ShowerSimulation:
         self.PID_MAP = {'gamma': 0, 'e+': 1, 'e-': 2, 'proton': 3, 'pi_charged': 4, 'pi0': 5, 'mu': 6}
         self.INV_PID_MAP = {v: k for k, v in self.PID_MAP.items()}
         
-        # Ensure inputs are lists
+        # Ensure inputs are lists and broadcast to match primary_types length
         if isinstance(primary_types, str):
             primary_types = [primary_types]
+        batch_size = len(primary_types)
+
         if isinstance(energies, (float, int)):
-            energies = [energies]
+            energies = [float(energies)] * batch_size
+        elif len(energies) == 1:
+            energies = [float(energies[0])] * batch_size
+        elif len(energies) != batch_size:
+            raise ValueError("Length of energies must match length of primary_types")
+
         if isinstance(z_starts, (float, int)):
-            z_starts = [z_starts]
+            z_starts = [float(z_starts)] * batch_size
+        elif len(z_starts) == 1:
+            z_starts = [float(z_starts[0])] * batch_size
+        elif len(z_starts) != batch_size:
+            raise ValueError("Length of z_starts must match length of primary_types")
         self.dtype = torch.float32
             
         # Magnetic field vectors (X: North, Y: East, Z: Down) in Tesla
