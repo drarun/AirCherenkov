@@ -7,9 +7,17 @@ import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from recon.gnn import SpatiotemporalGNN
 from analysis.dataset import CherenkovDataset
+import argparse
 
 def train_networks():
-    print("Loading datasets...")
+    parser = argparse.ArgumentParser(description="Train Spatiotemporal GNN for AirCherenkov")
+    parser.add_argument("--root", type=str, default="data/train", help="Dataset root directory containing 'raw' folder")
+    parser.add_argument("--model_path", type=str, default="data/spatiotemporal_gnn.pt", help="Path to save the trained model")
+    parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    args = parser.parse_args()
+
+    print(f"Loading dataset from root: {args.root}...")
     
     # Generate the edge index for the hexagonal camera grid
     from sim.camera import Camera
@@ -26,7 +34,7 @@ def train_networks():
             data.edge_index = self.edge_idx
             return data
             
-    dataset = CherenkovDataset(root='data/train', pre_transform=AddEdgeIndex(edge_index))
+    dataset = CherenkovDataset(root=args.root, pre_transform=AddEdgeIndex(edge_index))
     print(f"Dataset loaded with {len(dataset)} events.")
     
     if len(dataset) == 0:
@@ -39,8 +47,8 @@ def train_networks():
     train_data = dataset[:split]
     val_data = dataset[split:]
     
-    train_loader = DataLoader(train_data, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=128, shuffle=False)
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -52,7 +60,7 @@ def train_networks():
     criterion_energy = nn.MSELoss()
     criterion_class = nn.BCEWithLogitsLoss()
     
-    epochs = 25
+    epochs = args.epochs
     print(f"\nTraining on {device} for {epochs} epochs...")
     
     for epoch in range(epochs):
@@ -87,8 +95,9 @@ def train_networks():
             
         print(f"Epoch {epoch+1}/{epochs} | Class Loss: {total_loss_c/len(train_loader):.4f} | Energy Loss: {total_loss_e/len(train_loader):.4f}")
         
-    print("\nTraining complete! Saving models...")
-    torch.save(model.state_dict(), 'data/spatiotemporal_gnn.pt')
+    print(f"\nTraining complete! Saving model to {args.model_path}...")
+    os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+    torch.save(model.state_dict(), args.model_path)
 
 if __name__ == '__main__':
     train_networks()
