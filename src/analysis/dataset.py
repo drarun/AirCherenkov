@@ -66,7 +66,7 @@ class CherenkovDataset(InMemoryDataset):
         
         px_feat = torch.tensor(pixel_x, dtype=torch.float32).unsqueeze(1)
         py_feat = torch.tensor(pixel_y, dtype=torch.float32).unsqueeze(1)
-        trigger = CameraTrigger(cam)
+        trigger = CameraTrigger(pixel_x, pixel_y)
         
         for raw_file in self.raw_paths:
             print(f"Processing {raw_file}...")
@@ -95,35 +95,33 @@ class CherenkovDataset(InMemoryDataset):
                 
                 if isinstance(sim_data, list):
                     for evt in sim_data:
-                        # evt['fadc_traces'] shape is (4 telescopes, 469 pixels, 16 bins).
-                        # We must NOT sum them, as that destroys stereoscopic spatial correlations.
-                        # Instead, we treat each telescope as a separate graph for the single-camera GNN.
+                        event_x_list = []
                         for tel_idx in range(len(evt['fadc_traces'])):
                             trace_np = evt['fadc_traces'][tel_idx]
                             gain_np = evt['gain_flags'][tel_idx]
                             
-                            # Integrate for CoG and Trigger (using max bin for timing)
                             img_np = np.sum(trace_np, axis=1)
                             timing_np = np.argmax(trace_np, axis=1) * 2.0
                             
                             is_triggered, t0 = trigger.evaluate(img_np, timing_np)
-                            
                             if is_triggered:
-                                trace_feat = torch.tensor(trace_np, dtype=torch.float32)
+                                # Apply log1p normalization (Critical 1)
+                                trace_feat = torch.log1p(torch.tensor(trace_np, dtype=torch.float32))
                                 gain_feat = torch.tensor(gain_np, dtype=torch.float32).unsqueeze(1)
+                                timing_feat = torch.tensor(timing_np, dtype=torch.float32).unsqueeze(1) # Advisory 9
                                 
-                                # Calculate Center of Gravity (Shower Core) for translation invariance
-                                total_charge = np.sum(img_np)
+                                # CoG with mask (Advisory 8)
+                                mask = img_np > 5.0
+                                total_charge = np.sum(img_np[mask])
                                 if total_charge > 0:
-                                    cog_x = np.sum(img_np * pixel_x) / total_charge
-                                    cog_y = np.sum(img_np * pixel_y) / total_charge
+                                    cog_x = np.sum(img_np[mask] * pixel_x[mask]) / total_charge
+                                    cog_y = np.sum(img_np[mask] * pixel_y[mask]) / total_charge
                                 else:
                                     cog_x, cog_y = 0.0, 0.0
                                     
                                 px_shifted = torch.tensor(pixel_x - cog_x, dtype=torch.float32).unsqueeze(1)
                                 py_shifted = torch.tensor(pixel_y - cog_y, dtype=torch.float32).unsqueeze(1)
                                 
-                                # INJECT SPATIOTEMPORAL FEATURES (16-bin trace + gain + 5 spatial)
                                 px_squared = px_shifted ** 2
                                 py_squared = py_shifted ** 2
                                 pxy = px_shifted * py_shifted
@@ -131,21 +129,33 @@ class CherenkovDataset(InMemoryDataset):
                                 x = torch.cat([
                                     trace_feat, 
                                     gain_feat, 
+                                    timing_feat,
                                     px_shifted, 
                                     py_shifted, 
                                     px_squared, 
                                     py_squared, 
                                     pxy
                                 ], dim=1)
-                        
-                                y_e = torch.log10(torch.tensor([evt['energy']], dtype=torch.float32))
-                                y_c = torch.tensor([evt['label']], dtype=torch.float32)
+                                event_x_list.append(x)
                                 
-                                data = Data(x=x, y_energy=y_e, y_class=y_c)
-                                data_list.append(data)
+                        if len(event_x_list) > 0:
+                            # Stereoscopic (Important 4)
+                            combined_x = torch.cat(event_x_list, dim=0).half()  # Halve memory usage
+                            
+                            num_nodes = len(pixel_x)
+                            edge_index_list = []
+                            for i in range(len(event_x_list)):
+                                offset_edge = cam.edge_index + (i * num_nodes)
+                                edge_index_list.append(offset_edge)
+                            combined_edge_index = torch.cat(edge_index_list, dim=1)
+                            
+                            y_e = torch.log10(torch.tensor([evt['energy']], dtype=torch.float32))
+                            y_c = torch.tensor([evt['label']], dtype=torch.float32)
+                            
+                            data = Data(x=combined_x, edge_index=combined_edge_index, y_energy=y_e, y_class=y_c)
+                            data_list.append(data)
         
-        if self.pre_transform is not None:
-            data_list = [self.pre_transform(d) for d in data_list]
+        # We removed self.pre_transform logic here since edge_index is built-in
             
         print(f"Processed {len(data_list)} events. Saving to {self.processed_paths[0]}...")
         data, slices = self.collate(data_list)

@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'train_large')
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'train_large', 'raw')
 cam = Camera(n_rings=12)
 pixel_x = cam.pixel_x.tolist()
 pixel_y = cam.pixel_y.tolist()

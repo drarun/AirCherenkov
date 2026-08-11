@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GraphNorm, global_max_pool, global_mean_pool
+from torch_geometric.nn import GATConv, GraphNorm, global_max_pool, global_mean_pool, global_add_pool
 
 class SpatiotemporalGNN(torch.nn.Module):
-    def __init__(self, num_node_features=22, hidden_channels=64, heads=4, dropout=0.1):
+    def __init__(self, num_node_features=23, hidden_channels=64, heads=4, dropout=0.1):
         super(SpatiotemporalGNN, self).__init__()
         self.dropout = dropout
         
@@ -14,8 +14,8 @@ class SpatiotemporalGNN(torch.nn.Module):
         self.pool1d = nn.MaxPool1d(kernel_size=2)
         
         # 16 time bins -> pool by 2 = 8 bins. 8 bins * 16 channels = 128 temporal features.
-        # Plus 6 static features (gain + 5 spatial) = 134 graph features.
-        gat_in_channels = 128 + 6
+        # Plus remaining features (gain, spatial, timing)
+        gat_in_channels = 128 + (num_node_features - 16)
         
         # Phase 3: Spatial Graph Attention (Multi-head)
         self.conv1 = GATConv(gat_in_channels, hidden_channels, heads=heads)
@@ -47,6 +47,7 @@ class SpatiotemporalGNN(torch.nn.Module):
         )
 
     def forward(self, x, edge_index, batch):
+        x = x.float()
         trace = x[:, :16].unsqueeze(1) # [N, 1 (channel), 16 (bins)]
         spatial = x[:, 16:] # [N, 6]
         
@@ -78,9 +79,9 @@ class SpatiotemporalGNN(torch.nn.Module):
         x = self.norm4(x, batch)
         x = F.relu(x)
         
-        # Energy output uses max pooling
-        x_max = global_max_pool(x, batch)
-        energy_out = self.energy_head(x_max)
+        # Energy output uses sum pooling (light is additive)
+        x_add = global_add_pool(x, batch)
+        energy_out = self.energy_head(x_add)
         
         # Class output uses mean and max pooling
         x_mean = global_mean_pool(x, batch)

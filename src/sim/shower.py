@@ -86,10 +86,18 @@ class ShowerSimulation:
         self.entropy_pool = torch.rand(50_000_000, device=self.device, dtype=self.dtype)
         self.entropy_idx = 0
         
+        # Handle array-like direction inputs for diffuse backgrounds
+        if not isinstance(px_init, (list, tuple, np.ndarray, torch.Tensor)):
+            px_init = [float(px_init)] * batch_size
+        if not isinstance(py_init, (list, tuple, np.ndarray, torch.Tensor)):
+            py_init = [float(py_init)] * batch_size
+        if not isinstance(pz_init, (list, tuple, np.ndarray, torch.Tensor)):
+            pz_init = [float(pz_init)] * batch_size
+
         # State tensor [PID, E, x, y, z, px, py, pz, generation, event_id]
         init_state = []
         for i in range(batch_size):
-            init_state.append([self.PID_MAP[primary_types[i]], energies[i], 0.0, 0.0, z_starts[i], px_init, py_init, pz_init, 0.0, float(i)])
+            init_state.append([self.PID_MAP[primary_types[i]], energies[i], 0.0, 0.0, z_starts[i], float(px_init[i]), float(py_init[i]), float(pz_init[i]), 0.0, float(i)])
             
         self.active = torch.tensor(init_state, dtype=self.dtype, device=self.device)
         self.batch_size = batch_size

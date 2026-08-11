@@ -14,7 +14,7 @@ from sim.telescope import TelescopeArray
 import argparse
 
 def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, save_every=1000, 
-                           output_dir='data/train_raw', zenith_deg=0.0, azimuth_deg=0.0,
+                           output_dir='data/train_raw', zenith_deg=0.0, azimuth_deg=0.0, diffuse_fov=0.0,
                            e_min=100.0, e_max=10000.0, spectral_index=2.0, impact_radius=250.0,
                            debug=False):
     """
@@ -27,18 +27,12 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
         os.environ['AIRCHERENKOV_DEBUG'] = '0'
     os.makedirs(output_dir, exist_ok=True)
     
-    # Compute initial direction vector from zenith/azimuth
-    # TODO: For diffuse cosmic-ray background simulations (to test background subtraction methods),
-    # we should modify this to allow per-event random solid-angle pointing (isotropic distribution)
-    # instead of a perfectly parallel beam for the entire batch.
     zen_rad = np.radians(zenith_deg)
     azi_rad = np.radians(azimuth_deg)
-    px_init = np.sin(zen_rad) * np.cos(azi_rad)
-    py_init = np.sin(zen_rad) * np.sin(azi_rad)
-    pz_init = -np.cos(zen_rad)
     
-    print(f"Shower direction: zenith={zenith_deg:.1f}°, azimuth={azimuth_deg:.1f}°")
-    print(f"  -> (px, py, pz) = ({px_init:.4f}, {py_init:.4f}, {pz_init:.4f})")
+    print(f"Shower base direction: zenith={zenith_deg:.1f}°, azimuth={azimuth_deg:.1f}°")
+    if diffuse_fov > 0:
+        print(f"Isotropic Background Mode: Scattering directions within {diffuse_fov:.2f}° FOV")
     
     # Higher z_start for inclined showers (longer slant depth)
     z_start = 20000.0 if zenith_deg < 25.0 else 25000.0
@@ -97,6 +91,9 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
             pids = []
             energies = []
             z_starts = []
+            px_batch = []
+            py_batch = []
+            pz_batch = []
             
             # Sample parameters
             for _ in range(current_batch_size):
@@ -123,10 +120,30 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                 energies.append(E)
                 z_starts.append(z_start)
                 
+                # Calculate specific direction for this shower
+                if diffuse_fov > 0:
+                    # Randomize direction within FOV cone uniformly in solid angle
+                    fov_rad = np.radians(diffuse_fov)
+                    # Random angle from the center (cosine distribution for uniform solid angle)
+                    cos_theta = 1.0 - np.random.rand() * (1.0 - np.cos(fov_rad))
+                    theta_offset = np.arccos(cos_theta)
+                    phi_offset = np.random.rand() * 2 * np.pi
+                    
+                    # Perturb zenith and azimuth (approximate for small FOVs)
+                    evt_zen = zen_rad + theta_offset * np.cos(phi_offset)
+                    evt_azi = azi_rad + theta_offset * np.sin(phi_offset)
+                else:
+                    evt_zen = zen_rad
+                    evt_azi = azi_rad
+                    
+                px_batch.append(np.sin(evt_zen) * np.cos(evt_azi))
+                py_batch.append(np.sin(evt_zen) * np.sin(evt_azi))
+                pz_batch.append(-np.cos(evt_zen))
+                
             # Run fully batched simulation with direction injection
             sim = ShowerSimulation(
                 primary_types=pids, energies=energies, z_starts=z_starts,
-                px_init=px_init, py_init=py_init, pz_init=pz_init
+                px_init=px_batch, py_init=py_batch, pz_init=pz_batch
             )
             sim.run(max_generations=16, verbose=False)
             
@@ -218,6 +235,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='data/train_raw', help='Output directory')
     parser.add_argument('--zenith_deg', type=float, default=0.0, help='Zenith angle in degrees')
     parser.add_argument('--azimuth_deg', type=float, default=0.0, help='Azimuth angle in degrees (0=N, 90=E, 180=S)')
+    parser.add_argument('--diffuse_fov', type=float, default=0.0, help='If > 0, scatters directions isotropically within this FOV radius (degrees)')
     parser.add_argument('--e_min', type=float, default=80.0, help='Min energy in GeV')
     parser.add_argument('--e_max', type=float, default=30000.0, help='Max energy in GeV')
     parser.add_argument('--spectral_index', type=float, default=2.0, help='Spectral index for E^-alpha sampling')
@@ -233,6 +251,7 @@ if __name__ == '__main__':
         output_dir=args.output_dir,
         zenith_deg=args.zenith_deg,
         azimuth_deg=args.azimuth_deg,
+        diffuse_fov=args.diffuse_fov,
         e_min=args.e_min,
         e_max=args.e_max,
         spectral_index=args.spectral_index,
