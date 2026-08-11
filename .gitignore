@@ -10,3 +10,7 @@ data/
 .vscode/
 
 DiagnosticPlots/
+
+# Tectonic binaries
+tectonic.exe
+tectonic.zip

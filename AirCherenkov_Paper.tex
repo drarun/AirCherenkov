@@ -1,0 +1,75 @@
+\documentclass[twocolumn,times]{aastex631}
+
+\usepackage{amsmath}
+\usepackage{graphicx}
+
+\shorttitle{AirCherenkov Methods and Pipeline}
+\shortauthors{Arun S. Madhavan}
+
+\begin{document}
+
+\title{AirCherenkov: A GPU-Accelerated Pipeline for Spatiotemporal GNN Reconstruction of Atmospheric Cherenkov Showers}
+
+\author{Arun S. Madhavan}
+\affiliation{Independent Researcher}
+
+\begin{abstract}
+We present the methodology and pipeline for AirCherenkov, a novel software framework designed for the simulation and analysis of Very-High-Energy (VHE) gamma-ray showers observed by Imaging Atmospheric Cherenkov Telescopes (IACTs). Our approach couples a highly optimized, tensorized Monte Carlo engine running natively on Graphics Processing Units (GPUs) with a Spatiotemporal Graph Neural Network (GNN) for event reconstruction. In this methods paper, we detail the core architecture of the simulation pipeline, the implementation of the GNN for unified energy regression and particle classification, and the methodology for constructing Instrument Response Functions (IRFs). We also outline future extensions, including full spectral forward-folding for robust source analysis.
+\end{abstract}
+
+\keywords{Gamma-ray astronomy --- Methods: data analysis --- Methods: numerical}
+
+\section{Introduction}
+Imaging Atmospheric Cherenkov Telescopes (IACTs) such as VERITAS, MAGIC, H.E.S.S., and the future Cherenkov Telescope Array (CTA) observe the universe at Very-High-Energy (VHE; $E > 100$ GeV) gamma-ray wavelengths. The detection of these photons relies on capturing the brief flashes of Cherenkov light emitted by extended electromagnetic air showers initiated in the upper atmosphere. Because the physical processes scale geometrically, traditional Monte Carlo (MC) simulations \citep[e.g., CORSIKA;][]{Heck1998} and classical analysis methods \citep[e.g., Hillas parameterization;][]{Hillas1985} are computationally expensive and may discard critical spatiotemporal information. Recent applications of deep learning \citep[e.g.,][]{Shilon2019} have shown promise, but often still rely on 2D image projections.
+
+In this work, we introduce AirCherenkov, a pipeline that performs end-to-end GPU-accelerated MC shower generation, telescope ray-tracing, and deep learning-based event reconstruction. The complete source code is open-source and available at \url{https://github.com/drarun/AirCherenkov}.
+
+\section{Methodology: What We Have Done}
+
+\subsection{GPU-Accelerated Monte Carlo Engine}
+The core of AirCherenkov is the \texttt{ShowerSimulation} engine. Unlike traditional CPU-based MC tools that process particles sequentially, our engine operates on fully tensorized arrays using PyTorch, processing thousands of particles simultaneously across a batch of showers. It accurately models physical phenomena including mean free path interactions, bremsstrahlung, pair production, Highland scattering, and Lorentz force geomagnetic deflections. 
+
+To prevent memory exhaustion during the simulation of ultra-high-energy hadronic background events (e.g., 30 TeV cosmic-ray protons), we implemented a ``photon bunching'' mechanism. This bundles a configurable number of physical Cherenkov photons into a single computational packet, drastically reducing the GPU VRAM footprint while preserving the statistical distribution of light on the ground.
+
+\subsection{Telescope Optics and Ray-Tracing}
+Ground-level Cherenkov photons are propagated through the telescope optics via a batched ray-tracing algorithm. The \texttt{TelescopeArray} module handles the projection of photons onto the camera's hexagonal pixel grid. The resulting data structure is a 3D spatiotemporal array containing the Flash Analog-to-Digital Converter (FADC) traces for each pixel over discrete time bins.
+
+\subsection{Spatiotemporal GNN Reconstruction}
+Traditional IACT analysis reduces the 3D FADC data to a 2D charge image, discarding temporal evolution. We employ a unified \texttt{SpatiotemporalGNN} that natively ingests the graph structure of the hexagonal camera. Each pixel represents a node, with edges connecting adjacent pixels. The node features include the full 16-bin FADC trace. 
+
+The GNN performs message passing across the spatial graph while maintaining the temporal trace features. It utilizes a shared latent embedding space before bifurcating into two prediction heads:
+\begin{itemize}
+    \item \textbf{Energy Regressor:} Predicts the continuous primary energy ($E_{\mathrm{reco}}$) of the initiating particle.
+    \item \textbf{Class Predictor:} Outputs a probability score for gamma/hadron separation.
+\end{itemize}
+This unified architecture allows the network to leverage correlations between the shower's development (e.g., muon rings from hadronic showers) and its total energy scale.
+
+\section{Calculation of Instrument Response Functions (IRFs)}
+A critical component of bridging the gap between raw telescope data and astrophysical source spectra is the Instrument Response Function (IRF). The IRF quantifies the probability that a photon of true energy $E_{\mathrm{true}}$ arriving from a specific direction will be reconstructed at an energy $E_{\mathrm{reco}}$ and spatial position $\vec{p}$. 
+
+Within AirCherenkov, IRFs are constructed directly from our simulated MC datasets:
+\begin{enumerate}
+    \item \textbf{Effective Area ($A_{\mathrm{eff}}$):} We calculate the ratio of successfully triggered and reconstructed gamma-ray events to the total number of simulated events within a defined maximum impact radius. This ratio is multiplied by the total physical area simulated to yield $A_{\mathrm{eff}}(E_{\mathrm{true}}, \theta, \phi)$.
+    \item \textbf{Energy Migration Matrix:} We bin the simulated events into a 2D histogram of $E_{\mathrm{true}}$ vs. $E_{\mathrm{reco}}$, normalizing each true energy slice to generate the Probability Density Function $P(E_{\mathrm{reco}} | E_{\mathrm{true}})$.
+    \item \textbf{Background Rate:} We independently process simulated hadronic (proton) events through the GNN class predictor. The surviving events define the residual cosmic-ray background rate.
+\end{enumerate}
+
+\section{Future Work}
+While the core components of AirCherenkov have been validated on test sets, significant extensions are planned for the upcoming observing campaigns.
+
+\subsection{Full Spectral Forward-Folding}
+Our immediate goal is to reconstruct the intrinsic spectrum of the Crab Nebula. Because IACTs have a finite energy resolution, direct ``unfolding'' of the observed counts can introduce numerical instabilities. Instead, we will implement a forward-folding maximum likelihood approach. We will assume a parameterized spectral model (e.g., an $E^{-\Gamma}$ power law or log-parabola), fold it through our derived effective area and energy migration matrices, and optimize the parameters to match the observed pseudodata counts via SciPy minimizers.
+
+\subsection{Fault Tolerance and Scaling}
+As we scale to simulating millions of events for Phase 3 publication-level statistics, we will expand our newly implemented checkpointing system to support multi-node distributed training and generation.
+
+\section{Conclusion}
+AirCherenkov provides a modern, differentiable, and highly parallelized framework for VHE gamma-ray astronomy. By natively retaining spatiotemporal data and leveraging GPU tensor operations, we aim to maximize the scientific yield of both current and next-generation IACT observatories.
+
+\begin{thebibliography}{99}
+\bibitem[Heck et al.(1998)]{Heck1998} Heck, D., Knapp, J., Capdevielle, J.~N., Schatz, G., \& Thouw, T.\ 1998, CORSIKA: A Monte Carlo Code to Simulate Extensive Air Showers, FZKA 6019, Forschungszentrum Karlsruhe
+\bibitem[Hillas(1985)]{Hillas1985} Hillas, A.~M.\ 1985, 19th International Cosmic Ray Conference (ICRC19), La Jolla, 3, 445
+\bibitem[Shilon et al.(2019)]{Shilon2019} Shilon, I., Kraus, M., B{\"u}chele, M., et al.\ 2019, Astroparticle Physics, 105, 44
+\end{thebibliography}
+
+\end{document}
