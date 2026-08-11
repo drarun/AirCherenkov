@@ -33,6 +33,8 @@ def main():
     gamma_size = []
     hadron_size = []
     
+    gamma_true_e = []
+    
     gamma_width = []
     hadron_width = []
     
@@ -75,6 +77,7 @@ def main():
                 if label == 1:
                     gamma_r.append(r)
                     gamma_size.append(total_size)
+                    gamma_true_e.append(ev.get('energy', 100.0))
                     if widths: gamma_width.append(np.mean(widths))
                     if lengths: gamma_length.append(np.mean(lengths))
                 else:
@@ -215,6 +218,80 @@ def main():
     plt.tight_layout()
     plt.savefig(os.path.join(diagnostics_dir, "06_hillas_width_dist.png"), bbox_inches='tight')
     plt.close()
+    
+    # 7. Energy Resolution & Bias (Stage 5 Proxy)
+    # Reconstruct energy using a simple 2D polynomial regression: log10(E) = f(log10(Size), Radius)
+    gamma_size = np.array(gamma_size)
+    gamma_true_e = np.array(gamma_true_e)
+    
+    if len(gamma_size) > 10:
+        log10_size = np.log10(gamma_size)
+        log10_true_e = np.log10(gamma_true_e) # in GeV
+        
+        # Design matrix: [1, log10(S), r, log10(S)*r, r^2]
+        A_mat = np.column_stack([
+            np.ones_like(log10_size),
+            log10_size,
+            gamma_r,
+            log10_size * gamma_r,
+            gamma_r**2
+        ])
+        
+        try:
+            beta, _, _, _ = np.linalg.lstsq(A_mat, log10_true_e, rcond=None)
+            log10_pred_e = A_mat @ beta
+            E_pred = 10**log10_pred_e
+            E_true = gamma_true_e
+            
+            frac_error = (E_pred - E_true) / E_true
+            
+            # Group into energy bins
+            log_e_bins = np.linspace(np.log10(100), np.log10(30000), 10)
+            bin_centers = 10**(0.5 * (log_e_bins[:-1] + log_e_bins[1:])) / 1000.0 # to TeV
+            
+            resolutions = []
+            biases = []
+            
+            for i in range(len(log_e_bins)-1):
+                mask = (log10_true_e >= log_e_bins[i]) & (log10_true_e < log_e_bins[i+1])
+                if np.sum(mask) >= 5:
+                    errors_in_bin = frac_error[mask]
+                    # Resolution: 68% containment half-width of absolute fractional error
+                    res = np.percentile(np.abs(errors_in_bin), 68)
+                    bias = np.median(errors_in_bin)
+                    resolutions.append(res)
+                    biases.append(bias)
+                else:
+                    resolutions.append(np.nan)
+                    biases.append(np.nan)
+            
+            # Plot Energy Performance
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
+            
+            ax1.plot(bin_centers, np.array(resolutions) * 100.0, 'o-', color='#38BDF8', lw=2.5, label='68% containment')
+            ax1.set_xscale('log')
+            ax1.set_xlabel('True Energy [TeV]')
+            ax1.set_ylabel('Energy Resolution [%]')
+            ax1.set_title('Baseline Energy Resolution')
+            ax1.axhline(y=17, color='gray', linestyle='--', alpha=0.5, label='VERITAS Goal (17%)')
+            ax1.grid(True, alpha=0.2)
+            ax1.legend()
+            
+            ax2.plot(bin_centers, np.array(biases) * 100.0, 's-', color='#F43F5E', lw=2.5, label='Median Bias')
+            ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+            ax2.set_xscale('log')
+            ax2.set_xlabel('True Energy [TeV]')
+            ax2.set_ylabel('Energy Bias [%]')
+            ax2.set_title('Baseline Energy Bias')
+            ax2.grid(True, alpha=0.2)
+            ax2.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(diagnostics_dir, "07_energy_resolution_bias.png"), bbox_inches='tight')
+            plt.close()
+            print("Successfully generated energy resolution and bias plots.")
+        except Exception as ex:
+            print(f"Failed to generate energy diagnostics: {ex}")
     
     print(f"Successfully generated all diagnostic plots in {diagnostics_dir}")
 
