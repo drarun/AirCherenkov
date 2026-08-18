@@ -126,6 +126,20 @@ class CherenkovDataset(InMemoryDataset):
                                 py_squared = py_shifted ** 2
                                 pxy = px_shifted * py_shifted
                                 
+                                # Per-pixel log10(charge) and telescope-level log10(Size)
+                                # These give the GNN direct access to energy-correlated
+                                # amplitude information that log1p compresses away.
+                                pixel_charge = np.maximum(img_np, 0.0)
+                                log_pixel_charge = torch.tensor(
+                                    np.log10(pixel_charge + 1.0), dtype=torch.float32
+                                ).unsqueeze(1)
+                                
+                                # Hillas Size = total integrated charge (broadcast to all nodes)
+                                log_size = np.log10(max(total_charge, 1.0))
+                                log_size_feat = torch.full(
+                                    (len(pixel_x), 1), log_size, dtype=torch.float32
+                                )
+                                
                                 x = torch.cat([
                                     trace_feat, 
                                     gain_feat, 
@@ -134,7 +148,9 @@ class CherenkovDataset(InMemoryDataset):
                                     py_shifted, 
                                     px_squared, 
                                     py_squared, 
-                                    pxy
+                                    pxy,
+                                    log_pixel_charge,
+                                    log_size_feat
                                 ], dim=1)
                                 event_x_list.append(x)
                                 

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GraphNorm, global_max_pool, global_mean_pool, global_add_pool
 
 class SpatiotemporalGNN(torch.nn.Module):
-    def __init__(self, num_node_features=23, hidden_channels=64, heads=4, dropout=0.1):
+    def __init__(self, num_node_features=25, hidden_channels=64, heads=4, dropout=0.1):
         super(SpatiotemporalGNN, self).__init__()
         self.dropout = dropout
         
@@ -33,10 +33,12 @@ class SpatiotemporalGNN(torch.nn.Module):
         
         # Phase 4: Shared Heads
         self.energy_head = nn.Sequential(
-            nn.Linear(hidden_channels, 16),
+            nn.Linear(hidden_channels, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(16, 1)
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
         )
         
         self.class_head = nn.Sequential(
@@ -85,6 +87,7 @@ class SpatiotemporalGNN(torch.nn.Module):
         
         # Class output uses mean and max pooling
         x_mean = global_mean_pool(x, batch)
+        x_max = global_max_pool(x, batch)
         x_concat = torch.cat([x_mean, x_max], dim=1)
         class_out = self.class_head(x_concat)
         

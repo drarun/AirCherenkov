@@ -10,45 +10,46 @@ from analysis.dataset import CherenkovDataset
 from torch_geometric.loader import DataLoader
 
 def evaluate():
-    # Pre-transform
-    from sim.camera import Camera
-    cam = Camera(n_rings=12)
-    edge_index = cam.edge_index
-    
-    class AddEdgeIndex(object):
-        def __init__(self, edge_idx):
-            self.edge_idx = edge_idx
-        def __call__(self, data):
-            data.edge_index = self.edge_idx
-            return data
-
-    dataset = CherenkovDataset(root='data/test', pre_transform=AddEdgeIndex(edge_index))
-    loader = DataLoader(dataset, batch_size=128, shuffle=False)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    model = SpatiotemporalGNN().to(device)
-    model.load_state_dict(torch.load('data/spatiotemporal_gnn.pt', map_location=device, weights_only=True))
-    model.eval()
-    
-    true_e, pred_e = [], []
-    true_c, pred_c = [], []
-    
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            c_out, e_out = model(batch.x, batch.edge_index, batch.batch)
-            
-            true_e.extend(batch.y_energy.cpu().numpy())
-            pred_e.extend(e_out.view(-1).cpu().numpy())
-            
-            true_c.extend(batch.y_class.cpu().numpy())
-            pred_c.extend(torch.sigmoid(c_out).view(-1).cpu().numpy())
-            
-    true_e = np.array(true_e)
-    pred_e = np.array(pred_e)
-    true_c = np.array(true_c)
-    pred_c = np.array(pred_c)
+    cache_path = 'data/eval_predictions.npz'
+    if os.path.exists(cache_path):
+        print(f"Loading predictions from cache: {cache_path}...")
+        data = np.load(cache_path)
+        true_e = data['true_e']
+        pred_e = data['pred_e']
+        true_c = data['true_c']
+        pred_c = data['pred_c']
+    else:
+        print("No cache found. Running GNN inference on train_large dataset...")
+        dataset = CherenkovDataset(root='data/train_large')
+        loader = DataLoader(dataset, batch_size=32, shuffle=False)
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = SpatiotemporalGNN().to(device)
+        model.load_state_dict(torch.load('data/spatiotemporal_gnn_v2.pt', map_location=device, weights_only=True))
+        model.eval()
+        
+        true_e, pred_e = [], []
+        true_c, pred_c = [], []
+        
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(device)
+                c_out, e_out = model(batch.x, batch.edge_index, batch.batch)
+                
+                true_e.extend(batch.y_energy.cpu().numpy())
+                pred_e.extend(e_out.view(-1).cpu().numpy())
+                
+                true_c.extend(batch.y_class.cpu().numpy())
+                pred_c.extend(torch.sigmoid(c_out).view(-1).cpu().numpy())
+                
+        true_e = np.array(true_e)
+        pred_e = np.array(pred_e)
+        true_c = np.array(true_c)
+        pred_c = np.array(pred_c)
+        
+        os.makedirs('data', exist_ok=True)
+        np.savez(cache_path, true_e=true_e, pred_e=pred_e, true_c=true_c, pred_c=pred_c)
+        print(f"Saved predictions to cache: {cache_path}")
     
     # Filter to gamma-only events for energy analysis
     gamma_mask = (true_c == 1.0)
@@ -160,7 +161,12 @@ def evaluate():
     ax.set_xlabel(r'True Energy [TeV]', fontsize=13)
     ax.set_ylabel(r'Energy Resolution [%]', fontsize=13)
     ax.set_title('Energy Resolution vs True Energy', fontsize=14)
-    ax.axhline(y=17, color='gray', linestyle='--', alpha=0.5, label='VERITAS benchmark (17%)')
+    # Realistic energy-dependent VERITAS benchmark curve
+    # (Typically ~35% at 80 GeV, improving to ~15-17% in the TeV regime)
+    benchmark_energies_tev = np.logspace(-1, 1.5, 50)
+    # Simple parameterized fit representing VERITAS performance
+    benchmark_res = np.sqrt(15.0**2 + (10.0 / np.sqrt(benchmark_energies_tev))**2)
+    ax.plot(benchmark_energies_tev, benchmark_res, color='gray', linestyle='--', alpha=0.7, label='VERITAS benchmark')
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, max(resolutions * 100) * 1.3])

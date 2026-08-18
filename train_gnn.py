@@ -70,22 +70,7 @@ def train_networks():
 
     print(f"Loading dataset from root: {args.root}...")
     
-    # Generate the edge index for the hexagonal camera grid
-    from sim.camera import Camera
-    cam = Camera(n_rings=12)
-    edge_index = cam.edge_index
-    
-    # Pre-transform to attach edge_index to every Data object
-    import torch_geometric.transforms as T
-    
-    class AddEdgeIndex(object):
-        def __init__(self, edge_idx):
-            self.edge_idx = edge_idx
-        def __call__(self, data):
-            data.edge_index = self.edge_idx
-            return data
-            
-    dataset = CherenkovDataset(root=args.root, pre_transform=AddEdgeIndex(edge_index))
+    dataset = CherenkovDataset(root=args.root)
     print(f"Dataset loaded with {len(dataset)} events.")
     
     if len(dataset) == 0:
@@ -107,20 +92,22 @@ def train_networks():
     model = SpatiotemporalGNN().to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
     
-    criterion_energy = nn.MSELoss()
+    criterion_energy = nn.HuberLoss(delta=0.3, reduction='none')
     criterion_class = nn.BCEWithLogitsLoss()
     
     epochs = args.epochs
     print(f"\nTraining on {device} for {epochs} epochs...")
+    
+    best_val_loss = float('inf')
     
     for epoch in range(epochs):
         model.train()
         
         total_loss = 0
         
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             batch = batch.to(device)
             optimizer.zero_grad()
             
@@ -130,10 +117,21 @@ def train_networks():
             # 2. Classification Loss (all events)
             loss_c = criterion_class(class_logits.view(-1), batch.y_class.view(-1))
             
-            # 3. Energy Loss (only gamma events)
+            # 3. Energy Loss (only gamma events) with spectrum-compensating weights
             gamma_mask = (batch.y_class.view(-1) == 1.0)
             if gamma_mask.any():
-                loss_e = criterion_energy(energy_pred.view(-1)[gamma_mask], batch.y_energy.view(-1)[gamma_mask])
+                y_true = batch.y_energy.view(-1)[gamma_mask]
+                y_pred = energy_pred.view(-1)[gamma_mask]
+                
+                # Weight ~ E^alpha to flatten the E^-2 training spectrum
+                # y_true is log10(E/GeV), so E^alpha = 10^(alpha * log10(E))
+                # Using alpha=2.0 (the generation spectral index)
+                energy_weights = 10.0 ** (2.0 * y_true)
+                energy_weights = energy_weights / energy_weights.mean()  # normalize
+                
+                per_event_loss = criterion_energy(y_pred, y_true)
+                loss_e = (energy_weights * per_event_loss).mean()
+                
                 # Loss weighting: give more weight to energy
                 loss = loss_c + 5.0 * loss_e
             else:
@@ -144,6 +142,9 @@ def train_networks():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
             total_loss += loss.item()
+            
+            if (batch_idx + 1) % 200 == 0:
+                print(f"  Batch {batch_idx + 1}/{len(train_loader)} | Cur Loss: {loss.item():.4f}")
             
         train_loss = total_loss / len(train_loader)
         
@@ -157,7 +158,7 @@ def train_networks():
                 loss_c = criterion_class(class_logits.view(-1), data.y_class.view(-1))
                 gamma_mask = (data.y_class.view(-1) == 1.0)
                 if gamma_mask.any():
-                    loss_e = criterion_energy(energy_pred.view(-1)[gamma_mask], data.y_energy.view(-1)[gamma_mask])
+                    loss_e = criterion_energy(energy_pred.view(-1)[gamma_mask], data.y_energy.view(-1)[gamma_mask]).mean()
                     loss = loss_c + 5.0 * loss_e
                 else:
                     loss = loss_c
@@ -170,9 +171,18 @@ def train_networks():
         # Step scheduler
         scheduler.step(val_loss)
         
-    print(f"\nTraining complete! Saving model to {args.model_path}...")
-    os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
-    torch.save(model.state_dict(), args.model_path)
+        # Checkpointing
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            print(f"*** New best validation loss! Saving to {args.model_path}")
+            os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+            torch.save(model.state_dict(), args.model_path)
+            
+        # Also save latest epoch just in case
+        latest_path = args.model_path.replace(".pt", "_latest.pt")
+        torch.save(model.state_dict(), latest_path)
+        
+    print(f"\nTraining complete!")
 
 if __name__ == '__main__':
     train_networks()
