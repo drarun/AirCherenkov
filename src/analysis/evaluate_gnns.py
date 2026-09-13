@@ -21,11 +21,14 @@ def evaluate():
     else:
         print("No cache found. Running GNN inference on train_large dataset...")
         dataset = CherenkovDataset(root='data/train_large')
-        loader = DataLoader(dataset, batch_size=32, shuffle=False)
+        loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=torch.cuda.is_available())
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        use_amp = torch.cuda.is_available()
         model = SpatiotemporalGNN().to(device)
-        model.load_state_dict(torch.load('data/spatiotemporal_gnn_v2.pt', map_location=device, weights_only=True))
+        import sys
+        model_path = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == '--model' else 'data/spatiotemporal_gnn_v5.pt'
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         model.eval()
         
         true_e, pred_e = [], []
@@ -33,14 +36,15 @@ def evaluate():
         
         with torch.no_grad():
             for batch in loader:
-                batch = batch.to(device)
-                c_out, e_out = model(batch.x, batch.edge_index, batch.batch)
+                batch = batch.to(device, non_blocking=True)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    c_out, e_out = model(batch.x, batch.edge_index, batch.batch)
                 
                 true_e.extend(batch.y_energy.cpu().numpy())
-                pred_e.extend(e_out.view(-1).cpu().numpy())
+                pred_e.extend(e_out.view(-1).float().cpu().numpy())
                 
                 true_c.extend(batch.y_class.cpu().numpy())
-                pred_c.extend(torch.sigmoid(c_out).view(-1).cpu().numpy())
+                pred_c.extend(torch.sigmoid(c_out).view(-1).float().cpu().numpy())
                 
         true_e = np.array(true_e)
         pred_e = np.array(pred_e)

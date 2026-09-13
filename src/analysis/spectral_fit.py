@@ -246,20 +246,20 @@ def plot_spectrum(fit_result, aeff, output_path='data/spectral_fit.png'):
 
     # Best fit
     flux_fit = power_law_flux(e_plot, fit_result['f0'], fit_result['alpha'])
-    ax.plot(e_plot, e_plot ** 2 * flux_fit, 'r-', lw=2.5,
+    ax.plot(e_plot, flux_fit, 'r-', lw=2.5,
             label=(rf"Best fit: $f_0 = {fit_result['f0']:.2e}$, "
                    rf"$\alpha = {fit_result['alpha']:.2f} \pm {fit_result['alpha_err']:.2f}$"))
 
     # VERITAS reference
     flux_veritas = power_law_flux(e_plot, CRAB_F0_VERITAS, CRAB_INDEX_VERITAS)
-    ax.plot(e_plot, e_plot ** 2 * flux_veritas, 'b--', lw=1.5, alpha=0.7,
+    ax.plot(e_plot, flux_veritas, 'b--', lw=1.5, alpha=0.7,
             label=rf"VERITAS Crab ($\alpha = {CRAB_INDEX_VERITAS}$)")
 
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel(r'Energy [TeV]', fontsize=13)
-    ax.set_ylabel(r'$E^2\,dN/dE$ [TeV m$^{-2}$ s$^{-1}$]', fontsize=13)
-    ax.set_title('Spectral Energy Distribution', fontsize=14)
+    ax.set_ylabel(r'$dN/dE$ [m$^{-2}$ s$^{-1}$ TeV$^{-1}$]', fontsize=13)
+    ax.set_title('Differential Energy Spectrum', fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, which='both')
 
@@ -338,12 +338,12 @@ def main():
     print(f"  Spectral Fit Results")
     print(f"{'=' * 60}")
     print(f"  Converged:             {fit['success']}")
-    print(f"  f₀ (1 TeV):            {fit['f0']:.3e} ± {fit['f0_err']:.3e}  m⁻² s⁻¹ TeV⁻¹")
-    print(f"  Spectral index α:      {fit['alpha']:.3f} ± {fit['alpha_err']:.3f}")
+    print(f"  f0 (1 TeV):            {fit['f0']:.3e} +/- {fit['f0_err']:.3e}  m^-2 s^-1 TeV^-1")
+    print(f"  Spectral index alpha:  {fit['alpha']:.3f} +/- {fit['alpha_err']:.3f}")
     print(f"  Neg. log-likelihood:   {fit['nll']:.2f}")
     print(f"{'=' * 60}")
     print(f"  VERITAS Crab reference:")
-    print(f"    f₀ = {CRAB_F0_VERITAS:.3e},  α = {CRAB_INDEX_VERITAS}")
+    print(f"    f0 = {CRAB_F0_VERITAS:.3e},  alpha = {CRAB_INDEX_VERITAS}")
     print(f"{'=' * 60}")
 
     # 5. Plot

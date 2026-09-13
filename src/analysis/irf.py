@@ -202,23 +202,12 @@ def run_gnn_inference(test_data_root, model_path, batch_size=128):
         true_class       – (N,) array  (1 = gamma, 0 = hadron)
         pred_class_score – (N,) array  (sigmoid output, 0–1)
     """
-    from sim.camera import Camera
     from recon.gnn import SpatiotemporalGNN
     from analysis.dataset import CherenkovDataset
     from torch_geometric.loader import DataLoader
 
-    cam = Camera(n_rings=12)
-    edge_index = cam.edge_index
-
-    class AddEdgeIndex:
-        def __init__(self, edge_idx):
-            self.edge_idx = edge_idx
-        def __call__(self, data):
-            data.edge_index = self.edge_idx
-            return data
-
-    dataset = CherenkovDataset(root=test_data_root, pre_transform=AddEdgeIndex(edge_index))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataset = CherenkovDataset(root=test_data_root)
+    loader = DataLoader(dataset, batch_size=32, shuffle=False)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = SpatiotemporalGNN().to(device)
