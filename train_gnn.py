@@ -114,11 +114,9 @@ def train_networks():
     val_data = dataset[split:]
 
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, persistent_workers=True,
-                              pin_memory=torch.cuda.is_available())
+                              num_workers=0, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
-                            num_workers=4, persistent_workers=True,
-                            pin_memory=torch.cuda.is_available())
+                            num_workers=0, pin_memory=torch.cuda.is_available())
 
     # ------------------------------------------------------------------
     # Model, optimizer, scheduler, loss, AMP Scaler
