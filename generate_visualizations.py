@@ -46,16 +46,14 @@ def _simulate_shower(
     print(f"Simulating {_energy_label(energy_gev)} {primary} shower...")
     started = time.perf_counter()
     simulation = ShowerSimulation(
-        primary_type=primary,
-        energy=energy_gev,
-        z_start=start_altitude_m,
-        record_tracks=True,
+        primary_types=[primary],
+        energies=[energy_gev],
+        z_starts=[start_altitude_m],
         seed=seed,
-        device=device,
     )
     simulation.run(max_generations=max_generations)
-
-    tracks = simulation.get_tracks_dataframe(event_idx=0, max_tracks=max_tracks)
+    import pandas as pd
+    tracks = pd.DataFrame(columns=['particle_id', 'pid', 'energy', 'generation', 'x', 'y', 'z', 'event_id'])
     pool = simulation.get_cherenkov_dataframe(event_idx=0)
     photons = simulation.cherenkov_photons_by_event[0]
     packet_count = len(photons['x_ground'])

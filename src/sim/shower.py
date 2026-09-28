@@ -23,7 +23,7 @@ def norm_dir(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor):
 
 class ShowerSimulation:
     def __init__(self, primary_types=['gamma'], energies=[1000.0], z_starts=[20000.0],
-                 site="VERITAS", px_init=0.0, py_init=0.0, pz_init=-1.0):
+                 site="VERITAS", x_init=0.0, y_init=0.0, px_init=0.0, py_init=0.0, pz_init=-1.0, dtype=torch.float32):
         """
         A 3D toy Monte Carlo using fully tensorized PyTorch operations.
         Supports batch processing of multiple independent showers.
@@ -37,13 +37,15 @@ class ShowerSimulation:
                 py_init = sin(θ) * sin(φ)
                 pz_init = -cos(θ)
         """
-        self.critical_energy = 0.085 # 85 MeV
+        self.critical_energy = 0.085
         self.photon_yield_factor = 1.0 
         
         from sim.backend import get_device
         self.device = get_device()
         if self.device is None:
             self.device = torch.device('cpu')
+            
+        self.dtype = dtype
             
         self.PID_MAP = {'gamma': 0, 'e+': 1, 'e-': 2, 'proton': 3, 'pi_charged': 4, 'pi0': 5, 'mu': 6}
         self.INV_PID_MAP = {v: k for k, v in self.PID_MAP.items()}
@@ -66,14 +68,15 @@ class ShowerSimulation:
             z_starts = [float(z_starts[0])] * batch_size
         elif len(z_starts) != batch_size:
             raise ValueError("Length of z_starts must match length of primary_types")
-        self.dtype = torch.float32
             
         # Magnetic field vectors (X: North, Y: East, Z: Down) in Tesla
         if site == "VERITAS":
             self.B_field = torch.tensor([23.9e-6, 4.1e-6, 40.8e-6], device=self.device, dtype=self.dtype)
+        elif site == "MAGIC":
+            self.B_field = torch.tensor([10.5e-6, -3.2e-6, -25.8e-6], device=self.device, dtype=self.dtype)
         elif site == "HESS":
             # H.E.S.S. Namibia (Southern hemisphere, Z is upwards relative to field lines)
-            self.B_field = torch.tensor([10.5e-6, -3.2e-6, -25.8e-6], device=self.device, dtype=self.dtype)
+            self.B_field = torch.tensor([24.2e-6, 1.2e-6, 30.8e-6], device=self.device, dtype=self.dtype)
         elif site == "CTA_NORTH":
             # CTA La Palma
             self.B_field = torch.tensor([24.2e-6, 1.2e-6, 30.8e-6], device=self.device, dtype=self.dtype)
@@ -93,11 +96,15 @@ class ShowerSimulation:
             py_init = [float(py_init)] * batch_size
         if not isinstance(pz_init, (list, tuple, np.ndarray, torch.Tensor)):
             pz_init = [float(pz_init)] * batch_size
+        if not isinstance(x_init, (list, tuple, np.ndarray, torch.Tensor)):
+            x_init = [float(x_init)] * batch_size
+        if not isinstance(y_init, (list, tuple, np.ndarray, torch.Tensor)):
+            y_init = [float(y_init)] * batch_size
 
         # State tensor [PID, E, x, y, z, px, py, pz, generation, event_id]
         init_state = []
         for i in range(batch_size):
-            init_state.append([self.PID_MAP[primary_types[i]], energies[i], 0.0, 0.0, z_starts[i], float(px_init[i]), float(py_init[i]), float(pz_init[i]), 0.0, float(i)])
+            init_state.append([self.PID_MAP[primary_types[i]], energies[i], float(x_init[i]), float(y_init[i]), z_starts[i], float(px_init[i]), float(py_init[i]), float(pz_init[i]), 0.0, float(i)])
             
         self.active = torch.tensor(init_state, dtype=self.dtype, device=self.device)
         self.batch_size = batch_size
@@ -129,6 +136,7 @@ class ShowerSimulation:
         # Filter dead immediately
         alive_mask = (p[:, 1] >= self.critical_energy) & (p[:, 4] > 0)
         p = p[alive_mask]
+        print(f"p.shape after alive_mask: {p.shape}")
         if p.shape[0] == 0:
             self.active = p
             return
@@ -143,19 +151,28 @@ class ShowerSimulation:
         dist = torch.zeros(N, device=self.device, dtype=self.dtype)
         
         # Mean free paths
-        mask_em = (pid == 0) | (pid == 1) | (pid == 2)
+        mask_gamma = (pid == 0)
+        mask_e = (pid == 1) | (pid == 2)
         mask_had = (pid == 3) | (pid == 4)
         mask_pi0 = (pid == 5)
         mask_mu = (pid == 6)
         
-        if mask_em.any():
-            dist[mask_em] = torch.empty(mask_em.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_em], 36.62)
+        # Pair production MFP = (9/7) * X0;  Bremsstrahlung MFP = X0
+        X0_air = 36.62  # radiation length in air (g/cm^2)
+        if mask_gamma.any():
+            dist[mask_gamma] = torch.empty(mask_gamma.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_gamma], X0_air * 9.0 / 7.0)
+        if mask_e.any():
+            dist[mask_e] = torch.empty(mask_e.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_e], X0_air)
         if mask_had.any():
             dist[mask_had] = torch.empty(mask_had.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_had], 90.0)
         if mask_pi0.any():
             dist[mask_pi0] = 10.0
         if mask_mu.any():
             dist[mask_mu] = 5000.0
+
+        px_eff = px.clone()
+        py_eff = py.clone()
+        pz_eff = pz.clone()
 
         # Highland Scattering
         mask_e = (pid == 1) | (pid == 2)
@@ -171,8 +188,9 @@ class ShowerSimulation:
                 x_g = x_gcm2[valid_scatter]
                 Ee = E_e[valid_scatter]
                 
-                log_term = torch.log(x_g / 36.62)
-                theta_rms = (0.0136 / Ee) * torch.sqrt(x_g / 36.62) * (1 + 0.038 * log_term)
+                # theta_0 = (13.6 MeV / p c) * sqrt(x/X0)
+                # E_e is in GeV, so 13.6 MeV = 0.0136 GeV
+                theta_rms = (0.0136 / Ee) * torch.sqrt(x_g / X0_air) * (1 + 0.038 * torch.log(x_g / X0_air))
                 theta_rms = torch.clamp(theta_rms, min=0.0, max=0.3)
                 
                 theta1 = torch.normal(mean=0.0, std=theta_rms)
@@ -207,10 +225,20 @@ class ShowerSimulation:
                 e2_y = torch.where(safe, e2_y / norm_e2, 1.0).to(self.device)
                 e2_z = torch.where(safe, e2_z / norm_e2, 0.0).to(self.device)
                 
+                # Position advances by 1/sqrt(3) of the angular kick
+                inv_sqrt3 = 0.577350269
+                p_eff_x = v_x + theta1 * inv_sqrt3 * e1_x + theta2 * inv_sqrt3 * e2_x
+                p_eff_y = v_y + theta1 * inv_sqrt3 * e1_y + theta2 * inv_sqrt3 * e2_y
+                p_eff_z = v_z + theta1 * inv_sqrt3 * e1_z + theta2 * inv_sqrt3 * e2_z
+                p_eff_x, p_eff_y, p_eff_z = norm_dir(p_eff_x, p_eff_y, p_eff_z)
+                px_eff[idx_scatter] = p_eff_x.to(self.dtype)
+                py_eff[idx_scatter] = p_eff_y.to(self.dtype)
+                pz_eff[idx_scatter] = p_eff_z.to(self.dtype)
+                
+                # Momentum advances by full angular kick
                 p_new_x = v_x + theta1 * e1_x + theta2 * e2_x
                 p_new_y = v_y + theta1 * e1_y + theta2 * e2_y
                 p_new_z = v_z + theta1 * e1_z + theta2 * e2_z
-                
                 p_new_x, p_new_y, p_new_z = norm_dir(p_new_x, p_new_y, p_new_z)
                 px[idx_scatter] = p_new_x.to(self.dtype)
                 py[idx_scatter] = p_new_y.to(self.dtype)
@@ -246,10 +274,19 @@ class ShowerSimulation:
             px[c_idx] = p_nx.to(self.dtype)
             py[c_idx] = p_ny.to(self.dtype)
             pz[c_idx] = p_nz.to(self.dtype)
+            
+            # Lorentz force is constant, so mean deflection is half the total
+            px_eff[c_idx] = (px_eff[c_idx] + dp[:, 0] * 0.5).to(self.dtype)
+            py_eff[c_idx] = (py_eff[c_idx] + dp[:, 1] * 0.5).to(self.dtype)
+            pz_eff[c_idx] = (pz_eff[c_idx] + dp[:, 2] * 0.5).to(self.dtype)
+            px_eff_nx, py_eff_ny, pz_eff_nz = norm_dir(px_eff[c_idx], py_eff[c_idx], pz_eff[c_idx])
+            px_eff[c_idx] = px_eff_nx.to(self.dtype)
+            py_eff[c_idx] = py_eff_ny.to(self.dtype)
+            pz_eff[c_idx] = pz_eff_nz.to(self.dtype)
 
-        x_new = x + px * dist
-        y_new = y + py * dist
-        z_new = z + pz * dist
+        x_new = x + px_eff * dist
+        y_new = y + py_eff * dist
+        z_new = z + pz_eff * dist
         
         # Ray Trace Cherenkov Segments
         valid_z = (z_new > 0) & (z > 0)
@@ -257,7 +294,7 @@ class ShowerSimulation:
         if c_mask.any():
             self.c_segs_start.append(torch.stack([x[c_mask], y[c_mask], z[c_mask]], dim=1))
             self.c_segs_end.append(torch.stack([x_new[c_mask], y_new[c_mask], z_new[c_mask]], dim=1))
-            self.c_segs_p.append(torch.stack([px[c_mask], py[c_mask], pz[c_mask]], dim=1))
+            self.c_segs_p.append(torch.stack([px_eff[c_mask], py_eff[c_mask], pz_eff[c_mask]], dim=1))
             self.c_segs_E.append(E[c_mask])
             self.c_segs_event_id.append(evt[c_mask])
             
@@ -304,13 +341,12 @@ class ShowerSimulation:
             idx_b = idx_alive[mask_b]
             N_b = idx_b.shape[0]
             E_b = E[idx_b]
-            min_u = self.critical_energy / E_b
-            rand_val = self._get_rand(N_b)
-            u = torch.pow(min_u, rand_val)
-            u = torch.max(min_u, u)
             
-            g_E = u * E_b
+            # Bremsstrahlung: e -> e + gamma
+            # u is fraction of energy given to photon
+            u = self._get_rand(N_b) * 0.9 + 0.05
             e_E = (1 - u) * E_b
+            g_E = u * E_b
             
             phi = self._get_rand(N_b) * 2 * np.pi
             pt = 0.0005

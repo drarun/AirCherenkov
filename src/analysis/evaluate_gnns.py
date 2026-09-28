@@ -5,13 +5,26 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from sklearn.metrics import roc_auc_score, roc_curve
 
+import sys
+sys.path.insert(0, 'src')
+
 from recon.gnn import SpatiotemporalGNN
 from analysis.dataset import CherenkovDataset
 from torch_geometric.loader import DataLoader
 
 def evaluate():
-    cache_path = 'data/eval_predictions.npz'
-    if os.path.exists(cache_path):
+    import sys
+    model_path = 'data/spatiotemporal_gnn_v6.pt'
+    force_recompute = '--force' in sys.argv
+    if '--model' in sys.argv:
+        m_idx = sys.argv.index('--model')
+        if m_idx + 1 < len(sys.argv):
+            model_path = sys.argv[m_idx + 1]
+
+    model_tag = os.path.splitext(os.path.basename(model_path))[0]
+    cache_path = f'data/eval_predictions_{model_tag}.npz'
+
+    if os.path.exists(cache_path) and not force_recompute:
         print(f"Loading predictions from cache: {cache_path}...")
         data = np.load(cache_path)
         true_e = data['true_e']
@@ -19,15 +32,13 @@ def evaluate():
         true_c = data['true_c']
         pred_c = data['pred_c']
     else:
-        print("No cache found. Running GNN inference on train_large dataset...")
+        print(f"Running GNN inference on train_large dataset with model: {model_path}...")
         dataset = CherenkovDataset(root='data/train_large')
         loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=torch.cuda.is_available())
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         use_amp = torch.cuda.is_available()
         model = SpatiotemporalGNN().to(device)
-        import sys
-        model_path = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == '--model' else 'data/spatiotemporal_gnn_v5.pt'
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         model.eval()
         
@@ -123,10 +134,10 @@ def evaluate():
         
         errors_in_bin = frac_error[mask]
         
-        # Resolution: 68% containment half-width (robust to outliers)
-        sorted_abs = np.sort(np.abs(errors_in_bin))
-        idx_68 = int(0.68 * len(sorted_abs))
-        resolution_68 = sorted_abs[idx_68] if idx_68 < len(sorted_abs) else sorted_abs[-1]
+        # Resolution: 68% containment half-width (robust to outliers and bias)
+        q84 = np.percentile(errors_in_bin, 84)
+        q16 = np.percentile(errors_in_bin, 16)
+        resolution_68 = 0.5 * (q84 - q16)
         
         # Bias: median fractional error
         bias = np.median(errors_in_bin)
@@ -196,7 +207,9 @@ def evaluate():
     # Print Summary Statistics
     # ========================================================================
     overall_rmse = np.sqrt(np.mean((te - pe)**2))
-    overall_res = np.median(np.abs(frac_error)) * 100
+    q84_overall = np.percentile(frac_error, 84)
+    q16_overall = np.percentile(frac_error, 16)
+    overall_res = 0.5 * (q84_overall - q16_overall) * 100
     overall_bias = np.median(frac_error) * 100
     
     print(f"\n{'='*50}")

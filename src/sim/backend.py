@@ -7,6 +7,7 @@ this module so the rest of the codebase stays backend-agnostic.
 """
 
 import os
+import math
 import numpy as np
 
 try:
@@ -385,11 +386,14 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
             # Stratified quadrature of the Frank--Tamm yield along the segment.
             # This preserves the local altitude/beta dependence instead of
             # forcing every long segment to use its midpoint refractivity.
+            # Atmospheric absorption (approx 22km extinction length)
+            transmission = torch.exp(-distance_to_ground / 22000.0)
             packet_weight = (
                 segment_length[segment_start:segment_end][local_segment]
                 * 37000.0
                 * float(photon_yield_factor)
                 * local_sin2
+                * transmission
                 / count_per_packet.to(dtype)
             )
             packet_values = torch.stack(
@@ -500,11 +504,14 @@ def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
         (ze > 0) & (photon_direction[:, 2] < 0) & np.isfinite(distance)
         & (distance >= 0) & (local_sin2 > 0)
     )
+    # Atmospheric absorption (approx 22km extinction length)
+    transmission = np.exp(-distance / 22000.0)
     weight = (
         ds[segment_index]
         * 37000.0
         * photon_yield_factor
         * local_sin2
+        * transmission
         / packet_count
     )
     packed = np.column_stack((
@@ -554,6 +561,7 @@ def _camera_axial_coordinates(pixel_x, pixel_y, pixel_size):
 def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                   x_tel, y_tel, z_tel, mirror_radius,
                   mirror_reflectivity, quantum_efficiency, *,
+                  pointing_zenith=0.0, pointing_azimuth=0.0,
                   n_time_bins=16, bin_width_ns=2.0, nsb_rate=2.0,
                   pedestal_std=0.5, saturation_limit=250.0,
                   low_gain_factor=10.0, shower_start_altitude=20000.0,
@@ -576,6 +584,8 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         saturation_limit=saturation_limit,
         low_gain_factor=low_gain_factor,
         shower_start_altitude=shower_start_altitude,
+        pointing_zenith=pointing_zenith,
+        pointing_azimuth=pointing_azimuth,
         device=device,
         generator=generator,
     )
@@ -585,6 +595,7 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
 def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                     telescope_x, telescope_y, telescope_z, mirror_radius,
                     mirror_reflectivity, quantum_efficiency, *,
+                    pointing_zenith=0.0, pointing_azimuth=0.0,
                     n_time_bins=16, bin_width_ns=2.0, nsb_rate=2.0,
                     pedestal_std=0.5, saturation_limit=250.0,
                     low_gain_factor=10.0, shower_start_altitude=20000.0,
@@ -639,6 +650,7 @@ def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
             int(n_time_bins), float(bin_width_ns), float(nsb_rate),
             float(pedestal_std), float(saturation_limit),
             float(low_gain_factor), float(shower_start_altitude),
+            pointing_zenith, pointing_azimuth,
             resolved_device, generator,
         )
     return (
@@ -734,6 +746,7 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
                           pixel_size, telescope, n_time_bins, bin_width_ns,
                           nsb_rate, pedestal_std, saturation_limit,
                           low_gain_factor, shower_start_altitude,
+                          pointing_zenith, pointing_azimuth,
                           device, generator):
     """Shared CPU/CUDA geometry, timing, noise, and gain implementation."""
     n_telescopes = telescope['telescope_x'].numel()
@@ -827,8 +840,26 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             dy = hit_y - emit_y
             dz = hit_z - emit_z
 
-            u_deg = torch.rad2deg(torch.atan2(-dx, -dz))
-            v_deg = torch.rad2deg(torch.atan2(-dy, -dz))
+            theta = torch.tensor(math.radians(pointing_zenith), device=device, dtype=dx.dtype)
+            phi = torch.tensor(math.radians(pointing_azimuth), device=device, dtype=dx.dtype)
+
+            vx = -dx
+            vy = -dy
+            vz = -dz
+
+            # Rotate around Z by -phi
+            x_prime = vx * torch.cos(phi) + vy * torch.sin(phi)
+            y_prime = -vx * torch.sin(phi) + vy * torch.cos(phi)
+            z_prime = vz
+
+            # Rotate around Y by -theta
+            x_double_prime = x_prime * torch.cos(theta) - z_prime * torch.sin(theta)
+            y_double_prime = y_prime
+            z_double_prime = x_prime * torch.sin(theta) + z_prime * torch.cos(theta)
+
+            u_deg = torch.rad2deg(torch.atan2(x_double_prime, z_double_prime))
+            v_deg = torch.rad2deg(torch.atan2(y_double_prime, z_double_prime))
+            
             r_float = v_deg / height
             q_float = (u_deg / pixel_size) - 0.5 * r_float
             cube_x = q_float
@@ -922,7 +953,17 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             weights=charge[in_window],
             minlength=n_telescopes * n_pixels * n_time_bins,
         ).reshape(n_telescopes, n_pixels, n_time_bins)
-        traces += signal
+        import torch.nn.functional as F
+        sigma_bins = 1.5 / bin_width_ns
+        kernel_size = 5
+        x = torch.arange(-kernel_size//2 + 1, kernel_size//2 + 1, device=device, dtype=torch.float32)
+        kernel = torch.exp(-0.5 * (x / sigma_bins)**2)
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, kernel_size)
+        
+        signal_flat = signal.view(n_telescopes * n_pixels, 1, n_time_bins)
+        signal_smooth = F.conv1d(signal_flat, kernel, padding=kernel_size//2)
+        traces += signal_smooth.view(n_telescopes, n_pixels, n_time_bins)
 
     if nsb_rate > 0:
         traces += torch.poisson(

@@ -284,6 +284,8 @@ class TelescopeArray:
         device=None,
         generator=None,
         shower_start_altitude=None,
+        pointing_zenith=0.0,
+        pointing_azimuth=0.0,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """Ray trace the array, batching telescopes with compatible cameras.
 
@@ -349,6 +351,8 @@ class TelescopeArray:
                 np.asarray([tel.quantum_efficiency for tel in telescopes], dtype=np.float64),
                 **config.backend_kwargs(),
                 shower_start_altitude=start_altitude,
+                pointing_zenith=pointing_zenith,
+                pointing_azimuth=pointing_azimuth,
                 device=tel_device,
                 generator=tel_generator,
             )

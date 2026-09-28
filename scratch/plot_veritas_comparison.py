@@ -2,84 +2,107 @@ import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter, LogLocator
 
 def generate_plots():
-    # 1. Load predictions
-    eval_cache = 'data/eval_predictions.npz'
-    if not os.path.exists(eval_cache):
-        print(f"Error: {eval_cache} not found.")
-        return
+    v5_cache = 'data/eval_predictions.npz'
+    v6_cache = 'data/eval_predictions_spatiotemporal_gnn_v6.npz'
+    v7_cache = 'data/eval_predictions_spatiotemporal_gnn_v7.npz'
 
-    data = np.load(eval_cache)
-    true_e = data['true_e']
-    pred_e = data['pred_e']
-    true_c = data['true_c']
-    pred_c = data['pred_c']
+    data7 = np.load(v7_cache)
+    v8_cache = 'data/eval_predictions_spatiotemporal_gnn_v8.npz'
+    v7_cache = 'data/eval_predictions_spatiotemporal_gnn_v7.npz'
+    v5_cache = 'data/eval_predictions.npz'
 
-    gamma_mask = (true_c == 1.0)
-    te = true_e[gamma_mask] # log10(E_true / GeV)
-    pe = pred_e[gamma_mask] # log10(E_reco / GeV)
+    data8 = np.load(v8_cache)
+    data7 = np.load(v7_cache)
+    data5 = np.load(v5_cache)
 
-    E_true = 10**te # GeV
-    E_reco = 10**pe # GeV
-    frac_error = (E_reco - E_true) / E_true
+    gamma_mask8 = data8['true_c'] == 1.0
+    te8 = data8['true_e'][gamma_mask8]
+    pe8 = data8['pred_e'][gamma_mask8]
+    fe8 = (10**pe8 - 10**te8) / (10**te8)
 
-    # 2. Binning
-    log_e_bins = np.linspace(np.min(te) - 0.02, np.max(te) + 0.02, 13)
+    gamma_mask7 = data7['true_c'] == 1.0
+    te7 = data7['true_e'][gamma_mask7]
+    pe7 = data7['pred_e'][gamma_mask7]
+    fe7 = (10**pe7 - 10**te7) / (10**te7)
+
+    gamma_mask5 = data5['true_c'] == 1.0
+    te5 = data5['true_e'][gamma_mask5]
+    pe5 = data5['pred_e'][gamma_mask5]
+    fe5 = (10**pe5 - 10**te5) / (10**te5)
+
+    log_e_bins = np.linspace(np.min(te8) - 0.02, np.max(te8) + 0.02, 13)
     bin_centers = 0.5 * (log_e_bins[:-1] + log_e_bins[1:])
 
-    resolutions = []
-    biases = []
-    res_errs = []
-    bias_errs = []
+    res8, bias8, res_err8, bias_err8 = [], [], [], []
+    res7, bias7, res_err7, bias_err7 = [], [], [], []
+    res5, bias5, res_err5, bias_err5 = [], [], [], []
     valid_centers = []
-    event_counts = []
 
     for i in range(len(log_e_bins) - 1):
-        mask = (te >= log_e_bins[i]) & (te < log_e_bins[i+1])
-        if mask.sum() < 15:
+        mask8 = (te8 >= log_e_bins[i]) & (te8 < log_e_bins[i+1])
+        mask7 = (te7 >= log_e_bins[i]) & (te7 < log_e_bins[i+1])
+        mask5 = (te5 >= log_e_bins[i]) & (te5 < log_e_bins[i+1])
+        
+        if mask8.sum() < 15 or mask7.sum() < 15 or mask5.sum() < 15:
             continue
-        errors_in_bin = frac_error[mask]
-        sorted_abs = np.sort(np.abs(errors_in_bin))
-        idx_68 = int(0.68 * len(sorted_abs))
-        res_68 = sorted_abs[idx_68] if idx_68 < len(sorted_abs) else sorted_abs[-1]
-        bias = np.median(errors_in_bin)
+        
+        err8 = fe8[mask8]
+        b8 = np.median(err8)
+        r8 = 0.5 * (np.percentile(err8, 84) - np.percentile(err8, 16))
+        
+        err7 = fe7[mask7]
+        b7 = np.median(err7)
+        r7 = 0.5 * (np.percentile(err7, 84) - np.percentile(err7, 16))
+        
+        err5 = fe5[mask5]
+        b5 = np.median(err5)
+        r5 = 0.5 * (np.percentile(err5, 84) - np.percentile(err5, 16))
 
-        # Bootstrap error bars
+        # Bootstrap
         n_boot = 300
-        res_boot = []
-        bias_boot = []
+        rb8, bb8, rb7, bb7, rb5, bb5 = [], [], [], [], [], []
         for _ in range(n_boot):
-            sample = np.random.choice(errors_in_bin, size=len(errors_in_bin), replace=True)
-            s_abs = np.sort(np.abs(sample))
-            idx_s = int(0.68 * len(s_abs))
-            res_boot.append(s_abs[idx_s] if idx_s < len(s_abs) else s_abs[-1])
-            bias_boot.append(np.median(sample))
+            s8 = np.random.choice(err8, size=len(err8), replace=True)
+            rb8.append(0.5 * (np.percentile(s8, 84) - np.percentile(s8, 16)))
+            bb8.append(np.median(s8))
+            s7 = np.random.choice(err7, size=len(err7), replace=True)
+            rb7.append(0.5 * (np.percentile(s7, 84) - np.percentile(s7, 16)))
+            bb7.append(np.median(s7))
+            s5 = np.random.choice(err5, size=len(err5), replace=True)
+            rb5.append(0.5 * (np.percentile(s5, 84) - np.percentile(s5, 16)))
+            bb5.append(np.median(s5))
 
-        resolutions.append(res_68 * 100.0)
-        biases.append(bias * 100.0)
-        res_errs.append(np.std(res_boot) * 100.0)
-        bias_errs.append(np.std(bias_boot) * 100.0)
-        valid_centers.append(10**bin_centers[i] / 1000.0) # TeV
-        event_counts.append(mask.sum())
+        res8.append(r8 * 100.0)
+        bias8.append(b8 * 100.0)
+        res_err8.append(np.std(rb8) * 100.0)
+        bias_err8.append(np.std(bb8) * 100.0)
+
+        res7.append(r7 * 100.0)
+        bias7.append(b7 * 100.0)
+        res_err7.append(np.std(rb7) * 100.0)
+        bias_err7.append(np.std(bb7) * 100.0)
+
+        res5.append(r5 * 100.0)
+        bias5.append(b5 * 100.0)
+        res_err5.append(np.std(rb5) * 100.0)
+        bias_err5.append(np.std(bb5) * 100.0)
+
+        valid_centers.append(10**bin_centers[i] / 1000.0)
 
     valid_centers = np.array(valid_centers)
-    resolutions = np.array(resolutions)
-    biases = np.array(biases)
-    res_errs = np.array(res_errs)
-    bias_errs = np.array(bias_errs)
+    res8, bias8 = np.array(res8), np.array(bias8)
+    res_err8, bias_err8 = np.array(res_err8), np.array(bias_err8)
+    res7, bias7 = np.array(res7), np.array(bias7)
+    res_err7, bias_err7 = np.array(res_err7), np.array(bias_err7)
+    res5, bias5 = np.array(res5), np.array(bias5)
+    res_err5, bias_err5 = np.array(res_err5), np.array(bias_err5)
 
-    # Benchmark curves
     benchmark_energies_tev = np.logspace(np.log10(0.08), np.log10(30.0), 100)
-    
-    # VERITAS Resolution Benchmark: ~35% at 100 GeV, ~23% at 200 GeV, ~17% at 1 TeV, ~15% at 5+ TeV
     veritas_res_benchmark = np.sqrt(15.0**2 + (11.0 / np.sqrt(benchmark_energies_tev))**2)
-    
-    # VERITAS Bias Benchmark: +15-20% at 80-100 GeV threshold, 0% (+/-5%) between 200 GeV and 10 TeV, slight dip at >10 TeV
     veritas_bias_benchmark = 20.0 / (1.0 + (benchmark_energies_tev / 0.12)**2.2) - 5.0 * (benchmark_energies_tev / 15.0)
 
-    # Styling setup
     plt.rcParams.update({
         'font.size': 11,
         'font.family': 'sans-serif',
@@ -92,50 +115,53 @@ def generate_plots():
     })
 
     # =========================================================================
-    # COMBINED 2-PANEL FIGURE
+    # COMBINED 2-PANEL FIGURE: v8 vs v7 vs v5 vs VERITAS
     # =========================================================================
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), dpi=300)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
 
     # --- PANEL 1: Energy Resolution ---
-    ax1.plot(benchmark_energies_tev, veritas_res_benchmark, color='#555555', linestyle='--', lw=2.2,
+    ax1.plot(benchmark_energies_tev, veritas_res_benchmark, color='#333333', linestyle='--', lw=2.2,
              label='VERITAS Benchmark ($15\\% \\oplus 11\\%/\\sqrt{E}$)', zorder=2)
-    
-    # Target scientific regime shaded zone (<20% high energy)
     ax1.axhspan(0, 20, color='green', alpha=0.08, label='Target High-Energy Regime (<20%)')
-    
-    # GNN data points
-    ax1.errorbar(valid_centers, resolutions, yerr=res_errs, fmt='o-', color='#1f77b4',
-                 ecolor='#1f77b4', elinewidth=1.8, capsize=4, capthick=1.5,
-                 markersize=7, lw=2.2, label='SpatiotemporalGNN v5 (Epoch 25)', zorder=4)
+
+    ax1.errorbar(valid_centers, res5, yerr=res_err5, fmt='s:', color='#9467bd',
+                 ecolor='#9467bd', elinewidth=1.5, capsize=3, markersize=6, lw=1.5,
+                 label='v5 Baseline (Flawed Physics)', zorder=3, alpha=0.5)
+
+    ax1.errorbar(valid_centers, res7, yerr=res_err7, fmt='^--', color='#d95f02',
+                 ecolor='#d95f02', elinewidth=1.5, capsize=3, markersize=6, lw=1.5,
+                 label='v7 Fine-Tuned (Flawed Physics)', zorder=4, alpha=0.6)
+
+    ax1.errorbar(valid_centers, res8, yerr=res_err8, fmt='o-', color='#1f77b4',
+                 ecolor='#1f77b4', elinewidth=2.0, capsize=4, markersize=7, lw=2.4,
+                 label='v8 (Corrected Physics + Sqrt-Sampler)', zorder=5)
 
     ax1.set_xscale('log')
     ax1.set_xlabel('True Energy [TeV]', fontweight='bold')
-    ax1.set_ylabel('Energy Resolution (68% Containment) [%]', fontweight='bold')
+    ax1.set_ylabel('Energy Resolution (0.5 * IQR) [%]', fontweight='bold')
     ax1.set_title('Energy Resolution vs. True Energy', fontweight='bold', pad=10)
     ax1.grid(True, which='both', linestyle=':', alpha=0.5)
     ax1.set_xlim([0.07, 32.0])
-    ax1.set_ylim([0, 105])
-    ax1.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.9)
-
-    # Text box for core metrics
-    median_res_core = np.median(resolutions[(valid_centers >= 0.15) & (valid_centers <= 2.0)])
-    ax1.text(0.97, 0.05, f'Core Spectrum (0.15–2 TeV):\nMedian Resolution = {median_res_core:.1f}%',
-             transform=ax1.transAxes, ha='right', va='bottom',
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='#eef4f8', edgecolor='#1f77b4', alpha=0.9))
+    ax1.set_ylim([0, 95])
+    ax1.legend(loc='upper right', frameon=True, facecolor='white', framealpha=0.9)
 
     # --- PANEL 2: Energy Bias ---
-    # Benchmark tolerance band: +/- 10%
     ax2.axhspan(-10, 10, color='#2ca02c', alpha=0.15, label='VERITAS Tolerance Window ($\\pm 10\\%$)')
     ax2.axhline(0, color='black', linestyle='-', lw=1.2, alpha=0.6, label='Zero Bias Baseline')
-    
-    # Benchmark typical lookup table curve
-    ax2.plot(benchmark_energies_tev, veritas_bias_benchmark, color='#555555', linestyle='--', lw=2.0,
-             label='VERITAS Typical Lookup Table Bias', zorder=2)
+    ax2.plot(benchmark_energies_tev, veritas_bias_benchmark, color='#333333', linestyle='--', lw=2.0,
+             label='VERITAS Typical Lookup Bias', zorder=2)
 
-    # GNN data points
-    ax2.errorbar(valid_centers, biases, yerr=bias_errs, fmt='s-', color='#d95f02',
-                 ecolor='#d95f02', elinewidth=1.8, capsize=4, capthick=1.5,
-                 markersize=7, lw=2.2, label='SpatiotemporalGNN v5 (Epoch 25)', zorder=4)
+    ax2.errorbar(valid_centers, bias5, yerr=bias_err5, fmt='s:', color='#9467bd',
+                 ecolor='#9467bd', elinewidth=1.5, capsize=3, markersize=6, lw=1.5,
+                 label='v5 Baseline (Flawed Physics)', zorder=3, alpha=0.5)
+
+    ax2.errorbar(valid_centers, bias7, yerr=bias_err7, fmt='^--', color='#d95f02',
+                 ecolor='#d95f02', elinewidth=1.5, capsize=3, markersize=6, lw=1.5,
+                 label='v7 Fine-Tuned (Flawed Physics)', zorder=4, alpha=0.6)
+
+    ax2.errorbar(valid_centers, bias8, yerr=bias_err8, fmt='o-', color='#1f77b4',
+                 ecolor='#1f77b4', elinewidth=2.0, capsize=4, markersize=7, lw=2.4,
+                 label='v8 (Corrected Physics + Sqrt-Sampler)', zorder=5)
 
     ax2.set_xscale('log')
     ax2.set_xlabel('True Energy [TeV]', fontweight='bold')
@@ -143,20 +169,14 @@ def generate_plots():
     ax2.set_title('Energy Bias vs. True Energy', fontweight='bold', pad=10)
     ax2.grid(True, which='both', linestyle=':', alpha=0.5)
     ax2.set_xlim([0.07, 32.0])
-    ax2.set_ylim([-100, 70])
-    ax2.legend(loc='lower left', frameon=True, facecolor='white', framealpha=0.9)
+    ax2.set_ylim([-95, 120])
+    ax2.legend(loc='upper right', frameon=True, facecolor='white', framealpha=0.9)
 
-    # Highlight sweet spot
-    ax2.axvspan(0.18, 0.45, color='#ffd92f', alpha=0.18, label='Optimal Calibrated Band (180–450 GeV)')
-    ax2.text(0.97, 0.95, f'Optimal Calibrated Regime:\n180–450 GeV ($|\\mathrm{{Bias}}| < 10\\%$)\nMinimum Bias at 268 GeV: +2.0%',
-             transform=ax2.transAxes, ha='right', va='top',
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='#fffbe6', edgecolor='#d95f02', alpha=0.9))
-
-    fig.suptitle('AirCherenkov SpatiotemporalGNN v5: Energy Reconstruction vs. VERITAS Benchmarks',
+    fig.suptitle('AirCherenkov SpatiotemporalGNN: Impact of Physics Fixes',
                  fontweight='bold', fontsize=15, y=0.98)
     plt.tight_layout()
 
-    # Save to multiple destinations
+    # Save to data/
     combined_png = 'data/energy_performance.png'
     fig.savefig(combined_png, dpi=300, bbox_inches='tight')
     print(f"Saved: {combined_png}")
@@ -165,67 +185,18 @@ def generate_plots():
     desktop = os.path.expanduser('~/OneDrive/Desktop')
     if not os.path.exists(desktop):
         desktop = os.path.expanduser('~/Desktop')
-    desktop_pdf = os.path.join(desktop, 'VERITAS_GNN_Energy_Performance.pdf')
+    desktop_pdf = os.path.join(desktop, 'VERITAS_GNN_Energy_Performance_v8.pdf')
     fig.savefig(desktop_pdf, dpi=300, bbox_inches='tight')
     print(f"Saved: {desktop_pdf}")
 
-    # Also save to conversation artifacts directory
+    # Artifact dir
     artifact_dir = r'C:\Users\aruns\.gemini\antigravity-cli\brain\f0e1b905-b5d2-4fce-80a1-d0620d2d7de7'
     if os.path.exists(artifact_dir):
-        artifact_png = os.path.join(artifact_dir, 'veritas_energy_performance.png')
+        artifact_png = os.path.join(artifact_dir, 'veritas_energy_performance_v8.png')
         fig.savefig(artifact_png, dpi=300, bbox_inches='tight')
         print(f"Saved: {artifact_png}")
 
     plt.close(fig)
-
-    # =========================================================================
-    # STANDALONE RESOLUTION PLOT
-    # =========================================================================
-    fig_res, ax_res = plt.subplots(figsize=(8, 6), dpi=300)
-    ax_res.plot(benchmark_energies_tev, veritas_res_benchmark, color='#555555', linestyle='--', lw=2.5,
-                label='VERITAS Standard Benchmark ($15\\% \\oplus 11\\%/\\sqrt{E}$)', zorder=2)
-    ax_res.axhspan(0, 20, color='green', alpha=0.08, label='Target High-Energy Regime (<20%)')
-    ax_res.errorbar(valid_centers, resolutions, yerr=res_errs, fmt='o-', color='#1f77b4',
-                    ecolor='#1f77b4', elinewidth=1.8, capsize=4, capthick=1.5,
-                    markersize=7, lw=2.2, label='SpatiotemporalGNN v5 (Epoch 25)', zorder=4)
-    ax_res.set_xscale('log')
-    ax_res.set_xlabel('True Energy [TeV]', fontweight='bold')
-    ax_res.set_ylabel('Energy Resolution (68% Containment) [%]', fontweight='bold')
-    ax_res.set_title('VERITAS Energy Resolution Benchmark Comparison', fontweight='bold', pad=12)
-    ax_res.grid(True, which='both', linestyle=':', alpha=0.5)
-    ax_res.set_xlim([0.07, 32.0])
-    ax_res.set_ylim([0, 105])
-    ax_res.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.9)
-    plt.tight_layout()
-    res_png = 'data/energy_resolution_vs_veritas.png'
-    fig_res.savefig(res_png, dpi=300, bbox_inches='tight')
-    print(f"Saved: {res_png}")
-    plt.close(fig_res)
-
-    # =========================================================================
-    # STANDALONE BIAS PLOT
-    # =========================================================================
-    fig_bias, ax_bias = plt.subplots(figsize=(8, 6), dpi=300)
-    ax_bias.axhspan(-10, 10, color='#2ca02c', alpha=0.15, label='VERITAS Benchmark Tolerance Window ($\\pm 10\\%$)')
-    ax_bias.axhline(0, color='black', linestyle='-', lw=1.2, alpha=0.6, label='Zero Bias Baseline')
-    ax_bias.plot(benchmark_energies_tev, veritas_bias_benchmark, color='#555555', linestyle='--', lw=2.2,
-                 label='VERITAS Typical Lookup Table Bias', zorder=2)
-    ax_bias.errorbar(valid_centers, biases, yerr=bias_errs, fmt='s-', color='#d95f02',
-                     ecolor='#d95f02', elinewidth=1.8, capsize=4, capthick=1.5,
-                     markersize=7, lw=2.2, label='SpatiotemporalGNN v5 (Epoch 25)', zorder=4)
-    ax_bias.set_xscale('log')
-    ax_bias.set_xlabel('True Energy [TeV]', fontweight='bold')
-    ax_bias.set_ylabel('Relative Energy Bias [(E_reco - E_true) / E_true] [%]', fontweight='bold')
-    ax_bias.set_title('VERITAS Energy Bias Benchmark Comparison', fontweight='bold', pad=12)
-    ax_bias.grid(True, which='both', linestyle=':', alpha=0.5)
-    ax_bias.set_xlim([0.07, 32.0])
-    ax_bias.set_ylim([-100, 70])
-    ax_bias.legend(loc='lower left', frameon=True, facecolor='white', framealpha=0.9)
-    plt.tight_layout()
-    bias_png = 'data/energy_bias_vs_veritas.png'
-    fig_bias.savefig(bias_png, dpi=300, bbox_inches='tight')
-    print(f"Saved: {bias_png}")
-    plt.close(fig_bias)
 
 if __name__ == '__main__':
     generate_plots()

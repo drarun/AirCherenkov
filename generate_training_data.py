@@ -13,8 +13,14 @@ from sim.telescope import TelescopeArray
 
 import argparse
 
-def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, save_every=1000, 
+# Enable TF32 for up to 3x faster tensor math on RTX 3000/4000/5000 series
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, save_every=1000, 
                            output_dir='data/train_raw', zenith_deg=0.0, azimuth_deg=0.0, diffuse_fov=0.0,
+                           wobble_offset=0.0,
                            e_min=100.0, e_max=10000.0, spectral_index=2.0, impact_radius=250.0,
                            debug=False):
     """
@@ -116,7 +122,10 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                 # Generalized power-law sampling: E^(-alpha) from e_min to e_max
                 u = np.random.rand()
                 alpha = spectral_index
-                E = (u * e_max**(1-alpha) + (1-u) * e_min**(1-alpha)) ** (1.0/(1-alpha))
+                if abs(alpha - 1.0) < 1e-5:
+                    E = e_min * ((e_max / e_min) ** u)
+                else:
+                    E = (u * e_max**(1-alpha) + (1-u) * e_min**(1-alpha)) ** (1.0/(1-alpha))
                 energies.append(E)
                 z_starts.append(z_start)
                 
@@ -132,6 +141,11 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                     # Perturb zenith and azimuth (approximate for small FOVs)
                     evt_zen = zen_rad + theta_offset * np.cos(phi_offset)
                     evt_azi = azi_rad + theta_offset * np.sin(phi_offset)
+                elif wobble_offset > 0:
+                    theta_offset = np.radians(wobble_offset)
+                    phi_offset = np.random.rand() * 2 * np.pi
+                    evt_zen = zen_rad + theta_offset * np.cos(phi_offset)
+                    evt_azi = azi_rad + theta_offset * np.sin(phi_offset)
                 else:
                     evt_zen = zen_rad
                     evt_azi = azi_rad
@@ -141,11 +155,19 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                 pz_batch.append(-np.cos(evt_zen))
                 
             # Run fully batched simulation with direction injection
-            sim = ShowerSimulation(
-                primary_types=pids, energies=energies, z_starts=z_starts,
-                px_init=px_batch, py_init=py_batch, pz_init=pz_batch
-            )
-            sim.run(max_generations=16, verbose=False)
+            x_init_batch = []
+            y_init_batch = []
+            for pz_val, px_val, py_val, z_val in zip(pz_batch, px_batch, py_batch, z_starts):
+                x_init_batch.append(z_val * (px_val / pz_val))
+                y_init_batch.append(z_val * (py_val / pz_val))
+                
+            with torch.inference_mode():
+                sim = ShowerSimulation(
+                    primary_types=pids, energies=energies, z_starts=z_starts,
+                    x_init=x_init_batch, y_init=y_init_batch,
+                    px_init=px_batch, py_init=py_batch, pz_init=pz_batch
+                )
+                sim.run(max_generations=30, verbose=False)
             
             for i in range(current_batch_size):
                 photons = sim.cherenkov_photons_by_event.get(i, {})
@@ -162,7 +184,13 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=100, 
                     tel.x_tel -= ix
                     tel.y_tel -= iy
                     
-                img_outputs = array.ray_trace(photons)
+                with torch.inference_mode():
+                    img_outputs = array.ray_trace(
+                        photons,
+                        pointing_zenith=zenith_deg,
+                        pointing_azimuth=azimuth_deg + 180.0,
+                        shower_start_altitude=z_starts[i]
+                    )
                 
                 for tel in array.telescopes:
                     tel.x_tel += ix
@@ -236,6 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--zenith_deg', type=float, default=0.0, help='Zenith angle in degrees')
     parser.add_argument('--azimuth_deg', type=float, default=0.0, help='Azimuth angle in degrees (0=N, 90=E, 180=S)')
     parser.add_argument('--diffuse_fov', type=float, default=0.0, help='If > 0, scatters directions isotropically within this FOV radius (degrees)')
+    parser.add_argument('--wobble_offset', type=float, default=0.0, help='Wobble offset in degrees')
     parser.add_argument('--e_min', type=float, default=80.0, help='Min energy in GeV')
     parser.add_argument('--e_max', type=float, default=30000.0, help='Max energy in GeV')
     parser.add_argument('--spectral_index', type=float, default=2.0, help='Spectral index for E^-alpha sampling')
@@ -252,6 +281,7 @@ if __name__ == '__main__':
         zenith_deg=args.zenith_deg,
         azimuth_deg=args.azimuth_deg,
         diffuse_fov=args.diffuse_fov,
+        wobble_offset=args.wobble_offset,
         e_min=args.e_min,
         e_max=args.e_max,
         spectral_index=args.spectral_index,

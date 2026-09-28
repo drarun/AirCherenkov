@@ -80,16 +80,20 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
 def train_networks():
     parser = argparse.ArgumentParser(
         description="Train Spatiotemporal GNN for AirCherenkov (fault-tolerant)")
-    parser.add_argument("--root", type=str, default="data/train",
+    parser.add_argument("--root", type=str, default="data/train_large",
                         help="Dataset root directory containing 'raw' folder")
-    parser.add_argument("--model_path", type=str, default="data/spatiotemporal_gnn.pt",
+    parser.add_argument("--extra_root", type=str, default="data/train_large_highE",
+                        help="Optional supplementary dataset root directory to combine")
+    parser.add_argument("--model_path", type=str, default="data/spatiotemporal_gnn_v8.pt",
                         help="Path to save the best model weights")
-    parser.add_argument("--epochs", type=int, default=25,
+    parser.add_argument("--epochs", type=int, default=15,
                         help="Total number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32,
+    parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size for DataLoader")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest checkpoint if available")
+    parser.add_argument("--finetune_from", type=str, default="data/spatiotemporal_gnn_v7.pt",
+                        help="Path to model weights to initialize from (fine-tuning)")
     args = parser.parse_args()
 
     # Derived paths
@@ -99,21 +103,68 @@ def train_networks():
     # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
-    print(f"Loading dataset from root: {args.root}...")
-    dataset = CherenkovDataset(root=args.root)
-    print(f"Dataset loaded with {len(dataset)} events.")
+    print(f"Loading base dataset from root: {args.root}...")
+    dataset1 = CherenkovDataset(root=args.root)
+    print(f"Base dataset loaded with {len(dataset1)} events.")
+
+    if args.extra_root and os.path.exists(os.path.join(args.extra_root, 'processed', 'data.pt')):
+        print(f"Loading supplementary high-E dataset from: {args.extra_root}...")
+        dataset2 = CherenkovDataset(root=args.extra_root)
+        print(f"Supplementary dataset loaded with {len(dataset2)} events.")
+        from torch.utils.data import ConcatDataset
+        dataset = ConcatDataset([dataset1, dataset2])
+        all_energies = torch.cat([dataset1.y_energy.view(-1).float(), dataset2.y_energy.view(-1).float()])
+        all_classes = torch.cat([dataset1.y_class.view(-1).long(), dataset2.y_class.view(-1).long()])
+    else:
+        dataset = dataset1
+        all_energies = dataset1.y_energy.view(-1).float()
+        all_classes = dataset1.y_class.view(-1).long()
+
+    print(f"Total training pool: {len(dataset)} events.")
 
     if len(dataset) == 0:
         print("No events found. Please run the simulator first.")
         return
 
-    # Split train/val (deterministic after RNG restore)
-    dataset = dataset.shuffle()
+    # Split train/val (deterministic random permutation)
+    g = torch.Generator().manual_seed(42)
+    indices = torch.randperm(len(dataset), generator=g)
     split = int(0.8 * len(dataset))
-    train_data = dataset[:split]
-    val_data = dataset[split:]
+    train_idx = indices[:split]
+    val_idx = indices[split:]
 
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
+    from torch.utils.data import Subset, WeightedRandomSampler
+    train_data = Subset(dataset, train_idx)
+    val_data = Subset(dataset, val_idx)
+
+    train_energies = all_energies[train_idx]
+    train_classes = all_classes[train_idx]
+
+    print("Computing sqrt-weighted sampling weights...")
+    n_bins = 10
+    energy_bins = torch.clamp(((train_energies - 1.8) / (4.5 - 1.8) * n_bins).long(), min=0, max=n_bins - 1)
+
+    # Sqrt-inverse weighting: moderate upsampling of rare events (~9x at 30 TeV)
+    # instead of flat 1/N weighting (which caused 50x oversampling and memorization)
+    gamma_mask = (train_classes == 1)
+    gamma_bins = energy_bins[gamma_mask]
+    gamma_counts = torch.bincount(gamma_bins, minlength=n_bins).float().clamp(min=1.0)
+    gamma_w = 1.0 / torch.sqrt(gamma_counts[gamma_bins])
+    gamma_w = gamma_w / gamma_w.sum()
+
+    hadron_mask = (train_classes == 0)
+    hadron_bins = energy_bins[hadron_mask]
+    hadron_counts = torch.bincount(hadron_bins, minlength=n_bins).float().clamp(min=1.0)
+    hadron_w = 1.0 / torch.sqrt(hadron_counts[hadron_bins])
+    hadron_w = hadron_w / hadron_w.sum()
+
+    sample_weights = torch.zeros_like(train_energies, dtype=torch.float32)
+    sample_weights[gamma_mask] = 0.5 * gamma_w
+    sample_weights[hadron_mask] = 0.5 * hadron_w
+    
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_idx), replacement=True)
+
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, sampler=sampler,
                               num_workers=0, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
                             num_workers=0, pin_memory=torch.cuda.is_available())
@@ -127,15 +178,23 @@ def train_networks():
         torch.backends.cudnn.benchmark = True
         
     model = SpatiotemporalGNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Load pre-trained weights for fine-tuning (before optimizer/scheduler init)
+    if args.finetune_from and os.path.exists(args.finetune_from):
+        print(f"  >> Loading pre-trained weights from: {args.finetune_from}")
+        pretrained = torch.load(args.finetune_from, map_location=device, weights_only=True)
+        model.load_state_dict(pretrained)
+        print(f"     Loaded successfully. Fine-tuning with lower LR.")
+
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2)
+        optimizer, mode='min', factor=0.5, patience=4)
 
     # Automatic Mixed Precision (AMP) GradScaler for 2x faster GPU training
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    criterion_energy = nn.HuberLoss(delta=0.3, reduction='none')
+    criterion_energy = nn.MSELoss(reduction='none')
     criterion_class = nn.BCEWithLogitsLoss()
 
     # ------------------------------------------------------------------
@@ -201,25 +260,12 @@ def train_networks():
                     loss_c = criterion_class(
                         class_logits.view(-1), batch.y_class.view(-1))
 
-                    # 3. Energy loss (gamma events only, with inverse-frequency bin weights)
+                    # 3. Energy loss (gamma events only)
                     gamma_mask = (batch.y_class.view(-1) == 1.0)
                     if gamma_mask.any():
                         y_true = batch.y_energy.view(-1)[gamma_mask]
                         y_pred = energy_pred.view(-1)[gamma_mask]
-
-                        # Inverse-frequency bin weights
-                        n_bins = 10
-                        bin_indices = torch.clamp(
-                            ((y_true - 1.8) / (4.5 - 1.8) * n_bins).long(),
-                            min=0, max=n_bins - 1)
-                        bin_counts = torch.bincount(bin_indices, minlength=n_bins).float()
-                        bin_counts = bin_counts.clamp(min=1.0)
-                        energy_weights = 1.0 / bin_counts[bin_indices]
-                        energy_weights = energy_weights / energy_weights.mean()
-
-                        per_event_loss = criterion_energy(y_pred, y_true)
-                        loss_e = (energy_weights * per_event_loss).mean()
-
+                        loss_e = criterion_energy(y_pred, y_true).mean()
                         loss = loss_c + 5.0 * loss_e
                     else:
                         loss = loss_c

@@ -50,7 +50,7 @@ class CherenkovDataset(InMemoryDataset):
         raw_dir = os.path.join(self.root, 'raw')
         if not os.path.exists(raw_dir):
             return []
-        return [f for f in os.listdir(raw_dir) if os.path.isfile(os.path.join(raw_dir, f))]
+        return [f for f in os.listdir(raw_dir) if os.path.isfile(os.path.join(raw_dir, f)) and f.endswith('.pt')]
 
     @property
     def processed_file_names(self) -> str:
