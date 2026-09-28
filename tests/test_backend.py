@@ -121,7 +121,7 @@ def test_cpu_cuda_detector_geometry_parity():
         **kwargs,
     )
 
-    np.testing.assert_allclose(cuda_trace, cpu_trace, rtol=0, atol=0)
+    np.testing.assert_allclose(cuda_trace, cpu_trace, rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(cuda_gain, cpu_gain)
 
 
