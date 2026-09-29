@@ -56,24 +56,36 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
             gammas_thrown = state.get('gammas_thrown', 0)
             hadrons_thrown = state.get('hadrons_thrown', 0)
             
+    gammas_saved = 0
+    hadrons_saved = 0
     if existing_files:
         indices = [int(os.path.basename(f).split('_')[2].split('.pt')[0]) for f in existing_files]
         start_chunk_idx = max(indices) + 1
         print(f"Found {len(existing_files)} chunks. Resuming from chunk {start_chunk_idx}.")
+        for f in existing_files:
+            try:
+                chunk = torch.load(f, weights_only=False)
+                for ev in chunk:
+                    if ev.get('label', 1) == 1:
+                        gammas_saved += 1
+                    else:
+                        hadrons_saved += 1
+            except Exception:
+                pass
+        print(f"Loaded existing events: {gammas_saved} Gammas, {hadrons_saved} Hadrons saved.")
         print(f"State file says we have already thrown {gammas_thrown} Gammas and {hadrons_thrown} Hadrons.")
         
-    num_gammas -= gammas_thrown
-    num_hadrons -= hadrons_thrown
-        
-    num_gammas = max(0, num_gammas)
-    num_hadrons = max(0, num_hadrons)
-    events_remaining = num_gammas + num_hadrons
+    target_gammas = num_gammas
+    target_hadrons = num_hadrons
+    gammas_needed = max(0, target_gammas - gammas_saved)
+    hadrons_needed = max(0, target_hadrons - hadrons_saved)
+    events_remaining = gammas_needed + hadrons_needed
     
     if events_remaining <= 0:
         print("All requested events have already been generated!")
         return
 
-    print(f"Generating {num_gammas} gammas and {num_hadrons} hadrons in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
+    print(f"Generating {gammas_needed} gammas and {hadrons_needed} hadrons in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
     print(f"Energy range: {e_min:.0f} – {e_max:.0f} GeV, spectral index: E^-{spectral_index:.1f}")
     print(f"Impact radius: {impact_radius:.0f} m")
     
@@ -92,7 +104,7 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
     
     try:
         while events_remaining > 0:
-            current_batch_size = min(batch_size, events_remaining)
+            current_batch_size = batch_size
             
             pids = []
             energies = []
@@ -103,20 +115,18 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
             
             # Sample parameters
             for _ in range(current_batch_size):
-                if num_gammas > 0 and num_hadrons > 0:
-                    is_gamma = np.random.rand() < (num_gammas / (num_gammas + num_hadrons))
-                elif num_gammas > 0:
+                if gammas_needed > 0 and hadrons_needed > 0:
+                    is_gamma = np.random.rand() < (gammas_needed / (gammas_needed + hadrons_needed))
+                elif gammas_needed > 0:
                     is_gamma = True
                 else:
                     is_gamma = False
                     
                 if is_gamma:
                     pids.append('gamma')
-                    num_gammas -= 1
                     gammas_thrown += 1
                 else:
                     pids.append('proton')
-                    num_hadrons -= 1
                     hadrons_thrown += 1
                     
                 # Generalized power-law sampling: E^(-alpha) from e_min to e_max
@@ -157,9 +167,10 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
             # Run fully batched simulation with direction injection
             x_init_batch = []
             y_init_batch = []
+            z_obs = 1275.0
             for pz_val, px_val, py_val, z_val in zip(pz_batch, px_batch, py_batch, z_starts):
-                x_init_batch.append(z_val * (px_val / pz_val))
-                y_init_batch.append(z_val * (py_val / pz_val))
+                x_init_batch.append((z_val - z_obs) * (px_val / pz_val))
+                y_init_batch.append((z_val - z_obs) * (py_val / pz_val))
                 
             with torch.inference_mode():
                 sim = ShowerSimulation(
@@ -169,6 +180,7 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
                 )
                 sim.run(max_generations=30, verbose=False)
             
+            passed_trigger_count_in_batch = 0
             for i in range(current_batch_size):
                 photons = sim.cherenkov_photons_by_event.get(i, {})
                 if len(photons.get('x_ground', [])) == 0:
@@ -196,15 +208,20 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
                     tel.x_tel += ix
                     tel.y_tel += iy
                     
-                # Hardware Trigger: At least 2 telescopes with >= 3 pixels having > 5 PE in a single time bin
+                # Hardware Trigger: At least 2 telescopes with >= 3 pixels having > 8 PE total
                 trigger_count = 0
                 for trace, gain in img_outputs:
-                    max_pe_per_pixel = np.max(trace, axis=1)
-                    if np.sum(max_pe_per_pixel > 5.0) >= 3:
+                    total_pe_per_pixel = np.sum(trace, axis=1)
+                    if np.sum(total_pe_per_pixel > 8.0) >= 3:
                         trigger_count += 1
                         
                 if trigger_count >= 2:
+                    passed_trigger_count_in_batch += 1
                     passed_trigger_count += 1
+                    if pids[i] == 'gamma':
+                        gammas_needed = max(0, gammas_needed - 1)
+                    else:
+                        hadrons_needed = max(0, hadrons_needed - 1)
                     traces = [trace for trace, gain in img_outputs]
                     gains = [gain for trace, gain in img_outputs]
                     
@@ -219,14 +236,15 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
                         'azimuth_deg': azimuth_deg
                     })
             
-            events_remaining -= current_batch_size
-            events_completed_session += current_batch_size
-            pbar.update(current_batch_size)
+            # events_remaining is now decremented by triggers!
+            events_remaining = gammas_needed + hadrons_needed
+            events_completed_session += passed_trigger_count_in_batch
+            pbar.update(passed_trigger_count_in_batch)
             
             current_pct = int((events_completed_session / total_target_events) * 100)
             if current_pct > last_pct_reported:
                 for p in range(last_pct_reported + 1, current_pct + 1):
-                    pbar.write(f"[Progress {p}%] {events_completed_session}/{total_target_events} showers simulated ({passed_trigger_count} triggered)")
+                    pbar.write(f"[Progress {p}%] {events_completed_session}/{total_target_events} showers triggered")
                 last_pct_reported = current_pct
             
             # Save chunk

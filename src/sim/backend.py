@@ -161,7 +161,7 @@ _PHOTON_POSITION_KEYS = ('x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground')
 def _empty_photon_packets(include_event_id=False):
     result = {
         key: np.empty(0, dtype=np.float32)
-        for key in (*_PHOTON_POSITION_KEYS, 'weight', 'pz_emit')
+        for key in (*_PHOTON_POSITION_KEYS, 'weight')
     }
     if include_event_id:
         result['event_id'] = np.empty(0, dtype=np.int32)
@@ -399,7 +399,7 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
             # Store pz_emit for slant-path emission time calculation in ray_trace
             chunk_pz = directions[segment_start:segment_end, 2][local_segment]
             packet_values = torch.stack(
-                (xe, ye, ze, x_ground, y_ground, packet_weight, chunk_pz), dim=1
+                (xe, ye, ze, x_ground, y_ground, packet_weight), dim=1
             )[reaches_ground]
             packet_chunks.append(packet_values.cpu().numpy())
             if event_ids is not None:
@@ -414,7 +414,7 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
     packed = np.concatenate(packet_chunks, axis=0).astype(np.float32, copy=False)
     result = {
         key: packed[:, column]
-        for column, key in enumerate((*_PHOTON_POSITION_KEYS, 'weight', 'pz_emit'))
+        for column, key in enumerate((*_PHOTON_POSITION_KEYS, 'weight'))
     }
     if include_event_id:
         result['event_id'] = np.concatenate(event_chunks).astype(np.int32, copy=False)

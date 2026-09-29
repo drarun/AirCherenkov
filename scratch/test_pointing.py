@@ -23,8 +23,9 @@ def test():
     pz = -np.cos(evt_zen)
     
     z_start = 25000.0
-    x_init = z_start * (px / pz)
-    y_init = z_start * (py / pz)
+    z_obs = 1275.0
+    x_init = (z_start - z_obs) * (px / pz)
+    y_init = (z_start - z_obs) * (py / pz)
     
     print(f"Shower start: {x_init:.1f}, {y_init:.1f}, {z_start}")
     print(f"Shower dir: {px:.3f}, {py:.3f}, {pz:.3f}")
@@ -57,13 +58,12 @@ def test():
     # Create a grid of telescopes
     telescopes = []
     import copy
+    array = TelescopeArray.veritas_array()
     base_tel = array.telescopes[0]
-    for ix in np.linspace(-200, 200, 10):
-        for iy in np.linspace(-200, 200, 10):
-            tel = copy.deepcopy(base_tel)
-            tel.x_tel = float(ix)
-            tel.y_tel = float(iy)
-            telescopes.append(tel)
+    tel = copy.deepcopy(base_tel)
+    tel.x_tel = 80.0
+    tel.y_tel = 0.0
+    telescopes.append(tel)
     array.telescopes = telescopes
         
     results = array.ray_trace(
@@ -75,7 +75,9 @@ def test():
     
     print("Ray trace completed.")
     for i, (trace, gain) in enumerate(results):
-        print(f"Telescope {i} PE: {trace.sum():.1f}, Max: {trace.max():.1f}, Min: {trace.min():.1f}, Mean: {trace.mean():.1f}")
+        max_pe = trace.max()
+        if max_pe > 5.0:
+            print(f"Telescope {i} at ({telescopes[i].x_tel:.1f}, {telescopes[i].y_tel:.1f}) PE: {trace.sum():.1f}, Max: {max_pe:.1f}, Min: {trace.min():.1f}, Mean: {trace.mean():.1f}")
         
 if __name__ == '__main__':
     test()
