@@ -161,7 +161,7 @@ _PHOTON_POSITION_KEYS = ('x_emit', 'y_emit', 'z_emit', 'x_ground', 'y_ground')
 def _empty_photon_packets(include_event_id=False):
     result = {
         key: np.empty(0, dtype=np.float32)
-        for key in (*_PHOTON_POSITION_KEYS, 'weight')
+        for key in (*_PHOTON_POSITION_KEYS, 'weight', 'pz_emit')
     }
     if include_event_id:
         result['event_id'] = np.empty(0, dtype=np.int32)
@@ -396,8 +396,10 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
                 * transmission
                 / count_per_packet.to(dtype)
             )
+            # Store pz_emit for slant-path emission time calculation in ray_trace
+            chunk_pz = directions[segment_start:segment_end, 2][local_segment]
             packet_values = torch.stack(
-                (xe, ye, ze, x_ground, y_ground, packet_weight), dim=1
+                (xe, ye, ze, x_ground, y_ground, packet_weight, chunk_pz), dim=1
             )[reaches_ground]
             packet_chunks.append(packet_values.cpu().numpy())
             if event_ids is not None:
@@ -412,7 +414,7 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
     packed = np.concatenate(packet_chunks, axis=0).astype(np.float32, copy=False)
     result = {
         key: packed[:, column]
-        for column, key in enumerate((*_PHOTON_POSITION_KEYS, 'weight'))
+        for column, key in enumerate((*_PHOTON_POSITION_KEYS, 'weight', 'pz_emit'))
     }
     if include_event_id:
         result['event_id'] = np.concatenate(event_chunks).astype(np.int32, copy=False)
@@ -798,7 +800,20 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
                 device,
                 default=shower_start_altitude,
             )
-            emission_time = (packet_start_altitude - ze) / 0.299792458
+            # Slant-path emission time along the primary shower axis.
+            # The shower travels at pointing_zenith from vertical, so the
+            # vertical component of the shower direction is cos(pointing_zenith).
+            # Dividing Δz by cos(θ) gives the slant path along the shower axis,
+            # which is the correct reference for the Cherenkov wavefront timing.
+            # NOTE: we use the shower axis direction (pointing_zenith), NOT
+            # the individual scattered particle pz. Using scattered-particle pz
+            # causes ~100,000 ns time spans because scattered particles have
+            # very different slant depths. The shower axis pz gives ~5 ns spans.
+            import math as _math
+            pz_shower_abs = float(_math.cos(_math.radians(float(pointing_zenith))))
+            pz_shower_abs = max(pz_shower_abs, 0.05)  # guard near-horizontal
+            slant_distance = (packet_start_altitude - ze) / pz_shower_abs
+            emission_time = slant_distance / 0.299792458
 
         pair_limit = _ray_pair_chunk_limit(device)
         packet_chunk_size = max(1, pair_limit // n_telescopes)
@@ -827,6 +842,7 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             telescope_index, local_packet_index = torch.nonzero(
                 mirror_hit, as_tuple=True
             )
+            print(f"mirror hits: {telescope_index.numel()}")
             if telescope_index.numel() == 0:
                 continue
 
@@ -856,7 +872,6 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             x_double_prime = x_prime * torch.cos(theta) - z_prime * torch.sin(theta)
             y_double_prime = y_prime
             z_double_prime = x_prime * torch.sin(theta) + z_prime * torch.cos(theta)
-
             u_deg = torch.rad2deg(torch.atan2(x_double_prime, z_double_prime))
             v_deg = torch.rad2deg(torch.atan2(y_double_prime, z_double_prime))
             

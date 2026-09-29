@@ -134,9 +134,9 @@ class ShowerSimulation:
             
         p = self.active
         # Filter dead immediately
-        alive_mask = (p[:, 1] >= self.critical_energy) & (p[:, 4] > 0)
+        z_obs = 1275.0  # VERITAS observatory altitude (m)
+        alive_mask = (p[:, 1] >= self.critical_energy) & (p[:, 4] > z_obs)
         p = p[alive_mask]
-        print(f"p.shape after alive_mask: {p.shape}")
         if p.shape[0] == 0:
             self.active = p
             return
@@ -288,8 +288,9 @@ class ShowerSimulation:
         y_new = y + py_eff * dist
         z_new = z + pz_eff * dist
         
-        # Ray Trace Cherenkov Segments
-        valid_z = (z_new > 0) & (z > 0)
+        # Ray Trace Cherenkov Segments (only above observatory altitude)
+        z_obs = 1275.0
+        valid_z = (z_new > z_obs) & (z > z_obs)
         c_mask = mask_e & valid_z
         if c_mask.any():
             self.c_segs_start.append(torch.stack([x[c_mask], y[c_mask], z[c_mask]], dim=1))
@@ -298,7 +299,7 @@ class ShowerSimulation:
             self.c_segs_E.append(E[c_mask])
             self.c_segs_event_id.append(evt[c_mask])
             
-        z_new = torch.clamp(z_new, min=0.0)
+        z_new = torch.clamp(z_new, min=z_obs)
         
         # Ionization
         mask_ion = mask_e | (pid == 3) | (pid == 4)
@@ -307,7 +308,7 @@ class ShowerSimulation:
             E[mask_ion] -= 0.0021 * x_gcm2
             
         # Re-filter alive
-        alive = (E >= self.critical_energy) & (z_new > 0)
+        alive = (E >= self.critical_energy) & (z_new > z_obs)
         idx_alive = alive.nonzero(as_tuple=True)[0]
         new_particles = []
         
@@ -316,7 +317,7 @@ class ShowerSimulation:
         if mask_g.any():
             idx_g = idx_alive[mask_g]
             N_g = idx_g.shape[0]
-            u = self._get_rand(N_g) * 0.8 + 0.1
+            u = self._get_rand(N_g) * 0.2 + 0.4  # symmetric Heitler: u in [0.4, 0.6]
             e1_E = u * E[idx_g]
             e2_E = (1 - u) * E[idx_g]
             
@@ -342,9 +343,8 @@ class ShowerSimulation:
             N_b = idx_b.shape[0]
             E_b = E[idx_b]
             
-            # Bremsstrahlung: e -> e + gamma
-            # u is fraction of energy given to photon
-            u = self._get_rand(N_b) * 0.9 + 0.05
+            # Bremsstrahlung: e -> e + gamma, symmetric Heitler split u in [0.4, 0.6]
+            u = self._get_rand(N_b) * 0.2 + 0.4
             e_E = (1 - u) * E_b
             g_E = u * E_b
             
