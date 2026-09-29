@@ -201,20 +201,21 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [selectedPixel, setSelectedPixel] = useState(null);
   const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'overlap'
+  const [cleanView, setCleanView] = useState(true);
 
   useEffect(() => {
     axios.get(`${API_BASE}/config`).then(res => {
       setConfig(res.data);
-      fetchEvent(0);
+      fetchEvent(0, cleanView);
     }).catch(err => {
       console.error("Failed to load config", err);
       setLoading(false);
     });
   }, []);
 
-  const fetchEvent = (id) => {
+  const fetchEvent = (id, isClean = cleanView) => {
     setLoading(true);
-    axios.get(`${API_BASE}/events/${id}`).then(res => {
+    axios.get(`${API_BASE}/events/${id}?clean=${isClean}`).then(res => {
       setEventData(res.data);
       setEventId(id);
       setSelectedPixel(null);
@@ -286,6 +287,17 @@ export default function App() {
           </span>
           <button className="btn" onClick={() => setViewMode(v => v === 'grid' ? 'overlap' : 'grid')}>
             {viewMode === 'grid' ? 'Overlap View' : 'Grid View'}
+          </button>
+          <button 
+            className={`btn ${cleanView ? 'btn-primary' : ''}`}
+            onClick={() => {
+              const nextClean = !cleanView;
+              setCleanView(nextClean);
+              fetchEvent(eventId, nextClean);
+            }}
+            title="Toggle between tail-cut cleaned and raw charge view"
+          >
+            {cleanView ? 'Cleaned' : 'Raw'}
           </button>
           <button className="btn" onClick={handlePrev} disabled={eventId === 0 || loading}>
             <ChevronLeft size={18} /> Prev
