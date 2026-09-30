@@ -14,3 +14,5 @@ DiagnosticPlots/
 # Tectonic binaries
 tectonic.exe
 tectonic.zip
+
+*.log
