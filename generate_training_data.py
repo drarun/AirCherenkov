@@ -152,12 +152,13 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
                     
                     # Perturb zenith and azimuth (approximate for small FOVs)
                     evt_zen = zen_rad + theta_offset * np.cos(phi_offset)
-                    evt_azi = azi_rad + theta_offset * np.sin(phi_offset)
+                    evt_azi = azi_rad + theta_offset * np.sin(phi_offset) / max(np.sin(zen_rad), 1e-6)
                 elif wobble_offset > 0:
                     theta_offset = np.radians(wobble_offset)
                     phi_offset = np.random.rand() * 2 * np.pi
                     evt_zen = zen_rad + theta_offset * np.cos(phi_offset)
-                    evt_azi = azi_rad + theta_offset * np.sin(phi_offset)
+                    # Scale azimuth by 1/sin(zen) so the ring is circular on the sky
+                    evt_azi = azi_rad + theta_offset * np.sin(phi_offset) / max(np.sin(zen_rad), 1e-6)
                 else:
                     evt_zen = zen_rad
                     evt_azi = azi_rad

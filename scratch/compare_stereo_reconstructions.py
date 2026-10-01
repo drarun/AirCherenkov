@@ -1,6 +1,13 @@
 """
 Compare Geometric Stereoscopic Reconstruction vs Machine Learning Stereoscopic Reconstruction
 against Monte Carlo Truth for 1 TeV Gamma-ray events.
+
+Improvements over v1:
+- ML features now include asymmetry, miss, alpha, and geometric azimuth seed (61-dim)
+- Native multi-output RandomForestRegressor (shared trees, captures X/Y correlations)
+- Fixed wobble ring geometry (circular on the sky)
+- Larger evaluation dataset (~880 events)
+- Proper empirical CDF computation
 """
 import os
 import sys
@@ -23,19 +30,23 @@ def compute_angular_separation(zen1_deg, azi1_deg, zen2_deg, azi2_deg):
     """Compute spherical angular separation in degrees."""
     z1, a1 = np.radians(zen1_deg), np.radians(azi1_deg)
     z2, a2 = np.radians(zen2_deg), np.radians(azi2_deg)
-    
+
     v1 = np.column_stack([np.sin(z1) * np.cos(a1), np.sin(z1) * np.sin(a1), np.cos(z1)])
     v2 = np.column_stack([np.sin(z2) * np.cos(a2), np.sin(z2) * np.sin(a2), np.cos(z2)])
-    
+
     cos_sep = np.sum(v1 * v2, axis=1)
     cos_sep = np.clip(cos_sep, -1.0, 1.0)
     return np.degrees(np.arccos(cos_sep))
 
 
 def main():
-    data_path = 'data/stereo_eval/sim_batch_00000.pt'
+    # Use new v2 data (fixed wobble geometry, larger dataset)
+    data_path = 'data/stereo_eval_v2/sim_batch_00000.pt'
     if not os.path.exists(data_path):
-        print(f"Error: {data_path} not found.")
+        # Fall back to original data
+        data_path = 'data/stereo_eval/sim_batch_00000.pt'
+    if not os.path.exists(data_path):
+        print(f"Error: no evaluation data found.")
         sys.exit(1)
 
     print(f"Loading events from {data_path}...")
@@ -124,7 +135,7 @@ def main():
     ml_pred_direction = np.zeros_like(y_direction)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-        model = MLStereoReconstructor(n_estimators=100, max_depth=10, random_state=42 + fold)
+        model = MLStereoReconstructor(n_estimators=200, max_depth=14, random_state=42 + fold)
         model.fit(X[train_idx], y_impact[train_idx], y_direction[train_idx])
         p_imp, p_dir = model.predict(X[val_idx])
         ml_pred_impact[val_idx] = p_imp
@@ -150,23 +161,23 @@ def main():
     )
 
     # Print summary statistics
-    print("\n" + "=" * 65)
-    print("       STEREOSCOPIC RECONSTRUCTION BENCHMARK COMPARISON       ")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print("           STEREOSCOPIC RECONSTRUCTION BENCHMARK COMPARISON (v2)      ")
+    print("=" * 70)
     print(f"Events Evaluated: {len(valid_idx)} (1 TeV Gamma, 30 deg Zen, 0.5 deg Wobble, 100m Imp)")
-    print("-" * 65)
-    print("METRIC                         | GEOMETRIC (SDP) | ML (RANDOM FOREST)")
-    print("-" * 65)
-    print(f"Direction 68% Containment (t68)|    {np.percentile(geom_ang_err, 68):.3f} deg     |    {np.percentile(ml_ang_err, 68):.3f} deg")
-    print(f"Direction Median Error         |    {np.median(geom_ang_err):.3f} deg     |    {np.median(ml_ang_err):.3f} deg")
-    print(f"Direction Mean Error           |    {np.mean(geom_ang_err):.3f} deg     |    {np.mean(ml_ang_err):.3f} deg")
-    print(f"Direction 95% Containment (t95)|    {np.percentile(geom_ang_err, 95):.3f} deg     |    {np.percentile(ml_ang_err, 95):.3f} deg")
-    print("-" * 65)
-    print(f"Impact Core 68% Containment(R68)|    {np.percentile(geom_imp_err, 68):.1f} m        |    {np.percentile(ml_imp_err, 68):.1f} m")
-    print(f"Impact Core Median Error       |    {np.median(geom_imp_err):.1f} m        |    {np.median(ml_imp_err):.1f} m")
-    print(f"Impact Core Mean Error         |    {np.mean(geom_imp_err):.1f} m        |    {np.mean(ml_imp_err):.1f} m")
-    print(f"Impact Core 95% Containment(R95)|    {np.percentile(geom_imp_err, 95):.1f} m        |    {np.percentile(ml_imp_err, 95):.1f} m")
-    print("=" * 65)
+    print("-" * 70)
+    print("METRIC                           | GEOMETRIC (SDP) | ML (RANDOM FOREST)")
+    print("-" * 70)
+    print(f"Direction 68% Containment (t68)  |    {np.percentile(geom_ang_err, 68):.3f} deg     |    {np.percentile(ml_ang_err, 68):.3f} deg")
+    print(f"Direction Median Error           |    {np.median(geom_ang_err):.3f} deg     |    {np.median(ml_ang_err):.3f} deg")
+    print(f"Direction Mean Error             |    {np.mean(geom_ang_err):.3f} deg     |    {np.mean(ml_ang_err):.3f} deg")
+    print(f"Direction 95% Containment (t95)  |    {np.percentile(geom_ang_err, 95):.3f} deg     |    {np.percentile(ml_ang_err, 95):.3f} deg")
+    print("-" * 70)
+    print(f"Impact Core 68% Containment (R68)|    {np.percentile(geom_imp_err, 68):.1f} m         |    {np.percentile(ml_imp_err, 68):.1f} m")
+    print(f"Impact Core Median Error         |    {np.median(geom_imp_err):.1f} m         |    {np.median(ml_imp_err):.1f} m")
+    print(f"Impact Core Mean Error           |    {np.mean(geom_imp_err):.1f} m         |    {np.mean(ml_imp_err):.1f} m")
+    print(f"Impact Core 95% Containment (R95)|    {np.percentile(geom_imp_err, 95):.1f} m         |    {np.percentile(ml_imp_err, 95):.1f} m")
+    print("=" * 70)
 
     # 4. Generate Publication-Quality Comparison Plot
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
@@ -175,13 +186,14 @@ def main():
     ax = axes[0, 0]
     sorted_geom_ang = np.sort(geom_ang_err)
     sorted_ml_ang = np.sort(ml_ang_err)
-    p_ang = np.linspace(0, 100, len(sorted_geom_ang))
+    # Proper empirical CDF: F(x_i) = i / N
+    ecdf_frac = np.arange(1, len(sorted_geom_ang) + 1) / len(sorted_geom_ang) * 100
 
     g68_ang = np.percentile(geom_ang_err, 68)
     m68_ang = np.percentile(ml_ang_err, 68)
 
-    ax.plot(sorted_geom_ang, p_ang, label=f"Geometric SDP (68%: {g68_ang:.3f}°)", color='#1f77b4', lw=2.5)
-    ax.plot(sorted_ml_ang, p_ang, label=f"ML Random Forest (68%: {m68_ang:.3f}°)", color='#ff7f0e', lw=2.5, ls='--')
+    ax.plot(sorted_geom_ang, ecdf_frac, label=f"Geometric SDP (θ68: {g68_ang:.3f}°)", color='#1f77b4', lw=2.5)
+    ax.plot(sorted_ml_ang, ecdf_frac, label=f"ML Random Forest (θ68: {m68_ang:.3f}°)", color='#ff7f0e', lw=2.5, ls='--')
     ax.axhline(68.0, color='gray', ls=':', alpha=0.7, label='68% Containment')
     ax.axvline(g68_ang, color='#1f77b4', ls=':', alpha=0.5)
     ax.axvline(m68_ang, color='#ff7f0e', ls=':', alpha=0.5)
@@ -197,13 +209,13 @@ def main():
     ax = axes[0, 1]
     sorted_geom_imp = np.sort(geom_imp_err)
     sorted_ml_imp = np.sort(ml_imp_err)
-    p_imp_cdf = np.linspace(0, 100, len(sorted_geom_imp))
+    ecdf_frac_imp = np.arange(1, len(sorted_geom_imp) + 1) / len(sorted_geom_imp) * 100
 
     g68_imp = np.percentile(geom_imp_err, 68)
     m68_imp = np.percentile(ml_imp_err, 68)
 
-    ax.plot(sorted_geom_imp, p_imp_cdf, label=f"Geometric SDP (68%: {g68_imp:.1f} m)", color='#1f77b4', lw=2.5)
-    ax.plot(sorted_ml_imp, p_imp_cdf, label=f"ML Random Forest (68%: {m68_imp:.1f} m)", color='#ff7f0e', lw=2.5, ls='--')
+    ax.plot(sorted_geom_imp, ecdf_frac_imp, label=f"Geometric SDP (R68: {g68_imp:.1f} m)", color='#1f77b4', lw=2.5)
+    ax.plot(sorted_ml_imp, ecdf_frac_imp, label=f"ML Random Forest (R68: {m68_imp:.1f} m)", color='#ff7f0e', lw=2.5, ls='--')
     ax.axhline(68.0, color='gray', ls=':', alpha=0.7, label='68% Containment')
     ax.axvline(g68_imp, color='#1f77b4', ls=':', alpha=0.5)
     ax.axvline(m68_imp, color='#ff7f0e', ls=':', alpha=0.5)
@@ -271,14 +283,14 @@ def main():
                  "VERITAS Array Simulation | 1 TeV Gamma-Rays | 30° Zenith, 0.5° Wobble Offset, 100m Impact Radius",
                  fontsize=13, fontweight='bold', y=0.99)
     plt.tight_layout()
-    plot_file = 'scratch/stereo_reconstruction_comparison.png'
+    plot_file = 'scratch/stereo_reconstruction_comparison_v2.png'
     plt.savefig(plot_file, dpi=150)
     print(f"\nSaved comparison plot to {plot_file}")
 
     # Copy to artifacts directory
     artifact_dir = r"C:\Users\aruns\.gemini\antigravity-cli\brain\f0e1b905-b5d2-4fce-80a1-d0620d2d7de7"
     if os.path.exists(artifact_dir):
-        dest_plot = os.path.join(artifact_dir, "stereo_reconstruction_comparison.png")
+        dest_plot = os.path.join(artifact_dir, "stereo_reconstruction_comparison_v2.png")
         import shutil
         shutil.copyfile(plot_file, dest_plot)
         print(f"Copied plot to artifact directory: {dest_plot}")
