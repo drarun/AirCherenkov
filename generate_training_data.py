@@ -112,6 +112,8 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
             px_batch = []
             py_batch = []
             pz_batch = []
+            evt_zen_batch = []
+            evt_azi_batch = []
             
             # Sample parameters
             for _ in range(current_batch_size):
@@ -160,6 +162,8 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
                     evt_zen = zen_rad
                     evt_azi = azi_rad
                     
+                evt_zen_batch.append(evt_zen)
+                evt_azi_batch.append(evt_azi)
                 px_batch.append(np.sin(evt_zen) * np.cos(evt_azi))
                 py_batch.append(np.sin(evt_zen) * np.sin(evt_azi))
                 pz_batch.append(-np.cos(evt_zen))
@@ -233,7 +237,9 @@ def generate_training_data(num_gammas=10000, num_hadrons=10000, batch_size=500, 
                         'impact_x': ix,
                         'impact_y': iy,
                         'zenith_deg': zenith_deg,
-                        'azimuth_deg': azimuth_deg
+                        'azimuth_deg': azimuth_deg,
+                        'true_zenith_deg': float(np.degrees(evt_zen_batch[i])),
+                        'true_azimuth_deg': float(np.degrees(evt_azi_batch[i])),
                     })
             
             # events_remaining is now decremented by triggers!
