@@ -152,3 +152,59 @@ class MLStereoReconstructor:
         pred_dir = self.direction_model.predict(X)
         return pred_imp, pred_dir
 
+
+class StereoClassifier:
+    """Random Forest / Gradient Boosted classifier for gamma/hadron separation."""
+
+    def __init__(self, n_estimators: int = 200, max_depth: int = 14, random_state: int = 42):
+        from sklearn.ensemble import RandomForestClassifier
+        self.clf = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight='balanced'
+        )
+        self.is_fitted = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """Fit classifier on stereo feature matrix X with binary labels y (1=gamma, 0=hadron)."""
+        self.clf.fit(X, y)
+        self.is_fitted = True
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Predict gamma class probabilities (values between 0.0 and 1.0)."""
+        if not self.is_fitted:
+            raise RuntimeError("Classifier is not fitted yet.")
+        return self.clf.predict_proba(X)[:, 1]
+
+    def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+        """Predict binary class labels based on decision threshold."""
+        return (self.predict_proba(X) >= threshold).astype(int)
+
+
+class StereoEnergyRegressor:
+    """Random Forest regressor for primary gamma-ray energy reconstruction."""
+
+    def __init__(self, n_estimators: int = 200, max_depth: int = 14, random_state: int = 42):
+        self.reg = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
+        self.is_fitted = False
+
+    def fit(self, X: np.ndarray, y_log10_energy: np.ndarray):
+        """Fit regressor on stereo feature matrix X predicting log10(E/GeV)."""
+        self.reg.fit(X, y_log10_energy)
+        self.is_fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict reconstructed log10(E/GeV)."""
+        if not self.is_fitted:
+            raise RuntimeError("Regressor is not fitted yet.")
+        return self.reg.predict(X)
+
