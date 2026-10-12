@@ -103,12 +103,12 @@ class TestTailcutClean:
 class TestMLStereoFeatures:
 
     def test_feature_vector_length(self):
-        """Feature vector should be 4*13 + 9 = 61."""
+        """Feature vector should be 4*13 + 9 + 4 = 65."""
         cam = Camera(n_rings=12)
         array = TelescopeArray.veritas_array()
         traces = np.zeros((4, cam.n_pixels, 16), dtype=np.float32)
         feat = extract_stereo_features(traces, array.telescopes, cam)
-        assert len(feat) == 61
+        assert len(feat) == 65
 
     def test_zero_traces_yield_zero_features(self):
         """All-zero traces should give untriggered features."""
@@ -116,8 +116,45 @@ class TestMLStereoFeatures:
         array = TelescopeArray.veritas_array()
         traces = np.zeros((4, cam.n_pixels, 16), dtype=np.float32)
         feat = extract_stereo_features(traces, array.telescopes, cam)
-        # n_trig should be 0
-        assert feat[52] == 0.0  # n_trig is feature 52
+        assert feat[52] == 0.0  # n_trig
+        assert np.all(feat[61:65] == 0.0)  # no impact distance without images
+
+    def test_gh_mask_excludes_direction_features(self):
+        from recon.ml_stereo import gh_feature_mask
+        mask = gh_feature_mask()
+        assert mask.shape == (65,)
+        for idx in (2, 3, 59, 60, 13 + 12):  # T0 cx, T0 cy, geom zen/azi, T1 alpha
+            assert not mask[idx]
+        for idx in (1, 5, 6, 10, 57, 58, 61):  # size, length, width, asym, core, impact
+            assert mask[idx]
+
+    @pytest.mark.skipif(
+        not __import__('os').path.exists('data/stereo_eval_v2/sim_batch_00000.pt'),
+        reason="requires stereo_eval_v2 simulation data")
+    def test_impact_distance_matches_mc_truth(self):
+        """Shower-frame impact distances from reconstruction should track MC truth."""
+        import torch
+        cam = Camera(n_rings=12)
+        tels = TelescopeArray.veritas_array().telescopes
+        events = torch.load('data/stereo_eval_v2/sim_batch_00000.pt', weights_only=False)[:60]
+        errs = []
+        for ev in events:
+            feat = extract_stereo_features(ev['fadc_traces'], tels, cam,
+                                           ev['zenith_deg'], ev['azimuth_deg'])
+            if feat[56] < 1.0:
+                continue
+            zen = np.radians(ev['true_zenith_deg'])
+            azi = np.radians(ev['true_azimuth_deg'] + 180.0)
+            axis = np.array([np.sin(zen) * np.cos(azi), np.sin(zen) * np.sin(azi), np.cos(zen)])
+            core = np.array([float(ev['impact_x']), float(ev['impact_y']), 1275.0])
+            for t, tel in enumerate(tels):
+                if feat[t * 13] > 0:
+                    r = np.array([tel.x_tel, tel.y_tel, tel.z_tel]) - core
+                    true_d = np.linalg.norm(r - np.dot(r, axis) * axis)
+                    errs.append(feat[61 + t] - true_d)
+        assert len(errs) > 50
+        assert abs(np.median(errs)) < 15.0      # no gross systematic offset (m)
+        assert np.percentile(np.abs(errs), 68) < 80.0
 
 
 class TestMLStereoReconstructor:

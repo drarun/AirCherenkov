@@ -9,7 +9,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 
 from sim.camera import Camera
-from recon.stereo import reconstruct_event_geometric, tailcut_clean
+from recon.stereo import reconstruct_event_geometric, tailcut_clean, cam_to_sky_vector
 from recon.hillas import compute_hillas
 
 
@@ -48,6 +48,8 @@ def extract_stereo_features(
         58: geometric reco impact Y (m)
         59: geometric reco zenith (deg)
         60: geometric reco azimuth (deg)
+      Per-telescope shower-frame impact distance (4 features):
+        61-64: perpendicular distance from telescope t to the reconstructed shower axis (m)
     """
     n_tel = len(telescopes)
     feat_tel = []
@@ -102,13 +104,48 @@ def extract_stereo_features(
     if geom_res is not None:
         geom_feats = [1.0, geom_res.reco_impact_x, geom_res.reco_impact_y,
                       geom_res.reco_zenith_deg, geom_res.reco_azimuth_deg]
+        axis = np.asarray(geom_res.reco_direction_vector, dtype=np.float64)
+        core = np.array([geom_res.reco_impact_x, geom_res.reco_impact_y, z_obs])
     else:
         geom_feats = [0.0, cog_x, cog_y, pointing_zenith_deg, pointing_azimuth_deg]
+        # Fallback: assume shower axis along the optical axis, core at size-weighted CoG
+        axis = cam_to_sky_vector(0.0, 0.0, np.radians(pointing_zenith_deg),
+                                 np.radians(pointing_azimuth_deg + 180.0))
+        core = np.array([cog_x, cog_y, z_obs])
+
+    # Per-telescope impact distance measured perpendicular to the shower axis
+    # (shower-frame impact parameter). 0.0 for telescopes without a usable image.
+    impact_feats = []
+    for t_idx in range(4):
+        if t_idx < n_tel and feat_tel[t_idx * 13] > 0.0:
+            tel = telescopes[t_idx]
+            r = np.array([tel.x_tel, tel.y_tel, tel.z_tel], dtype=np.float64) - core
+            impact_feats.append(float(np.linalg.norm(r - np.dot(r, axis) * axis)))
+        else:
+            impact_feats.append(0.0)
 
     n_trig = sum(feat_tel[t * 13] for t in range(4))
     array_feats = [n_trig, np.log10(1.0 + tot_size), cog_x, cog_y] + geom_feats
 
-    return np.array(feat_tel + array_feats, dtype=np.float32)
+    return np.array(feat_tel + array_feats + impact_feats, dtype=np.float32)
+
+
+# Feature indices that encode absolute arrival direction / source position in the camera.
+# These MUST be excluded from gamma/hadron classification: gammas come from a fixed wobble
+# ring while protons are diffuse, so including them lets the classifier learn the source
+# position (an implicit theta^2 cut) and inflates AUC. Apply theta^2 separately instead.
+_PER_TEL_DIRECTIONAL = (2, 3, 4, 8, 9, 11, 12)  # cx, cy, dist, cos2psi, sin2psi, miss, alpha
+GH_EXCLUDED_FEATURES = tuple(
+    t * 13 + j for t in range(4) for j in _PER_TEL_DIRECTIONAL
+) + (59, 60)  # geometric reco zenith / azimuth
+N_STEREO_FEATURES = 65
+
+
+def gh_feature_mask(n_features: int = N_STEREO_FEATURES) -> np.ndarray:
+    """Boolean column mask selecting direction-agnostic features for gamma/hadron separation."""
+    mask = np.ones(n_features, dtype=bool)
+    mask[list(GH_EXCLUDED_FEATURES)] = False
+    return mask
 
 
 class MLStereoReconstructor:
