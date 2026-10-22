@@ -31,7 +31,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install -e ".[viz,dev]"
+        python -m pip install -e ".[viz,ml,dev]"
     - name: Run pytest
       run: python -m pytest
     - name: Build installable wheel
