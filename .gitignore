@@ -16,3 +16,5 @@ tectonic.exe
 tectonic.zip
 
 *.log
+
+external/
