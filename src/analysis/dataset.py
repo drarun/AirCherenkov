@@ -12,6 +12,7 @@ except ImportError:
         pass
 
 from sim.backend import get_device
+from sim.fadc import restore_low_gain_traces
 from analysis.io import BaseDataReader, TraceProcessor
 from analysis.graph import GraphBuilder
 
@@ -100,6 +101,7 @@ class CherenkovDataset(InMemoryDataset):
                             trace_np = evt['fadc_traces'][tel_idx]
                             gain_np = evt['gain_flags'][tel_idx]
                             
+                            trace_np = restore_low_gain_traces(evt['fadc_traces'][tel_idx], gain_np)
                             img_np = np.sum(trace_np, axis=1)
                             timing_np = np.argmax(trace_np, axis=1) * 2.0
                             

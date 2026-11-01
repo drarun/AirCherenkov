@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import torch
-from sim.shower import ShowerSimulation
+from sim.shower import ShowerSimulation, arclength_from_grammage, atmospheric_density
 
 def test_shower_initialization():
     sim = ShowerSimulation(primary_types=['gamma'], energies=[100.0])
@@ -85,3 +85,18 @@ def test_explicit_seed_reproduces_shower_and_packet_sampling():
     assert outputs[0].keys() == outputs[1].keys()
     for key in outputs[0]:
         np.testing.assert_allclose(outputs[0][key], outputs[1][key], rtol=1e-4, atol=1e-4)
+
+
+def test_arclength_from_grammage_conserves_slant_depth():
+    z1 = torch.tensor([50000.0, 25000.0, 12000.0], dtype=torch.float32)
+    pz = torch.tensor([-1.0, -0.8660254, -0.5], dtype=torch.float32)
+    dx = torch.tensor([47.0, 120.0, 250.0], dtype=torch.float32)
+
+    s = arclength_from_grammage(z1, pz, dx)
+    z2 = z1 + pz * s
+
+    H = 7640.0
+    xv1 = H * atmospheric_density(z1) * 100.0
+    xv2 = H * atmospheric_density(z2) * 100.0
+    recovered_dx = (xv2 - xv1) / (-pz)
+    np.testing.assert_allclose(recovered_dx.numpy(), dx.numpy(), rtol=1e-5, atol=1e-4)

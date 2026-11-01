@@ -9,6 +9,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 
 from sim.camera import Camera
+from sim.fadc import restore_low_gain_traces
 from recon.stereo import reconstruct_event_geometric, tailcut_clean, cam_to_sky_vector
 from recon.hillas import compute_hillas
 
@@ -20,6 +21,7 @@ def extract_stereo_features(
     pointing_zenith_deg: float = 30.0,
     pointing_azimuth_deg: float = 0.0,
     z_obs: float = 1275.0,
+    gain_flags: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Extract a fixed-size feature vector for an event across all telescopes.
 
@@ -62,6 +64,8 @@ def extract_stereo_features(
     for t_idx in range(4):
         if t_idx < n_tel:
             trace = fadc_traces[t_idx]
+            if gain_flags is not None:
+                trace = restore_low_gain_traces(trace, gain_flags[t_idx])
             raw_charge = np.sum(trace, axis=-1)
             c_clean, mask = tailcut_clean(raw_charge, camera)
             h = compute_hillas(camera, c_clean, mask) if np.sum(mask) >= 3 else None
@@ -100,6 +104,7 @@ def extract_stereo_features(
         pointing_zenith_deg=pointing_zenith_deg,
         pointing_azimuth_deg=pointing_azimuth_deg,
         z_obs=z_obs,
+        gain_flags=gain_flags,
     )
     if geom_res is not None:
         geom_feats = [1.0, geom_res.reco_impact_x, geom_res.reco_impact_y,
@@ -224,6 +229,10 @@ class StereoClassifier:
 class StereoEnergyRegressor:
     """Random Forest regressor for primary gamma-ray energy reconstruction."""
 
+    # Standard VERITAS telescope coordinates (m)
+    _TEL_X = np.array([0.0, 85.04, 34.12, -41.31], dtype=np.float64)
+    _TEL_Y = np.array([0.0, 32.31, 107.03, 53.94], dtype=np.float64)
+
     def __init__(self, n_estimators: int = 200, max_depth: int = 14, random_state: int = 42):
         self.reg = RandomForestRegressor(
             n_estimators=n_estimators,
@@ -233,9 +242,58 @@ class StereoEnergyRegressor:
         )
         self.is_fitted = False
 
+    @classmethod
+    def _augment_features(cls, X: np.ndarray) -> np.ndarray:
+        """Append wobble-invariant stereoscopic parallax (1/D_max) and depth-corrected
+        calorimetric size features when standard 65-dim stereo features are provided.
+        """
+        X_arr = np.asarray(X, dtype=np.float32)
+        if X_arr.ndim != 2 or X_arr.shape[1] < 65:
+            return X_arr
+
+        N = X_arr.shape[0]
+        extra = np.zeros((N, 5), dtype=np.float32)
+
+        for i in range(N):
+            row = X_arr[i]
+            zen_rad = np.radians(float(row[59]) if row[59] > 0 else 30.0)
+            azi_rad = np.radians(float(row[60]))
+            tu = (cls._TEL_X * np.cos(azi_rad) + cls._TEL_Y * np.sin(azi_rad)) * np.cos(zen_rad)
+            tv = -cls._TEL_X * np.sin(azi_rad) + cls._TEL_Y * np.cos(azi_rad)
+
+            cxs, cys, tus, tvs, ws, rts = [], [], [], [], [], []
+            for t in range(4):
+                if row[t * 13] > 0.0:
+                    sz = max(10.0 ** float(row[t * 13 + 1]) - 1.0, 1.0)
+                    cxs.append(np.radians(float(row[t * 13 + 2])))
+                    cys.append(np.radians(float(row[t * 13 + 3])))
+                    tus.append(tu[t])
+                    tvs.append(tv[t])
+                    ws.append(sz)
+                    rts.append(float(row[61 + t]))
+
+            if len(ws) >= 2:
+                cxs_a, cys_a = np.array(cxs), np.array(cys)
+                tus_a, tvs_a = np.array(tus), np.array(tvs)
+                ws_a, rts_a = np.array(ws), np.array(rts)
+                du = tus_a - np.average(tus_a, weights=ws_a)
+                dv = tvs_a - np.average(tvs_a, weights=ws_a)
+                dcx = cxs_a - np.average(cxs_a, weights=ws_a)
+                dcy = cys_a - np.average(cys_a, weights=ws_a)
+                denom = max(float(np.sum(ws_a * (du ** 2 + dv ** 2))), 1e-6)
+                slope = float(np.sum(ws_a * (du * dcx + dv * dcy))) / denom
+                c_spread = float(np.sqrt(np.average(dcx ** 2 + dcy ** 2, weights=ws_a)))
+                log_slope = float(np.log10(max(abs(slope), 1e-6)))
+                mean_r = float(np.average(rts_a, weights=ws_a))
+                # Inverse-square emission-distance-corrected log10(size)
+                depth_corr_log_sz = float(row[53]) - 1.85 * log_slope
+                extra[i] = [slope, c_spread, log_slope, mean_r, depth_corr_log_sz]
+
+        return np.hstack([X_arr, extra])
+
     def fit(self, X: np.ndarray, y_log10_energy: np.ndarray):
         """Fit regressor on stereo feature matrix X predicting log10(E/GeV)."""
-        self.reg.fit(X, y_log10_energy)
+        self.reg.fit(self._augment_features(X), y_log10_energy)
         self.is_fitted = True
         return self
 
@@ -243,5 +301,5 @@ class StereoEnergyRegressor:
         """Predict reconstructed log10(E/GeV)."""
         if not self.is_fitted:
             raise RuntimeError("Regressor is not fitted yet.")
-        return self.reg.predict(X)
+        return self.reg.predict(self._augment_features(X))
 

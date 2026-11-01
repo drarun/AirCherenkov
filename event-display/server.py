@@ -21,18 +21,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'viewer_test', 'raw_fixed')
+# Allow data path to be passed via CLI argument or environment variable
+cli_data_path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
+env_data_path = os.environ.get('DATA_PATH') or os.environ.get('DATA_DIR')
+data_target = cli_data_path or env_data_path
+
+if not data_target:
+    default_gammas = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'test_100_gammas_clean')
+    default_viewer = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'viewer_test', 'raw_fixed')
+    if os.path.exists(default_gammas) and glob.glob(os.path.join(default_gammas, '*.pt')):
+        data_target = default_gammas
+    else:
+        data_target = default_viewer
+
 cam = Camera(n_rings=12)
 pixel_x = cam.pixel_x.tolist()
 pixel_y = cam.pixel_y.tolist()
 
 events = []
-file_list = glob.glob(os.path.join(DATA_DIR, '*.pt'))
+if os.path.isfile(data_target) and data_target.endswith('.pt'):
+    file_list = [data_target]
+else:
+    file_list = glob.glob(os.path.join(data_target, '*.pt'))
+
 if file_list:
     file_list.sort()
     print(f"Loading data from {file_list[0]}...")
     events = torch.load(file_list[0], weights_only=False)
     print(f"Loaded {len(events)} events.")
+else:
+    print(f"Warning: No .pt files found in {data_target}")
 
 @app.get("/api/config")
 def get_config():

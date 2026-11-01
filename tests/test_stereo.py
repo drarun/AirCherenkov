@@ -128,6 +128,18 @@ class TestMLStereoFeatures:
         for idx in (1, 5, 6, 10, 57, 58, 61):  # size, length, width, asym, core, impact
             assert mask[idx]
 
+    def test_gain_flags_restore_low_gain_in_stereo_features(self):
+        cam = Camera(n_rings=12)
+        array = TelescopeArray.veritas_array()
+        traces = np.zeros((4, cam.n_pixels, 16), dtype=np.float32)
+        gains = np.zeros((4, cam.n_pixels), dtype=np.float32)
+        # Put 4 bright adjacent pixels in telescope 0 in low-gain mode (attenuated 10x)
+        traces[0, :4, 8] = 30.0
+        gains[0, :4] = 1.0
+        feat_unrestored = extract_stereo_features(traces, array.telescopes, cam)
+        feat_restored = extract_stereo_features(traces, array.telescopes, cam, gain_flags=gains)
+        assert feat_restored[1] > feat_unrestored[1] + 0.8  # ~10x larger size -> +1.0 in log10(size)
+
     @pytest.mark.skipif(
         not __import__('os').path.exists('data/stereo_eval_v2/sim_batch_00000.pt'),
         reason="requires stereo_eval_v2 simulation data")

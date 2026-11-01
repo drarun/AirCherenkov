@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from sim.camera import Camera
+from sim.fadc import restore_low_gain_traces
 from recon.hillas import compute_hillas, HillasParameters
 
 
@@ -94,6 +95,7 @@ def reconstruct_event_geometric(
     z_obs: float = 1275.0,
     min_size: float = 50.0,
     max_wl_ratio: float = 0.85,
+    gain_flags: Optional[np.ndarray] = None,
 ) -> Optional[StereoReconstructionResult]:
     """Reconstruct shower direction and ground impact core geometrically using SDP intersection.
     
@@ -121,6 +123,8 @@ def reconstruct_event_geometric(
 
     for t_idx in range(n_tel):
         trace = fadc_traces[t_idx]
+        if gain_flags is not None:
+            trace = restore_low_gain_traces(trace, gain_flags[t_idx])
         raw_charge = np.sum(trace, axis=-1)
         c_clean, mask = tailcut_clean(raw_charge, camera)
 

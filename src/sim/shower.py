@@ -14,6 +14,22 @@ def mean_free_path(z: torch.Tensor, X_length: float) -> torch.Tensor:
     return X_length / (rho * 100.0)
 
 @torch.jit.script
+def arclength_from_grammage(z: torch.Tensor, pz: torch.Tensor, delta_x_gcm2: torch.Tensor) -> torch.Tensor:
+    """Convert slant grammage delta_x (g/cm^2) to geometric arclength (m)
+    in an exponential atmosphere rho(z) = rho0 * exp(-z / H), matching
+    CORSIKA 8's ExponentialAtmosphere::getArclengthFromGrammage.
+    """
+    H = 7640.0
+    rho_m = atmospheric_density(z) * 100.0  # g/cm^2 per meter
+    neg_pz = -pz
+    horiz = torch.abs(neg_pz) < 1e-5
+    safe_neg_pz = torch.where(horiz, torch.ones_like(neg_pz), neg_pz)
+    arg = torch.clamp(1.0 + (safe_neg_pz * delta_x_gcm2) / torch.clamp(H * rho_m, min=1e-12), min=1e-6)
+    dist_slanted = (H / safe_neg_pz) * torch.log(arg)
+    dist_horiz = delta_x_gcm2 / torch.clamp(rho_m, min=1e-12)
+    return torch.clamp(torch.where(horiz, dist_horiz, dist_slanted), min=0.0)
+
+@torch.jit.script
 def norm_dir(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor):
     norm = torch.sqrt(px**2 + py**2 + pz**2)
     safe = norm > 0
@@ -22,10 +38,11 @@ def norm_dir(px: torch.Tensor, py: torch.Tensor, pz: torch.Tensor):
             torch.where(safe, pz/norm, pz))
 
 class ShowerSimulation:
-    def __init__(self, primary_types=['gamma'], energies=[1000.0], z_starts=[20000.0],
+    def __init__(self, primary_types=['gamma'], energies=[1000.0], z_starts=[50000.0],
                  site="VERITAS", x_init=0.0, y_init=0.0, px_init=0.0, py_init=0.0, pz_init=-1.0, dtype=torch.float32):
         """
-        A 3D toy Monte Carlo using fully tensorized PyTorch operations.
+        A 3D Monte Carlo air-shower simulation using batched PyTorch tensor operations
+        with CORSIKA-aligned exponential-atmosphere slant-grammage transport.
         Supports batch processing of multiple independent showers.
         
         Parameters
@@ -85,7 +102,7 @@ class ShowerSimulation:
             
         batch_size = len(primary_types)
         
-        # Pre-allocate Entropy Pool (50 Million random numbers in bfloat16) to avoid random overhead in loop
+        # Pre-allocate Entropy Pool (50 Million random numbers) to avoid random overhead in loop
         self.entropy_pool = torch.rand(50_000_000, device=self.device, dtype=self.dtype)
         self.entropy_idx = 0
         
@@ -118,6 +135,7 @@ class ShowerSimulation:
         
         # Output dictionary mapping event_id to its Cherenkov photons
         self.cherenkov_photons_by_event = {i: {'x_ground': np.array([]), 'y_ground': np.array([])} for i in range(batch_size)}
+
     def _get_rand(self, size):
         """Consume random numbers from the pre-allocated entropy pool."""
         if self.entropy_idx + size > self.entropy_pool.numel():
@@ -127,6 +145,7 @@ class ShowerSimulation:
         out = self.entropy_pool[self.entropy_idx:self.entropy_idx + size]
         self.entropy_idx += size
         return out
+
     def step(self):
         """Advance the simulation by one generation using batched tensor ops."""
         if self.active.shape[0] == 0:
@@ -149,22 +168,40 @@ class ShowerSimulation:
         evt = p[:, 9]
         N = p.shape[0]
         dist = torch.zeros(N, device=self.device, dtype=self.dtype)
+        delta_x = torch.zeros(N, device=self.device, dtype=self.dtype)
         
-        # Mean free paths
+        # Particle type masks
         mask_gamma = (pid == 0)
         mask_e = (pid == 1) | (pid == 2)
         mask_had = (pid == 3) | (pid == 4)
         mask_pi0 = (pid == 5)
         mask_mu = (pid == 6)
+        mask_ion = mask_e | mask_had
         
-        # Pair production MFP = (9/7) * X0;  Bremsstrahlung MFP = X0
+        # Sample slant interaction grammage delta_x (g/cm^2)
+        # Pair production MFP = (9/7) * X0; Bremsstrahlung half-energy step = X0 * ln(2)
         X0_air = 36.62  # radiation length in air (g/cm^2)
+        X_brems = X0_air * 0.69314718  # X0 * ln(2) = 25.383 g/cm^2
         if mask_gamma.any():
-            dist[mask_gamma] = torch.empty(mask_gamma.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_gamma], X0_air * 9.0 / 7.0)
+            delta_x[mask_gamma] = torch.empty(mask_gamma.sum(), device=self.device, dtype=self.dtype).exponential_() * (X0_air * 9.0 / 7.0)
         if mask_e.any():
-            dist[mask_e] = torch.empty(mask_e.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_e], X0_air)
+            delta_x[mask_e] = torch.empty(mask_e.sum(), device=self.device, dtype=self.dtype).exponential_() * X_brems
         if mask_had.any():
-            dist[mask_had] = torch.empty(mask_had.sum(), device=self.device, dtype=self.dtype).exponential_() * mean_free_path(z[mask_had], 90.0)
+            delta_x[mask_had] = torch.empty(mask_had.sum(), device=self.device, dtype=self.dtype).exponential_() * 90.0
+
+        # Cap charged-particle step grammage at ionization range to critical energy
+        # (matches CORSIKA 8 ContinuousProcess::getMaxStepLength)
+        alpha_ion = 0.0021  # GeV / (g/cm^2)
+        if mask_ion.any():
+            max_ion_x = torch.clamp((E[mask_ion] - self.critical_energy) / alpha_ion, min=0.0) + 1e-4
+            delta_x[mask_ion] = torch.minimum(delta_x[mask_ion], max_ion_x)
+
+        # Convert slant grammage to geometric arclength integrating exponential atmosphere
+        mask_grammage = mask_gamma | mask_e | mask_had
+        if mask_grammage.any():
+            dist[mask_grammage] = arclength_from_grammage(
+                z[mask_grammage], pz[mask_grammage], delta_x[mask_grammage]
+            )
         if mask_pi0.any():
             dist[mask_pi0] = 10.0
         if mask_mu.any():
@@ -174,23 +211,20 @@ class ShowerSimulation:
         py_eff = py.clone()
         pz_eff = pz.clone()
 
-        # Highland Scattering
-        mask_e = (pid == 1) | (pid == 2)
+        # Highland Multiple Coulomb Scattering using exact traversed grammage
         if mask_e.any():
-            z_e = z[mask_e]
-            dist_e = dist[mask_e]
             E_e = E[mask_e]
-            x_gcm2 = dist_e * atmospheric_density(z_e) * 100.0
+            x_gcm2 = delta_x[mask_e]
             
-            valid_scatter = x_gcm2 > 0
+            valid_scatter = x_gcm2 > 1e-6
             if valid_scatter.any():
                 idx_scatter = mask_e.nonzero(as_tuple=True)[0][valid_scatter]
                 x_g = x_gcm2[valid_scatter]
                 Ee = E_e[valid_scatter]
                 
-                # theta_0 = (13.6 MeV / p c) * sqrt(x/X0)
-                # E_e is in GeV, so 13.6 MeV = 0.0136 GeV
-                theta_rms = (0.0136 / Ee) * torch.sqrt(x_g / X0_air) * (1 + 0.038 * torch.log(x_g / X0_air))
+                # theta_0 = (13.6 MeV / p c) * sqrt(x/X0) * (1 + 0.038 * ln(x/X0))
+                ratio_x0 = torch.clamp(x_g / X0_air, min=1e-4)
+                theta_rms = (0.0136 / Ee) * torch.sqrt(ratio_x0) * torch.clamp(1.0 + 0.038 * torch.log(ratio_x0), min=0.5)
                 theta_rms = torch.clamp(theta_rms, min=0.0, max=0.3)
                 
                 theta1 = torch.normal(mean=0.0, std=theta_rms)
@@ -284,31 +318,41 @@ class ShowerSimulation:
             py_eff[c_idx] = py_eff_ny.to(self.dtype)
             pz_eff[c_idx] = pz_eff_nz.to(self.dtype)
 
-        x_new = x + px_eff * dist
-        y_new = y + py_eff * dist
-        z_new = z + pz_eff * dist
-        
-        # Ray Trace Cherenkov Segments (only above observatory altitude)
+        z_raw = z + pz_eff * dist
+
+        # Clip steps crossing the observation plane z_obs instead of discarding them
         z_obs = 1275.0
-        valid_z = (z_new > z_obs) & (z > z_obs)
-        c_mask = mask_e & valid_z
+        f_clip = torch.where(
+            z_raw < z_obs,
+            (z - z_obs) / torch.clamp(z - z_raw, min=1e-6),
+            torch.ones_like(dist)
+        )
+        f_clip = torch.clamp(f_clip, min=0.0, max=1.0)
+        dist_clipped = dist * f_clip
+        delta_x_clipped = delta_x * f_clip
+
+        x_new = x + px_eff * dist_clipped
+        y_new = y + py_eff * dist_clipped
+        z_new = z + pz_eff * dist_clipped
+        
+        # Ray Trace Cherenkov Segments (all electron segments above observatory altitude)
+        c_mask = mask_e & (z > z_obs) & (dist_clipped > 1e-3)
         if c_mask.any():
+            E_mid = torch.clamp(E[c_mask] - 0.5 * alpha_ion * delta_x_clipped[c_mask], min=self.critical_energy)
             self.c_segs_start.append(torch.stack([x[c_mask], y[c_mask], z[c_mask]], dim=1))
             self.c_segs_end.append(torch.stack([x_new[c_mask], y_new[c_mask], z_new[c_mask]], dim=1))
             self.c_segs_p.append(torch.stack([px_eff[c_mask], py_eff[c_mask], pz_eff[c_mask]], dim=1))
-            self.c_segs_E.append(E[c_mask])
+            self.c_segs_E.append(E_mid)
             self.c_segs_event_id.append(evt[c_mask])
             
         z_new = torch.clamp(z_new, min=z_obs)
         
-        # Ionization
-        mask_ion = mask_e | (pid == 3) | (pid == 4)
+        # Continuous ionization energy loss using exact traversed grammage
         if mask_ion.any():
-            x_gcm2 = dist[mask_ion] * atmospheric_density(z_new[mask_ion]) * 100.0
-            E[mask_ion] -= 0.0021 * x_gcm2
+            E[mask_ion] -= alpha_ion * delta_x_clipped[mask_ion]
             
-        # Re-filter alive
-        alive = (E >= self.critical_energy) & (z_new > z_obs)
+        # Re-filter alive particles that did not hit ground or range out below critical energy
+        alive = (E >= self.critical_energy) & (z_raw > z_obs)
         idx_alive = alive.nonzero(as_tuple=True)[0]
         new_particles = []
         
@@ -446,7 +490,7 @@ class ShowerSimulation:
         self.photon_yield_factor = state['photon_yield_factor']
 
         
-    def run(self, max_generations=12, verbose=True):
+    def run(self, max_generations=30, verbose=True):
         t0 = time.time()
         for gen in range(max_generations):
             if self.active.shape[0] == 0:
@@ -521,4 +565,4 @@ class ShowerSimulation:
 
 if __name__ == "__main__":
     sim = ShowerSimulation(['gamma', 'proton'], energies=[100.0, 500.0])
-    sim.run(max_generations=12)
+    sim.run(max_generations=30)

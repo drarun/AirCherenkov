@@ -852,7 +852,7 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             telescope_index, local_packet_index = torch.nonzero(
                 mirror_hit, as_tuple=True
             )
-            print(f"mirror hits: {telescope_index.numel()}")
+
             if telescope_index.numel() == 0:
                 continue
 
