@@ -17,6 +17,10 @@ class HillasParameters:
     alpha: float
     asymmetry: float
     third_moment: float = 0.0
+    time_gradient: float = 0.0
+    time_rms: float = 0.0
+    loss1: float = 0.0
+    loss2: float = 0.0
 
     @property
     def skewness(self) -> float:

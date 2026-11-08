@@ -7,7 +7,7 @@ Features:
   • CUDA OOM catch-and-recover (skips offending batch, clears cache)
   • Graceful shutdown on SIGINT / SIGTERM (saves emergency checkpoint)
   • Per-epoch memory cleanup (gc + torch.cuda.empty_cache)
-  • Capped E^2 spectrum weights to flatten the power-law without gradient explosion
+  • Heteroscedastic Gaussian NLL + Smooth-L1 (Huber) energy loss for outlier robustness
 """
 
 import os
@@ -44,7 +44,6 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_val_l
         'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }
     tag = " [EMERGENCY]" if is_emergency else ""
-    # Atomic write: write to tmp then rename so a crash mid-write can't corrupt
     tmp_path = path + ".tmp"
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, path)
@@ -96,7 +95,6 @@ def train_networks():
                         help="Path to model weights to initialize from (fine-tuning)")
     args = parser.parse_args()
 
-    # Derived paths
     checkpoint_path = args.model_path.replace(".pt", "_checkpoint.pt")
     best_model_path = args.model_path
 
@@ -144,8 +142,6 @@ def train_networks():
     n_bins = 10
     energy_bins = torch.clamp(((train_energies - 1.8) / (4.5 - 1.8) * n_bins).long(), min=0, max=n_bins - 1)
 
-    # Sqrt-inverse weighting: moderate upsampling of rare events (~9x at 30 TeV)
-    # instead of flat 1/N weighting (which caused 50x oversampling and memorization)
     gamma_mask = (train_classes == 1)
     gamma_bins = energy_bins[gamma_mask]
     gamma_counts = torch.bincount(gamma_bins, minlength=n_bins).float().clamp(min=1.0)
@@ -165,9 +161,9 @@ def train_networks():
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_idx), replacement=True)
 
     train_loader = DataLoader(train_data, batch_size=args.batch_size, sampler=sampler,
-                              num_workers=0, pin_memory=torch.cuda.is_available())
+                              num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
-                            num_workers=0, pin_memory=torch.cuda.is_available())
+                            num_workers=0, pin_memory=False)
 
     # ------------------------------------------------------------------
     # Model, optimizer, scheduler, loss, AMP Scaler
@@ -179,22 +175,19 @@ def train_networks():
         
     model = SpatiotemporalGNN().to(device)
 
-    # Load pre-trained weights for fine-tuning (before optimizer/scheduler init)
     if args.finetune_from and os.path.exists(args.finetune_from):
         print(f"  >> Loading pre-trained weights from: {args.finetune_from}")
         pretrained = torch.load(args.finetune_from, map_location=device, weights_only=True)
-        model.load_state_dict(pretrained)
-        print(f"     Loaded successfully. Fine-tuning with lower LR.")
+        model.load_state_dict(pretrained, strict=False)
+        print("     Loaded successfully.")
 
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=4)
+        optimizer, mode='min', factor=0.5, patience=3)
 
-    # Automatic Mixed Precision (AMP) GradScaler for 2x faster GPU training
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    criterion_energy = nn.MSELoss(reduction='none')
     criterion_class = nn.BCEWithLogitsLoss()
 
     # ------------------------------------------------------------------
@@ -216,14 +209,13 @@ def train_networks():
     # ------------------------------------------------------------------
     # Graceful shutdown handler
     # ------------------------------------------------------------------
-    shutdown_requested = [False]   # mutable flag for the closure
+    shutdown_requested = [False]
 
     def handle_shutdown(signum, frame):
         sig_name = signal.Signals(signum).name
         print(f"\n[SHUTDOWN] Received {sig_name}. Saving emergency checkpoint...")
         save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler,
                         max(start_epoch, 0), best_val_loss, is_emergency=True)
-        # Also save the raw model weights so we always have a usable artifact
         torch.save(model.state_dict(),
                     args.model_path.replace(".pt", "_emergency.pt"))
         shutdown_requested[0] = True
@@ -250,27 +242,28 @@ def train_networks():
                 batch = batch.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
 
-                # AMP Autocast forward pass
                 with torch.amp.autocast('cuda', enabled=use_amp):
-                    # 1. Forward pass
-                    class_logits, energy_pred = model(
-                        batch.x, batch.edge_index, batch.batch)
+                    class_logits, energy_pred, energy_logvar = model(
+                        batch.x, batch.edge_index, batch.batch, return_uncertainty=True)
 
-                    # 2. Classification loss (all events)
                     loss_c = criterion_class(
                         class_logits.view(-1), batch.y_class.view(-1))
 
-                    # 3. Energy loss (gamma events only)
                     gamma_mask = (batch.y_class.view(-1) == 1.0)
                     if gamma_mask.any():
                         y_true = batch.y_energy.view(-1)[gamma_mask]
                         y_pred = energy_pred.view(-1)[gamma_mask]
-                        loss_e = criterion_energy(y_pred, y_true).mean()
+                        log_var = energy_logvar.view(-1)[gamma_mask]
+
+                        sq_err = (y_pred - y_true) ** 2
+                        nll_e = 0.5 * torch.exp(-log_var) * sq_err + 0.5 * log_var
+                        huber_e = nn.functional.smooth_l1_loss(
+                            y_pred, y_true, reduction='none', beta=0.12)
+                        loss_e = (0.25 * nll_e + 2.0 * huber_e).mean()
                         loss = loss_c + 5.0 * loss_e
                     else:
                         loss = loss_c
 
-                # Scaled backward pass & unscaling clip
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
@@ -286,12 +279,9 @@ def train_networks():
                     print(f"\n  [OOM] Batch {batch_idx + 1} caused CUDA OOM "
                           f"(total OOMs: {oom_count}). Skipping...")
                     optimizer.zero_grad(set_to_none=True)
-                    # Aggressively free everything by dropping references explicitly
-                    batch = class_logits = energy_pred = loss = loss_c = loss_e = None
-                    per_event_loss = energy_weights = y_true = y_pred = None
+                    batch = class_logits = energy_pred = energy_logvar = loss = loss_c = loss_e = None
+                    y_true = y_pred = log_var = None
                     
-                    # If OOM happened after unscale_() but before step(), clear the scaler state
-                    # to prevent a RuntimeError on the next batch.
                     if hasattr(scaler, '_per_optimizer_states'):
                         scaler._per_optimizer_states.clear()
                         
@@ -299,7 +289,7 @@ def train_networks():
                     gc.collect()
                     continue
                 else:
-                    raise  # re-raise non-OOM RuntimeErrors
+                    raise
 
             if (batch_idx + 1) % 200 == 0:
                 print(f"  Batch {batch_idx + 1}/{len(train_loader)} "
@@ -323,10 +313,11 @@ def train_networks():
                         class_logits.view(-1), data.y_class.view(-1))
                     gamma_mask = (data.y_class.view(-1) == 1.0)
                     if gamma_mask.any():
-                        loss_e = criterion_energy(
+                        huber_e = nn.functional.smooth_l1_loss(
                             energy_pred.view(-1)[gamma_mask],
-                            data.y_energy.view(-1)[gamma_mask]).mean()
-                        loss = loss_c + 5.0 * loss_e
+                            data.y_energy.view(-1)[gamma_mask],
+                            beta=0.12)
+                        loss = loss_c + 10.0 * huber_e
                     else:
                         loss = loss_c
                 val_loss += loss.item() * data.num_graphs
@@ -349,13 +340,9 @@ def train_networks():
             os.makedirs(os.path.dirname(best_model_path) or '.', exist_ok=True)
             torch.save(model.state_dict(), best_model_path)
 
-        # Full stateful checkpoint every epoch (atomic write)
         save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler,
                         epoch, best_val_loss)
 
-        # ------------------------------------------------------------------
-        # Per-epoch memory cleanup
-        # ------------------------------------------------------------------
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

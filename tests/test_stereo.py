@@ -184,3 +184,27 @@ class TestMLStereoReconstructor:
         p_imp, p_dir = model.predict(X)
         assert p_imp.shape == (N, 2)
         assert p_dir.shape == (N, 2)
+
+
+    def test_extended_stereo_features_and_gnn_uncertainty(self):
+        import torch
+        from recon.gnn import SpatiotemporalGNN
+
+        cam = Camera(n_rings=12, pixel_size=0.15)
+        array = TelescopeArray.veritas_array()
+        traces = np.zeros((4, cam.n_pixels, 16), dtype=np.float32)
+        feat_ext = extract_stereo_features(
+            traces, array.telescopes, cam, include_extended=True
+        )
+        assert len(feat_ext) == 85
+
+        model = SpatiotemporalGNN()
+        model.eval()
+        batch_idx = torch.zeros(cam.n_pixels, dtype=torch.long)
+        x37 = torch.zeros((cam.n_pixels, 37), dtype=torch.float32)
+        c_out, e_out, e_logvar = model(
+            x37, cam.edge_index, batch_idx, return_uncertainty=True
+        )
+        assert c_out.shape == (1, 1)
+        assert e_out.shape == (1, 1)
+        assert e_logvar.shape == (1, 1)

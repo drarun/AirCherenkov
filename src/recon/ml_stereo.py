@@ -1,8 +1,9 @@
 """
 Machine Learning Stereoscopic Reconstructor.
-Extracts telescope and array-level stereoscopic features and trains multivariate
-regressors (Random Forest) to reconstruct shower arrival direction
-and core impact position.
+Extracts telescope and array-level stereoscopic features (using VERITAS DoublePass
+FADC trace integration, linear arrival-time gradient, and camera-edge leakage)
+and trains multivariate regressors/classifiers for shower arrival direction,
+core impact position, primary energy, and gamma/hadron separation.
 """
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -10,7 +11,8 @@ from sklearn.ensemble import RandomForestRegressor
 
 from sim.camera import Camera
 from sim.fadc import restore_low_gain_traces
-from recon.stereo import reconstruct_event_geometric, tailcut_clean, cam_to_sky_vector
+from recon.cleaning import double_pass_fadc_clean
+from recon.stereo import reconstruct_event_geometric, cam_to_sky_vector
 from recon.hillas import compute_hillas
 
 
@@ -22,11 +24,12 @@ def extract_stereo_features(
     pointing_azimuth_deg: float = 0.0,
     z_obs: float = 1275.0,
     gain_flags: Optional[np.ndarray] = None,
+    include_extended: bool = False,
 ) -> np.ndarray:
     """Extract a fixed-size feature vector for an event across all telescopes.
 
-    Feature vector structure (total length: 4 * 13 + 9 = 61 features):
-      For each of 4 telescopes (13 features each):
+    Base feature vector structure (65 features):
+      For each of 4 telescopes (13 features each, indices 0..51):
         0:  triggered (0 or 1)
         1:  log10(1 + size)
         2:  centroid_x (deg)
@@ -40,7 +43,7 @@ def extract_stereo_features(
         10: asymmetry (skewness)  — breaks head/tail degeneracy
         11: miss (deg)  — perpendicular distance from camera center to major axis
         12: alpha (deg) — angle between image major axis and source direction
-      Array-level summary (9 features):
+      Array-level summary (9 features, indices 52..60):
         52: number of triggered telescopes
         53: total array log10 size
         54: center-of-gravity X on ground (m)
@@ -50,11 +53,20 @@ def extract_stereo_features(
         58: geometric reco impact Y (m)
         59: geometric reco zenith (deg)
         60: geometric reco azimuth (deg)
-      Per-telescope shower-frame impact distance (4 features):
+      Per-telescope shower-frame impact distance (4 features, indices 61..64):
         61-64: perpendicular distance from telescope t to the reconstructed shower axis (m)
+
+    Extended DoublePass timing & leakage features (when ``include_extended=True``, +20 = 85 features):
+      For each of 4 telescopes (5 features each, indices 65..84):
+        0: loss1 (outermost camera ring charge fraction)
+        1: loss2 (outer two camera rings charge fraction)
+        2: time_gradient (linear arrival-time slope along major axis, ns/deg)
+        3: time_rms (arrival-time fit RMS residual, ns)
+        4: log10(1 + n_clean_pixels)
     """
     n_tel = len(telescopes)
     feat_tel = []
+    ext_tel = []
 
     tot_size = 0.0
     cog_x_num = 0.0
@@ -66,13 +78,16 @@ def extract_stereo_features(
             trace = fadc_traces[t_idx]
             if gain_flags is not None:
                 trace = restore_low_gain_traces(trace, gain_flags[t_idx])
-            raw_charge = np.sum(trace, axis=-1)
-            c_clean, mask = tailcut_clean(raw_charge, camera)
-            h = compute_hillas(camera, c_clean, mask) if np.sum(mask) >= 3 else None
+            dp = double_pass_fadc_clean(trace, camera)
+            c_clean, mask = dp.charges, dp.mask
+            n_pix = int(np.count_nonzero(mask))
+            h = compute_hillas(camera, c_clean, mask) if n_pix >= 3 else None
         else:
+            dp = None
+            n_pix = 0
             h = None
 
-        if h is not None and h.size > 20.0:
+        if h is not None and h.size > 20.0 and dp is not None:
             sz = float(h.size)
             cx, cy = float(h.centroid_x), float(h.centroid_y)
             dist = float(np.hypot(cx, cy))
@@ -87,12 +102,22 @@ def extract_stereo_features(
 
             feat_tel.extend([1.0, np.log10(1.0 + sz), cx, cy, dist, l, w, wl,
                              cos2psi, sin2psi, asym, miss, alpha])
+            ext_tel.extend([
+                float(dp.loss1),
+                float(dp.loss2),
+                float(dp.time_gradient),
+                float(dp.time_rms),
+                float(np.log10(1.0 + n_pix)),
+            ])
+            # Weight ground CoG by containment so edge-clipped images don't bias fallback core
+            w_cog = sz * max(0.1, 1.0 - 0.75 * float(dp.loss1))
             tot_size += sz
-            cog_x_num += sz * telescopes[t_idx].x_tel
-            cog_y_num += sz * telescopes[t_idx].y_tel
-            cog_denom += sz
+            cog_x_num += w_cog * telescopes[t_idx].x_tel
+            cog_y_num += w_cog * telescopes[t_idx].y_tel
+            cog_denom += w_cog
         else:
             feat_tel.extend([0.0] * 13)
+            ext_tel.extend([0.0] * 5)
 
     # Array summary
     cog_x = cog_x_num / max(cog_denom, 1e-6)
@@ -132,7 +157,10 @@ def extract_stereo_features(
     n_trig = sum(feat_tel[t * 13] for t in range(4))
     array_feats = [n_trig, np.log10(1.0 + tot_size), cog_x, cog_y] + geom_feats
 
-    return np.array(feat_tel + array_feats + impact_feats, dtype=np.float32)
+    base_vec = feat_tel + array_feats + impact_feats
+    if include_extended:
+        return np.array(base_vec + ext_tel, dtype=np.float32)
+    return np.array(base_vec, dtype=np.float32)
 
 
 # Feature indices that encode absolute arrival direction / source position in the camera.
@@ -144,12 +172,14 @@ GH_EXCLUDED_FEATURES = tuple(
     t * 13 + j for t in range(4) for j in _PER_TEL_DIRECTIONAL
 ) + (59, 60)  # geometric reco zenith / azimuth
 N_STEREO_FEATURES = 65
+N_EXTENDED_STEREO_FEATURES = 85
 
 
 def gh_feature_mask(n_features: int = N_STEREO_FEATURES) -> np.ndarray:
     """Boolean column mask selecting direction-agnostic features for gamma/hadron separation."""
     mask = np.ones(n_features, dtype=bool)
-    mask[list(GH_EXCLUDED_FEATURES)] = False
+    valid_excluded = [idx for idx in GH_EXCLUDED_FEATURES if idx < n_features]
+    mask[valid_excluded] = False
     return mask
 
 
@@ -172,7 +202,7 @@ class MLStereoReconstructor:
         """Fit models on feature matrix X.
 
         Args:
-            X: Feature matrix of shape (N, 61).
+            X: Feature matrix of shape (N, D).
             y_impact: Target array of shape (N, 2) containing [impact_x, impact_y] (meters).
             y_direction: Target array of shape (N, 2) containing [zenith_deg, azimuth_deg] (degrees).
         """
@@ -244,15 +274,16 @@ class StereoEnergyRegressor:
 
     @classmethod
     def _augment_features(cls, X: np.ndarray) -> np.ndarray:
-        """Append wobble-invariant stereoscopic parallax (1/D_max) and depth-corrected
-        calorimetric size features when standard 65-dim stereo features are provided.
+        """Append wobble-invariant stereoscopic parallax (1/D_max), camera-edge leakage
+        compensation, arrival-time gradient summary, and depth-corrected calorimetric size.
         """
         X_arr = np.asarray(X, dtype=np.float32)
         if X_arr.ndim != 2 or X_arr.shape[1] < 65:
             return X_arr
 
         N = X_arr.shape[0]
-        extra = np.zeros((N, 5), dtype=np.float32)
+        has_ext = X_arr.shape[1] >= 85
+        extra = np.zeros((N, 11), dtype=np.float32)
 
         for i in range(N):
             row = X_arr[i]
@@ -262,15 +293,40 @@ class StereoEnergyRegressor:
             tv = -cls._TEL_X * np.sin(azi_rad) + cls._TEL_Y * np.cos(azi_rad)
 
             cxs, cys, tus, tvs, ws, rts = [], [], [], [], [], []
+            loss1s, loss2s, tgrads, trmss, corr_sizes = [], [], [], [], []
+
             for t in range(4):
                 if row[t * 13] > 0.0:
                     sz = max(10.0 ** float(row[t * 13 + 1]) - 1.0, 1.0)
+                    dist = float(row[t * 13 + 4])
+                    length = float(row[t * 13 + 5])
+                    if has_ext:
+                        l1 = float(row[65 + t * 5 + 0])
+                        l2 = float(row[65 + t * 5 + 1])
+                        tg = float(row[65 + t * 5 + 2])
+                        tr = float(row[65 + t * 5 + 3])
+                    else:
+                        # Analytical radial edge leakage proxy when 65-dim vector is used
+                        edge_excess = dist + 1.2 * length - 1.55
+                        l1 = float(np.clip(edge_excess / max(1.5 * length, 0.15), 0.0, 1.0))
+                        l2 = float(np.clip((dist + 1.5 * length - 1.40) / max(1.5 * length, 0.15), 0.0, 1.0))
+                        tg = 0.0
+                        tr = 0.0
+
+                    # Containment weight favors telescopes with unclipped images
+                    w_contain = sz * (max(0.1, 1.0 - 0.85 * l1) ** 2)
                     cxs.append(np.radians(float(row[t * 13 + 2])))
                     cys.append(np.radians(float(row[t * 13 + 3])))
                     tus.append(tu[t])
                     tvs.append(tv[t])
-                    ws.append(sz)
+                    ws.append(w_contain)
                     rts.append(float(row[61 + t]))
+                    loss1s.append(l1)
+                    loss2s.append(l2)
+                    tgrads.append(tg)
+                    trmss.append(tr)
+                    # Compensate size for outer-ring truncation
+                    corr_sizes.append(sz / max(0.18, 1.0 - 0.85 * l2))
 
             if len(ws) >= 2:
                 cxs_a, cys_a = np.array(cxs), np.array(cys)
@@ -285,9 +341,24 @@ class StereoEnergyRegressor:
                 c_spread = float(np.sqrt(np.average(dcx ** 2 + dcy ** 2, weights=ws_a)))
                 log_slope = float(np.log10(max(abs(slope), 1e-6)))
                 mean_r = float(np.average(rts_a, weights=ws_a))
-                # Inverse-square emission-distance-corrected log10(size)
-                depth_corr_log_sz = float(row[53]) - 1.85 * log_slope
-                extra[i] = [slope, c_spread, log_slope, mean_r, depth_corr_log_sz]
+                min_r = float(np.min(rts_a))
+                mean_l1 = float(np.average(loss1s, weights=ws_a))
+                mean_l2 = float(np.average(loss2s, weights=ws_a))
+                mean_tg = float(np.average(np.abs(tgrads), weights=ws_a))
+                mean_tr = float(np.average(trmss, weights=ws_a))
+                log_corr_tot_sz = float(np.log10(1.0 + np.sum(corr_sizes)))
+                # Inverse-square emission-distance-corrected and leakage-compensated log10(size)
+                depth_corr_log_sz = log_corr_tot_sz - 1.85 * log_slope
+                extra[i] = [
+                    slope, c_spread, log_slope, mean_r, depth_corr_log_sz,
+                    min_r, mean_l1, mean_l2, mean_tg, mean_tr, log_corr_tot_sz
+                ]
+            elif len(ws) == 1:
+                log_corr_tot_sz = float(np.log10(1.0 + corr_sizes[0]))
+                extra[i] = [
+                    0.0, 0.0, -3.9, rts[0], log_corr_tot_sz,
+                    rts[0], loss1s[0], loss2s[0], abs(tgrads[0]), trmss[0], log_corr_tot_sz
+                ]
 
         return np.hstack([X_arr, extra])
 
@@ -302,4 +373,3 @@ class StereoEnergyRegressor:
         if not self.is_fitted:
             raise RuntimeError("Regressor is not fitted yet.")
         return self.reg.predict(self._augment_features(X))
-

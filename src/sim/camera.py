@@ -16,6 +16,9 @@ class Camera:
         self.pixel_x, self.pixel_y = self._generate_hex_grid()
         self.n_pixels = len(self.pixel_x)
         self._edge_index = None
+        self._neighbor_matrix = None
+        self._outer_ring1_mask = None
+        self._outer_ring2_mask = None
         
     def _generate_hex_grid(self):
         """Generates x and y coordinates for a hexagonal grid of pixels."""
@@ -43,12 +46,35 @@ class Camera:
         Returns:
             np.ndarray: Boolean matrix of shape (n_pixels, n_pixels) where True means pixels are adjacent.
         """
-        # Distance squared between all pairs of pixels
-        dist_sq = (self.pixel_x[:, None] - self.pixel_x[None, :])**2 + (self.pixel_y[:, None] - self.pixel_y[None, :])**2
-        # Hexagonal centers are exactly `self.pixel_size` apart
-        # We use 1.1 as a tolerance margin due to floating point math
-        is_neighbor = (dist_sq > 0) & (dist_sq < (self.pixel_size * 1.1)**2)
-        return is_neighbor
+        if (
+            self._neighbor_matrix is None
+            or self._neighbor_matrix.shape != (len(self.pixel_x), len(self.pixel_x))
+            or not np.all(np.isfinite(self.pixel_x))
+            or not np.all(np.isfinite(self.pixel_y))
+        ):
+            # Distance squared between all pairs of pixels
+            dist_sq = (self.pixel_x[:, None] - self.pixel_x[None, :])**2 + (self.pixel_y[:, None] - self.pixel_y[None, :])**2
+            # Hexagonal centers are exactly `self.pixel_size` apart
+            # We use 1.1 as a tolerance margin due to floating point math
+            self._neighbor_matrix = (dist_sq > 0) & (dist_sq < (self.pixel_size * 1.1)**2)
+        return self._neighbor_matrix
+
+    @property
+    def outer_ring1_mask(self):
+        """Boolean mask for pixels in the outermost hexagonal camera ring (degree < 6)."""
+        if self._outer_ring1_mask is None or len(self._outer_ring1_mask) != len(self.pixel_x):
+            adj = self.get_neighbor_matrix()
+            self._outer_ring1_mask = np.sum(adj, axis=1) < 6
+        return self._outer_ring1_mask
+
+    @property
+    def outer_ring2_mask(self):
+        """Boolean mask for pixels in the outermost two hexagonal camera rings."""
+        if self._outer_ring2_mask is None or len(self._outer_ring2_mask) != len(self.pixel_x):
+            adj = self.get_neighbor_matrix()
+            r1 = self.outer_ring1_mask
+            self._outer_ring2_mask = r1 | np.any(adj[:, r1], axis=1)
+        return self._outer_ring2_mask
         
     @property
     def edge_index(self):

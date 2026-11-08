@@ -135,3 +135,31 @@ def test_cleaning_rejects_invalid_parameters_and_geometry():
     camera.pixel_x[1] = np.nan
     with pytest.raises(ValueError, match="coordinates"):
         double_pass_clean(camera, np.full(3, 10.0))
+
+
+def test_double_pass_fadc_clean_recovers_time_gradient_and_faint_tail():
+    from recon.cleaning import double_pass_fadc_clean
+
+    camera = GraphCamera(
+        pixel_x=[0.1, 0.25, 0.4, 0.55, 0.7],
+        pixel_y=[0.0, 0.0, 0.0, 0.0, 0.0],
+        edges=[(0, 1), (1, 2), (2, 3), (3, 4)],
+        pixel_size=0.15,
+    )
+    # 5 pixels along +x axis with a linear arrival time gradient of +4 bins per step
+    # (bin_width = 2.0 ns -> +8 ns per 0.15 deg = +53.3 ns/deg -> clamped to +40 ns/deg,
+    # or let's use +1 bin = +2 ns per 0.15 deg = +13.33 ns/deg)
+    traces = np.zeros((5, 16), dtype=np.float32)
+    traces[0, 4] = 12.0
+    traces[1, 5] = 15.0
+    traces[2, 6] = 12.0
+    # Faint tail pixels at bins 7 and 8 (above Pass-2 threshold)
+    traces[3, 7] = 2.6
+    traces[4, 8] = 1.8
+
+    dp = double_pass_fadc_clean(traces, camera, nsb_rate=0.0)
+    assert np.all(dp.mask[:4])
+    assert dp.time_gradient == pytest.approx(2.0 / 0.15, rel=0.15)
+    assert dp.time_rms < 0.5
+    assert 0.0 <= dp.loss1 <= 1.0
+    assert dp.loss2 >= dp.loss1

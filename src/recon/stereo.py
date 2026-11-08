@@ -2,7 +2,8 @@
 Stereoscopic reconstruction of atmospheric Cherenkov showers.
 Implements the standard geometric Shower Detector Plane (SDP) intersection method
 (Hofmann et al. 1999, Astroparticle Physics 12, 135-152) for arrival direction
-and core impact position reconstruction.
+and core impact position reconstruction, using VERITAS-style DoublePass FADC
+trace integration and spatial-temporal image cleaning.
 """
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +11,7 @@ import numpy as np
 
 from sim.camera import Camera
 from sim.fadc import restore_low_gain_traces
+from recon.cleaning import double_pass_fadc_clean
 from recon.hillas import compute_hillas, HillasParameters
 
 
@@ -93,9 +95,10 @@ def reconstruct_event_geometric(
     pointing_zenith_deg: float = 30.0,
     pointing_azimuth_deg: float = 0.0,
     z_obs: float = 1275.0,
-    min_size: float = 50.0,
-    max_wl_ratio: float = 0.85,
+    min_size: float = 40.0,
+    max_wl_ratio: float = 0.88,
     gain_flags: Optional[np.ndarray] = None,
+    max_core_radius_m: float = 1200.0,
 ) -> Optional[StereoReconstructionResult]:
     """Reconstruct shower direction and ground impact core geometrically using SDP intersection.
     
@@ -108,6 +111,8 @@ def reconstruct_event_geometric(
         z_obs: Observatory ground plane altitude (meters).
         min_size: Minimum cleaned image size (PE) to include telescope.
         max_wl_ratio: Maximum width/length ratio (rejects near-circular images with ill-defined axes).
+        gain_flags: Optional low-gain channel flags (n_telescopes, n_pixels).
+        max_core_radius_m: Maximum allowed reconstructed core distance from array origin (meters).
         
     Returns:
         StereoReconstructionResult if >= 2 valid telescope images, else None.
@@ -125,15 +130,21 @@ def reconstruct_event_geometric(
         trace = fadc_traces[t_idx]
         if gain_flags is not None:
             trace = restore_low_gain_traces(trace, gain_flags[t_idx])
-        raw_charge = np.sum(trace, axis=-1)
-        c_clean, mask = tailcut_clean(raw_charge, camera)
 
-        if np.sum(mask) < 3:
+        dp = double_pass_fadc_clean(trace, camera)
+        c_clean, mask = dp.charges, dp.mask
+
+        if np.count_nonzero(mask) < 3:
             continue
 
         h = compute_hillas(camera, c_clean, mask)
         if h is None or h.size < min_size:
             continue
+
+        h.time_gradient = dp.time_gradient
+        h.time_rms = dp.time_rms
+        h.loss1 = dp.loss1
+        h.loss2 = dp.loss2
 
         wl = h.width / max(h.length, 1e-4)
         if wl > max_wl_ratio:
@@ -162,7 +173,8 @@ def reconstruct_event_geometric(
             'pos': tel_pos,
             'normal': normal,
             'size': h.size,
-            'wl': wl
+            'wl': wl,
+            'containment_weight': max(0.05, 1.0 - 0.75 * dp.loss1) ** 2,
         })
 
     if len(planes) < 2:
@@ -185,7 +197,14 @@ def reconstruct_event_geometric(
             if d[2] < 0:
                 d = -d  # Ensure upward pointing towards sky source
 
-            w = (sin_ang**2) / (1.0 / p_i['size'] + 1.0 / p_j['size']) * max(0.01, 1.0 - p_i['wl'])**2 * max(0.01, 1.0 - p_j['wl'])**2
+            w = (
+                (sin_ang ** 2)
+                / (1.0 / p_i['size'] + 1.0 / p_j['size'])
+                * max(0.01, 1.0 - p_i['wl']) ** 2
+                * max(0.01, 1.0 - p_j['wl']) ** 2
+                * p_i['containment_weight']
+                * p_j['containment_weight']
+            )
             dir_vectors.append(d * w)
             dir_weights.append(w)
 
@@ -199,8 +218,8 @@ def reconstruct_event_geometric(
             if abs(det) > 0.05:
                 try:
                     core_xy = np.linalg.solve(A, np.array([b_i, b_j]))
-                    if np.hypot(core_xy[0], core_xy[1]) < 350.0:  # within physical array bounds
-                        cw = w * (abs(det)**2)
+                    if np.hypot(core_xy[0], core_xy[1]) < max_core_radius_m:
+                        cw = w * (abs(det) ** 2)
                         core_points.append(core_xy)
                         core_weights.append(cw)
                 except np.linalg.LinAlgError:

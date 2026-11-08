@@ -1,6 +1,20 @@
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
 
 import numpy as np
+
+
+@dataclass
+class DoublePassResult:
+    """Result of VERITAS-style two-pass FADC trace integration and image cleaning."""
+    charges: np.ndarray
+    mask: np.ndarray
+    arrival_times_ns: np.ndarray
+    time_gradient: float
+    time_intercept: float
+    time_rms: float
+    loss1: float
+    loss2: float
 
 
 def _validated_image(image: Any) -> np.ndarray:
@@ -225,3 +239,227 @@ def double_pass_clean(
     )
 
     return _connected_to_seed(neighbors, eligible_pass2, mask_pass1)
+
+
+def compute_camera_leakage(
+    camera: Any, charges: np.ndarray, mask: np.ndarray
+) -> Tuple[float, float]:
+    """Compute outer-ring charge leakage fractions (loss1, loss2) for a cleaned image.
+
+    ``loss1`` is the fraction of cleaned image charge contained in the outermost
+    hexagonal ring of the camera (pixels with < 6 neighbors). ``loss2`` is the
+    fraction contained in the outermost two rings.
+    """
+    selected = np.asarray(mask, dtype=bool) & (np.asarray(charges) > 0.0)
+    if not np.any(selected):
+        return 0.0, 0.0
+    total_charge = float(np.sum(charges[selected]))
+    if total_charge <= 0.0:
+        return 0.0, 0.0
+
+    r1 = getattr(camera, "outer_ring1_mask", None)
+    r2 = getattr(camera, "outer_ring2_mask", None)
+    if r1 is None or r2 is None:
+        adj = _validated_neighbors(camera, len(charges))
+        r1 = np.sum(adj, axis=1) < 6
+        r2 = r1 | np.any(adj[:, r1], axis=1)
+
+    loss1 = float(np.sum(charges[selected & r1]) / total_charge)
+    loss2 = float(np.sum(charges[selected & r2]) / total_charge)
+    return loss1, loss2
+
+
+def _fit_directed_axis_and_time_gradient(
+    pixel_x: np.ndarray,
+    pixel_y: np.ndarray,
+    charges: np.ndarray,
+    mask: np.ndarray,
+    arrival_times_ns: np.ndarray,
+) -> Tuple[float, float, float, float, float, float, float]:
+    """Compute centroid, radially outward major axis, and weighted linear time gradient."""
+    sel = mask & (charges > 0.0)
+    w = charges[sel]
+    w_sum = float(np.sum(w))
+    if w_sum <= 0.0 or np.count_nonzero(sel) < 3:
+        return 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0
+
+    x_sel = pixel_x[sel]
+    y_sel = pixel_y[sel]
+    cx = float(np.dot(w, x_sel) / w_sum)
+    cy = float(np.dot(w, y_sel) / w_sum)
+    dx = x_sel - cx
+    dy = y_sel - cy
+    cov_xx = float(np.dot(w, dx * dx) / w_sum)
+    cov_yy = float(np.dot(w, dy * dy) / w_sum)
+    cov_xy = float(np.dot(w, dx * dy) / w_sum)
+    psi = float(0.5 * np.arctan2(2.0 * cov_xy, cov_xx - cov_yy))
+    dir_x = float(np.cos(psi))
+    dir_y = float(np.sin(psi))
+    if dir_x * cx + dir_y * cy < 0.0:
+        dir_x = -dir_x
+        dir_y = -dir_y
+
+    s_sel = dx * dir_x + dy * dir_y
+    t_sel = arrival_times_ns[sel]
+    s_mean = float(np.dot(w, s_sel) / w_sum)
+    t_mean = float(np.dot(w, t_sel) / w_sum)
+    ds = s_sel - s_mean
+    dt = t_sel - t_mean
+    var_s = float(np.dot(w, ds * ds))
+    if var_s > 1e-5:
+        m_t = float(np.clip(np.dot(w, ds * dt) / var_s, -40.0, 40.0))
+    else:
+        m_t = 0.0
+    b_t = float(t_mean - m_t * s_mean)
+    residuals = t_sel - (m_t * s_sel + b_t)
+    t_rms = float(np.sqrt(max(0.0, float(np.dot(w, residuals * residuals) / w_sum))))
+    return cx, cy, dir_x, dir_y, m_t, b_t, t_rms
+
+
+def double_pass_fadc_clean(
+    trace: np.ndarray,
+    camera: Any,
+    bin_width_ns: float = 2.0,
+    nsb_rate: float = 2.0,
+    window_pass1: int = 8,
+    window_pass2: int = 5,
+    pic1: float = 4.0,
+    bnd1: float = 2.0,
+    pic2: float = 1.8,
+    bnd2: float = 0.9,
+    dist_tolerance: float = 0.22,
+) -> DoublePassResult:
+    """Perform VERITAS-style two-pass FADC trace integration and image cleaning.
+
+    Pass 1:
+      - Integrates each pixel over a wide sliding window (``window_pass1`` bins = 16 ns)
+        to capture the pulse regardless of arrival-time gradient across the camera.
+      - Extracts each pixel's pulse arrival time ``T0`` (ns) as the baseline-subtracted
+        charge-weighted time centroid within the Pass-1 window.
+      - Applies Pass-1 tail-cut cleaning and fits a linear arrival-time gradient
+        ``t_pred(s) = m_t * s + b_t`` along the preliminary Hillas major axis.
+
+    Pass 2:
+      - Places a narrow integration window (``window_pass2`` bins = 10 ns) centered at
+        the predicted arrival time ``t_pred(s_i)`` for every pixel along the shower axis,
+        reducing NSB noise while following the longitudinal time gradient of distant showers.
+      - Applies spatial double-pass cleaning (``double_pass_clean``) to recover the
+        faint connected longitudinal fringe of the shower ellipse.
+      - Computes the final linear time gradient ``m_t`` (ns/deg), time RMS residual
+        ``sigma_t`` (ns), and camera-edge leakage fractions ``(loss1, loss2)``.
+    """
+    trace_arr = np.asarray(trace, dtype=np.float64)
+    pixel_x, pixel_y = _validated_geometry(camera, trace_arr.shape[0])
+    n_pixels = trace_arr.shape[0]
+
+    if trace_arr.ndim == 1:
+        c_clean = np.maximum(0.0, trace_arr - nsb_rate)
+        mask = double_pass_clean(
+            camera, c_clean, pic1=pic1, bnd1=bnd1, pic2=pic2, bnd2=bnd2,
+            dist_tolerance=dist_tolerance
+        )
+        loss1, loss2 = compute_camera_leakage(camera, c_clean, mask)
+        return DoublePassResult(
+            charges=c_clean.astype(np.float32),
+            mask=mask,
+            arrival_times_ns=np.zeros(n_pixels, dtype=np.float32),
+            time_gradient=0.0,
+            time_intercept=0.0,
+            time_rms=0.0,
+            loss1=loss1,
+            loss2=loss2,
+        )
+
+    n_bins = trace_arr.shape[1]
+    w1 = min(max(1, int(window_pass1)), n_bins)
+    w2 = min(max(1, int(window_pass2)), n_bins)
+    nsb_per_bin = float(nsb_rate) / float(n_bins)
+
+    # Cumulative sum for vectorized O(N_pixels) sliding window integration
+    cs = np.pad(np.cumsum(trace_arr, axis=1), ((0, 0), (1, 0)))
+
+    # --- PASS 1: Wide sliding window (w1 bins) ---
+    win_sums1 = cs[:, w1:] - cs[:, :-w1]
+    k1 = np.argmax(win_sums1, axis=1)
+    pidx = np.arange(n_pixels)
+    q1_raw = win_sums1[pidx, k1]
+    ped1 = nsb_per_bin * w1
+    c1 = np.maximum(0.0, q1_raw - ped1)
+
+    # Pulse arrival time T0 (ns) within the Pass-1 window
+    bins_idx1 = k1[:, None] + np.arange(w1)[None, :]
+    sub_traces1 = np.maximum(0.0, np.take_along_axis(trace_arr, bins_idx1, axis=1) - nsb_per_bin)
+    sub_sum1 = np.sum(sub_traces1, axis=1)
+    peak_bins = np.argmax(trace_arr, axis=1).astype(np.float64)
+    t0_bins = np.where(
+        sub_sum1 > 1e-3,
+        np.sum(sub_traces1 * bins_idx1, axis=1) / np.maximum(sub_sum1, 1e-6),
+        peak_bins,
+    )
+    arrival_times_ns = t0_bins * float(bin_width_ns)
+
+    # Pass-1 cleaning
+    mask_pass1 = tail_cut_clean(camera, c1, picture_thresh=pic1, boundary_thresh=bnd1, min_neighbors=1)
+    if np.count_nonzero(mask_pass1) < 3:
+        mask_pass1 = tail_cut_clean(camera, c1, picture_thresh=pic1, boundary_thresh=bnd1, min_neighbors=0)
+
+    if np.count_nonzero(mask_pass1) < 3 or np.sum(c1[mask_pass1]) <= 0.0:
+        return DoublePassResult(
+            charges=c1.astype(np.float32),
+            mask=np.zeros(n_pixels, dtype=bool),
+            arrival_times_ns=arrival_times_ns.astype(np.float32),
+            time_gradient=0.0,
+            time_intercept=0.0,
+            time_rms=0.0,
+            loss1=0.0,
+            loss2=0.0,
+        )
+
+    # Fit Pass-1 major axis and linear time gradient t_pred(s) = m_t * s + b_t
+    cx1, cy1, dir_x1, dir_y1, m_t1, b_t1, _ = _fit_directed_axis_and_time_gradient(
+        pixel_x, pixel_y, c1, mask_pass1, arrival_times_ns
+    )
+
+    # --- PASS 2: Narrow time-gradient-aligned window (w2 bins) ---
+    s_all = (pixel_x - cx1) * dir_x1 + (pixel_y - cy1) * dir_y1
+    t_pred_bins = (m_t1 * s_all + b_t1) / float(bin_width_ns)
+    k2_grad = np.clip(
+        np.rint(t_pred_bins - 0.5 * (w2 - 1)).astype(int), 0, n_bins - w2
+    )
+    win_sums2 = cs[:, w2:] - cs[:, :-w2]
+    q2_grad = win_sums2[pidx, k2_grad]
+    q2_peak = np.max(win_sums2, axis=1)
+    # Core pixels retain full pulse energy even if the shower core has finite thickness
+    q2_raw = np.where(mask_pass1, np.maximum(q2_grad, q2_peak), q2_grad)
+    ped2 = nsb_per_bin * w2
+    c2 = np.maximum(0.0, q2_raw - ped2)
+
+    # Spatial double-pass cleaning on narrow-window integrated image
+    mask_pass2 = double_pass_clean(
+        camera,
+        c2,
+        pic1=pic1 * 0.9,
+        bnd1=bnd1 * 0.9,
+        pic2=pic2,
+        bnd2=bnd2,
+        dist_tolerance=dist_tolerance,
+    )
+    if np.count_nonzero(mask_pass2) < 3:
+        mask_pass2 = mask_pass1
+
+    # Recompute final time gradient along Pass-2 directed Hillas axis
+    _, _, _, _, m_t2, b_t2, t_rms2 = _fit_directed_axis_and_time_gradient(
+        pixel_x, pixel_y, c2, mask_pass2, arrival_times_ns
+    )
+    loss1, loss2 = compute_camera_leakage(camera, c2, mask_pass2)
+
+    return DoublePassResult(
+        charges=c2.astype(np.float32),
+        mask=mask_pass2,
+        arrival_times_ns=arrival_times_ns.astype(np.float32),
+        time_gradient=m_t2,
+        time_intercept=b_t2,
+        time_rms=t_rms2,
+        loss1=loss1,
+        loss2=loss2,
+    )
