@@ -189,6 +189,7 @@ class TestMLStereoReconstructor:
     def test_extended_stereo_features_and_gnn_uncertainty(self):
         import torch
         from recon.gnn import SpatiotemporalGNN
+        from train_gnn import compute_event_containment_weights
 
         cam = Camera(n_rings=12, pixel_size=0.15)
         array = TelescopeArray.veritas_array()
@@ -199,6 +200,9 @@ class TestMLStereoReconstructor:
         assert len(feat_ext) == 85
 
         model = SpatiotemporalGNN()
+        assert model.GAT_SPATIAL_FEATURES == 21
+        assert model.STEREO_AUX_FEATURES == 13
+        assert model.CALO_SKIP_FEATURES == 14
         model.eval()
         batch_idx = torch.zeros(cam.n_pixels, dtype=torch.long)
         x37 = torch.zeros((cam.n_pixels, 37), dtype=torch.float32)
@@ -208,3 +212,22 @@ class TestMLStereoReconstructor:
         assert c_out.shape == (1, 1)
         assert e_out.shape == (1, 1)
         assert e_logvar.shape == (1, 1)
+
+        # Verify containment weights prioritize R_reco <= 180m over uncontained halo events
+        x_contained = torch.zeros((cam.n_pixels, 37), dtype=torch.float32)
+        x_contained[:, 32] = 0.0   # loss1 = 0
+        x_contained[:, 36] = 0.5   # reco_r_arr = 100 m (<= 180 m)
+
+        x_halo = torch.zeros((cam.n_pixels, 37), dtype=torch.float32)
+        x_halo[:, 32] = 0.35       # loss1 = 0.35
+        x_halo[:, 36] = 2.0        # reco_r_arr = 400 m
+
+        x_two = torch.cat([x_contained, x_halo], dim=0)
+        batch_two = torch.cat([
+            torch.zeros(cam.n_pixels, dtype=torch.long),
+            torch.ones(cam.n_pixels, dtype=torch.long),
+        ])
+        w = compute_event_containment_weights(x_two, batch_two)
+        assert w.shape == (2,)
+        assert w[0].item() == pytest.approx(1.0)
+        assert 0.05 <= w[1].item() < 0.20

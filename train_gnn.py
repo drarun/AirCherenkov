@@ -22,8 +22,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_mean_pool
 from recon.gnn import SpatiotemporalGNN
 from analysis.dataset import CherenkovDataset
+
+
+def compute_event_containment_weights(x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    """Compute Plan #2 physical containment weights per event from loss1 (col 32) and reco_r_arr (col 36)."""
+    if x.size(1) < 37:
+        return torch.ones(int(batch.max().item()) + 1, device=x.device, dtype=torch.float32)
+    xf = x.float()
+    loss1_mean = global_mean_pool(xf[:, 32:33], batch).view(-1).clamp(min=0.0, max=1.0)
+    reco_r_m = (global_mean_pool(xf[:, 36:37], batch).view(-1) * 200.0).clamp(min=0.0)
+    w_leak = (1.0 - 0.85 * loss1_mean).clamp(min=0.15) ** 2
+    w_core = torch.exp(-torch.clamp(reco_r_m - 180.0, min=0.0) / 120.0)
+    return (w_leak * w_core).clamp(min=0.05, max=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +158,7 @@ def train_networks():
     gamma_mask = (train_classes == 1)
     gamma_bins = energy_bins[gamma_mask]
     gamma_counts = torch.bincount(gamma_bins, minlength=n_bins).float().clamp(min=1.0)
-    gamma_w = 1.0 / torch.sqrt(gamma_counts[gamma_bins])
+    gamma_w = 1.0 / (gamma_counts[gamma_bins] ** 0.70)
     gamma_w = gamma_w / gamma_w.sum()
 
     hadron_mask = (train_classes == 0)
@@ -182,8 +195,8 @@ def train_networks():
         print("     Loaded successfully.")
 
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(args.epochs, 1), eta_min=1e-5)
 
     use_amp = torch.cuda.is_available()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -255,11 +268,15 @@ def train_networks():
                         y_pred = energy_pred.view(-1)[gamma_mask]
                         log_var = energy_logvar.view(-1)[gamma_mask]
 
+                        w_all = compute_event_containment_weights(batch.x, batch.batch)
+                        w_gamma = w_all[gamma_mask]
+                        w_gamma = w_gamma / w_gamma.mean().clamp(min=1e-6)
+
                         sq_err = (y_pred - y_true) ** 2
                         nll_e = 0.5 * torch.exp(-log_var) * sq_err + 0.5 * log_var
                         huber_e = nn.functional.smooth_l1_loss(
                             y_pred, y_true, reduction='none', beta=0.12)
-                        loss_e = (0.25 * nll_e + 2.0 * huber_e).mean()
+                        loss_e = (w_gamma * (0.25 * nll_e + 2.0 * huber_e)).mean()
                         loss = loss_c + 5.0 * loss_e
                     else:
                         loss = loss_c
@@ -313,11 +330,15 @@ def train_networks():
                         class_logits.view(-1), data.y_class.view(-1))
                     gamma_mask = (data.y_class.view(-1) == 1.0)
                     if gamma_mask.any():
+                        w_all = compute_event_containment_weights(data.x, data.batch)
+                        w_gamma = w_all[gamma_mask]
+                        w_gamma = w_gamma / w_gamma.mean().clamp(min=1e-6)
                         huber_e = nn.functional.smooth_l1_loss(
                             energy_pred.view(-1)[gamma_mask],
                             data.y_energy.view(-1)[gamma_mask],
+                            reduction='none',
                             beta=0.12)
-                        loss = loss_c + 10.0 * huber_e
+                        loss = loss_c + 10.0 * (w_gamma * huber_e).mean()
                     else:
                         loss = loss_c
                 val_loss += loss.item() * data.num_graphs
@@ -329,7 +350,7 @@ def train_networks():
               f"| Val Loss: {val_loss:.4f}"
               + (f" | OOMs skipped: {oom_count}" if oom_count else ""))
 
-        scheduler.step(val_loss)
+        scheduler.step()
 
         # ------------------------------------------------------------------
         # Checkpointing
