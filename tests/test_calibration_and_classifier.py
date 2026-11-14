@@ -35,6 +35,46 @@ def test_energy_calibrator_pchip():
     assert np.mean((calibrated - true_e)**2) < np.mean((pred_e - true_e)**2)
 
 
+def test_energy_calibrator_debias_endpoints():
+    rng = np.random.RandomState(42)
+    # Synthetic power-law spectrum dN/dE ~ E^-2.2 over log10(E/GeV) in [2.0, 4.2]
+    n_samples = 1800
+    e_min, e_max = 10.0**2.0, 10.0**4.2
+    alpha = 1.0 - 2.2
+    u = rng.uniform(0.0, 1.0, n_samples)
+    true_e = np.log10((e_min**alpha + u * (e_max**alpha - e_min**alpha)) ** (1.0 / alpha))
+    # Noisy compressed predictions induce positive low-E and negative high-E tail bias
+    pred_e = 2.2 + 0.8 * (true_e - 2.0) + rng.normal(0.0, 0.15, n_samples)
+
+    calib_base = EnergyCalibrator(method="pchip", min_samples_per_bin=20, debias_endpoints=False)
+    calib_debiased = EnergyCalibrator(method="pchip", min_samples_per_bin=20, debias_endpoints=True)
+    calib_base.fit(pred_e, true_e)
+    calib_debiased.fit(pred_e, true_e)
+
+    assert calib_base.stage2_model is None
+    assert calib_debiased.stage2_model is not None
+
+    # Verify strict monotonicity across the evaluation grid
+    eval_grid = np.linspace(float(np.min(pred_e)), float(np.max(pred_e)), 200)
+    grid_preds = calib_debiased.predict(eval_grid)
+    assert np.all(np.diff(grid_preds) > 0)
+
+    base_preds = calib_base.predict(pred_e)
+    debiased_preds = calib_debiased.predict(pred_e)
+
+    lo_mask = true_e < 2.35
+    hi_mask = true_e > 3.35
+    base_bias_lo = float(np.median(base_preds[lo_mask] - true_e[lo_mask]))
+    base_bias_hi = float(np.median(base_preds[hi_mask] - true_e[hi_mask]))
+    debiased_bias_lo = float(np.median(debiased_preds[lo_mask] - true_e[lo_mask]))
+    debiased_bias_hi = float(np.median(debiased_preds[hi_mask] - true_e[hi_mask]))
+
+    assert base_bias_lo > 0.0
+    assert base_bias_hi < 0.0
+    assert abs(debiased_bias_lo) < abs(base_bias_lo)
+    assert abs(debiased_bias_hi) < abs(base_bias_hi)
+
+
 def test_stereo_classifier_smoke():
     rng = np.random.RandomState(42)
     X = rng.randn(40, 61).astype(np.float32)
