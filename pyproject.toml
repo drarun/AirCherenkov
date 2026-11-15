@@ -27,6 +27,10 @@ ml = [
 ]
 sbi = ["sbi>=0.22,<1"]
 io = ["h5py>=3.9,<4"]
+gui = [
+    "PySide6>=6.6,<7",
+    "nvidia-ml-py>=12",
+]
 dev = ["pytest>=7.4,<9"]
 
 [project.scripts]
@@ -36,10 +40,12 @@ aircherenkov-camera = "run_gamma_camera_pipeline:main"
 aircherenkov-train = "train_gnn:main"
 aircherenkov-evaluate = "analysis.evaluate_gnns:main"
 aircherenkov-event-display = "analysis.event_display:main"
+aircherenkov-gui = "aircherenkov_gui:main"
 
 [tool.setuptools]
-packages = ["aircherenkov", "analysis", "recon", "sim"]
+packages = ["aircherenkov", "analysis", "gui", "recon", "sim"]
 py-modules = [
+    "aircherenkov_gui",
     "generate_training_data",
     "generate_visualizations",
     "plot_ldf",
@@ -52,5 +58,6 @@ py-modules = [
 [tool.setuptools.package-dir]
 aircherenkov = "src/aircherenkov"
 analysis = "src/analysis"
+gui = "src/gui"
 recon = "src/recon"
 sim = "src/sim"

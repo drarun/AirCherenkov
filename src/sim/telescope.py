@@ -205,6 +205,30 @@ class HessTelescope(Telescope):
         )
 
 
+class MagicTelescope(Telescope):
+    def __init__(
+        self,
+        x_tel=0.0,
+        y_tel=0.0,
+        z_tel=2200.0,
+        mirror_reflectivity=0.85,
+        quantum_efficiency=0.28,
+        **kwargs,
+    ):
+        super().__init__(
+            x_tel=x_tel,
+            y_tel=y_tel,
+            z_tel=z_tel,
+            mirror_radius=8.5,
+            focal_length=17.0,
+            mirror_reflectivity=mirror_reflectivity,
+            quantum_efficiency=quantum_efficiency,
+            n_rings=18,
+            pixel_size=0.1,
+            **kwargs,
+        )
+
+
 class CtaLST(Telescope):
     def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, **kwargs):
         super().__init__(
@@ -263,6 +287,97 @@ class TelescopeArray:
                 VeritasTelescope(x_tel=-41.31, y_tel=53.94, **telescope_kwargs),
             ]
         )
+
+    @staticmethod
+    def hess_array(**telescope_kwargs):
+        z_default = telescope_kwargs.pop("z_tel", 1800.0)
+        return TelescopeArray(
+            [
+                HessTelescope(x_tel=-60.0, y_tel=-60.0, z_tel=z_default, **telescope_kwargs),
+                HessTelescope(x_tel=60.0, y_tel=-60.0, z_tel=z_default, **telescope_kwargs),
+                HessTelescope(x_tel=60.0, y_tel=60.0, z_tel=z_default, **telescope_kwargs),
+                HessTelescope(x_tel=-60.0, y_tel=60.0, z_tel=z_default, **telescope_kwargs),
+            ]
+        )
+
+    @staticmethod
+    def magic_array(**telescope_kwargs):
+        z_default = telescope_kwargs.pop("z_tel", 2200.0)
+        return TelescopeArray(
+            [
+                MagicTelescope(x_tel=-42.5, y_tel=0.0, z_tel=z_default, **telescope_kwargs),
+                MagicTelescope(x_tel=42.5, y_tel=0.0, z_tel=z_default, **telescope_kwargs),
+            ]
+        )
+
+    @staticmethod
+    def from_preset(name: str, **telescope_kwargs):
+        key = str(name).strip().upper().replace(".", "").replace("-", "").replace(" ", "")
+        if key == "VERITAS":
+            return TelescopeArray.veritas_array(**telescope_kwargs)
+        if key == "HESS":
+            return TelescopeArray.hess_array(**telescope_kwargs)
+        if key == "MAGIC":
+            return TelescopeArray.magic_array(**telescope_kwargs)
+        raise ValueError(f"Unknown telescope array preset: {name!r}")
+
+    def to_dict(self, preset_name: str = "Custom") -> dict:
+        mean_z = (
+            float(np.mean([tel.z_tel for tel in self.telescopes]))
+            if self.telescopes
+            else 1268.0
+        )
+        default_fadc = (
+            self.telescopes[0].fadc_config.backend_kwargs()
+            if self.telescopes
+            else FADCConfig().backend_kwargs()
+        )
+        return {
+            "preset_name": str(preset_name),
+            "observatory_altitude_m": mean_z,
+            "fadc_config": default_fadc,
+            "telescopes": [
+                {
+                    "x_tel": float(tel.x_tel),
+                    "y_tel": float(tel.y_tel),
+                    "z_tel": float(tel.z_tel),
+                    "mirror_radius": float(tel.mirror_radius),
+                    "focal_length": float(tel.focal_length),
+                    "mirror_reflectivity": float(tel.mirror_reflectivity),
+                    "quantum_efficiency": float(tel.quantum_efficiency),
+                    "n_rings": int(tel.camera.n_rings),
+                    "pixel_size": float(tel.camera.pixel_size),
+                    "shower_start_altitude": float(tel.shower_start_altitude),
+                    "fadc_config": tel.fadc_config.backend_kwargs(),
+                }
+                for tel in self.telescopes
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TelescopeArray":
+        array_fadc = data.get("fadc_config", {})
+        telescopes = []
+        for spec in data.get("telescopes", []):
+            tel_fadc_dict = dict(array_fadc)
+            tel_fadc_dict.update(spec.get("fadc_config", {}))
+            fadc_cfg = FADCConfig(**tel_fadc_dict) if tel_fadc_dict else FADCConfig()
+            telescopes.append(
+                Telescope(
+                    x_tel=float(spec.get("x_tel", 0.0)),
+                    y_tel=float(spec.get("y_tel", 0.0)),
+                    z_tel=float(spec.get("z_tel", data.get("observatory_altitude_m", 1268.0))),
+                    mirror_radius=float(spec.get("mirror_radius", 6.0)),
+                    focal_length=float(spec.get("focal_length", 12.0)),
+                    mirror_reflectivity=float(spec.get("mirror_reflectivity", 0.82)),
+                    quantum_efficiency=float(spec.get("quantum_efficiency", 0.20)),
+                    n_rings=int(spec.get("n_rings", 12)),
+                    pixel_size=float(spec.get("pixel_size", 0.15)),
+                    shower_start_altitude=float(spec.get("shower_start_altitude", 20000.0)),
+                    fadc_config=fadc_cfg,
+                )
+            )
+        return cls(telescopes)
 
     @staticmethod
     def _camera_key(telescope: Telescope):

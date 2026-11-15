@@ -18,3 +18,9 @@ tectonic.zip
 *.log
 
 external/
+
+# Local-only papers, slide decks, and reports
+AirCherenkov_Paper.*
+AirCherenkov_Talk.*
+*.pptx
+reports/
