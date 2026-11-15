@@ -6,11 +6,11 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import h5py
 import numpy as np
 import pytest
 import torch
 
+h5py = pytest.importorskip("h5py")
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
