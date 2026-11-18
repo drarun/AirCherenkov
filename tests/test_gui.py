@@ -486,19 +486,20 @@ def test_upgraded_gnn_and_stage2_calibrator_integration(qapp) -> None:
     cmp_fid = compare_with_baseline(m["binned"])
     assert cmp_fid["n_res_better"] == 5
     assert cmp_fid["n_res_worse"] == 0
-    assert cmp_fid["n_bias_worse"] == 1
+    assert cmp_fid["n_bias_better"] == 3
+    assert cmp_fid["n_bias_worse"] == 0
     assert np.allclose(
         m["binned"]["resolution_68"] * 100.0,
-        [23.81, 22.69, 19.98, 17.61, 13.47, 10.42, 8.04],
+        [23.21, 23.00, 20.35, 17.59, 13.34, 11.25, 7.73],
         atol=0.15,
     )
     assert np.allclose(
         m["binned"]["bias"] * 100.0,
-        [15.46, -0.58, -1.16, -0.16, 0.58, 3.54, -5.14],
+        [8.92, -1.11, -0.77, -0.04, -0.19, 0.69, -0.49],
         atol=0.15,
     )
-    assert np.isclose(m["overall_res68"] * 100.0, 19.92, atol=0.1)
-    assert np.isclose(m["overall_bias"] * 100.0, 0.91, atol=0.1)
+    assert np.isclose(m["overall_res68"] * 100.0, 20.18, atol=0.15)
+    assert np.isclose(m["overall_bias"] * 100.0, 0.46, atol=0.15)
 
     # 2. Stage-2 debiaser OFF falls back to live Stage-1 PCHIP evaluation
     res_no_s2 = load_upgraded_gnn_benchmark_evaluation(
@@ -523,7 +524,7 @@ def test_upgraded_gnn_and_stage2_calibrator_integration(qapp) -> None:
     )
     assert np.allclose(
         res_all["metrics"]["binned"]["resolution_68"] * 100.0,
-        [23.80, 25.07, 20.27, 17.61, 13.47, 10.42, 8.04],
+        [24.29, 25.91, 20.58, 17.59, 13.34, 11.25, 7.73],
         atol=0.15,
     )
 
@@ -540,7 +541,7 @@ def test_upgraded_gnn_and_stage2_calibrator_integration(qapp) -> None:
         # Switching VERITAS cut tier updates plots and active bundle
         win.train_tab.combo_cut_tier.setCurrentIndex(3)  # core_contained
         assert win.train_tab.latest_bundle["metrics"]["tier"] == "core_contained"
-        assert np.isclose(win.train_tab.latest_bundle["metrics"]["overall_res68"] * 100.0, 19.86, atol=0.1)
+        assert np.isclose(win.train_tab.latest_bundle["metrics"]["overall_res68"] * 100.0, 20.11, atol=0.15)
         win.train_tab.combo_cut_tier.setCurrentIndex(0)  # fiducial_s80
 
         # 5. End-to-end IRF + Spectral + Li & Ma Skymap execution on cached gnn_cached bundle

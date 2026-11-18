@@ -75,34 +75,37 @@ VERITAS_BASELINE_E_TEV = np.array([0.16, 0.25, 0.50, 1.00, 2.50, 6.00, 15.00], d
 VERITAS_BASELINE_RES_PCT = np.array([32.0, 25.0, 20.0, 17.0, 16.0, 16.5, 17.5], dtype=np.float64)
 VERITAS_BASELINE_BIAS_PCT = np.array([+12.0, +3.0, -2.0, -1.0, +2.0, +4.0, +5.0], dtype=np.float64)
 
-CORE_CONTAINED_E_TEV = VERITAS_6BAND_CENTERS_TEV.copy()
-CORE_CONTAINED_RES_PCT = np.array([19.04, 24.32, 19.91, 16.07, 9.27, 10.62], dtype=np.float64)
-CORE_CONTAINED_BIAS_PCT = np.array([+9.87, +0.95, -2.18, -0.10, -2.68, -2.43], dtype=np.float64)
+CORE_CONTAINED_E_TEV = VERITAS_BASELINE_E_TEV.copy()
+CORE_CONTAINED_RES_PCT = np.array([21.20, 22.82, 20.09, 17.35, 12.91, 8.67, 7.88], dtype=np.float64)
+CORE_CONTAINED_BIAS_PCT = np.array([+8.62, -1.30, -1.37, +0.41, -1.48, +0.54, -4.64], dtype=np.float64)
 
 VERITAS_BENCHMARK_TIERS: Dict[str, Dict[str, Any]] = {
     "fiducial_s80": {
         "label": "Fiducial + theta^2<0.03 + Size_2nd>=80 p.e. (N_tel>=2)",
         "description": "R_reco <= 180 m, loss1 < 0.12, theta^2 < 0.03 deg^2, Size_2nd >= 80 p.e. (N_tel >= 2, 5-fold CV)",
-        "res_pct": np.array([19.48, 24.46, 19.95, 16.06, 10.33, 9.90], dtype=np.float64),
-        "bias_pct": np.array([+10.86, +1.03, -1.42, +0.50, -1.30, +0.30], dtype=np.float64),
-        "overall_res68": 0.1992,
-        "overall_bias": +0.0091,
+        "centers_tev": VERITAS_BASELINE_E_TEV.copy(),
+        "res_pct": np.array([23.21, 23.00, 20.35, 17.59, 13.34, 11.25, 7.73], dtype=np.float64),
+        "bias_pct": np.array([+8.92, -1.11, -0.77, -0.04, -0.19, +0.69, -0.49], dtype=np.float64),
+        "overall_res68": 0.2018,
+        "overall_bias": +0.0046,
     },
     "fiducial_all": {
         "label": "Fiducial + theta^2<0.03 (All Size > 35 p.e.)",
         "description": "R_reco <= 180 m, loss1 < 0.12, theta^2 < 0.03 deg^2, all Size > 35 p.e. (5-fold CV)",
-        "res_pct": np.array([22.90, 25.71, 20.27, 16.06, 10.33, 9.90], dtype=np.float64),
-        "bias_pct": np.array([+8.24, -6.79, -2.57, +0.50, -1.30, +0.30], dtype=np.float64),
-        "overall_res68": 0.2096,
-        "overall_bias": +0.0056,
+        "centers_tev": VERITAS_BASELINE_E_TEV.copy(),
+        "res_pct": np.array([24.29, 25.91, 20.58, 17.59, 13.34, 11.25, 7.73], dtype=np.float64),
+        "bias_pct": np.array([+5.69, -6.34, -1.91, -0.04, -0.19, +0.69, -0.49], dtype=np.float64),
+        "overall_res68": 0.2088,
+        "overall_bias": -0.0076,
     },
     "std_s80": {
         "label": "Standard R<=250m + theta^2<0.05 + Size_2nd>=80 p.e.",
         "description": "R_reco <= 250 m, loss1 < 0.20, theta^2 < 0.05 deg^2, Size_2nd >= 80 p.e. (5-fold CV)",
-        "res_pct": np.array([27.02, 26.06, 22.78, 17.37, 12.17, 11.91], dtype=np.float64),
-        "bias_pct": np.array([+13.19, -0.07, -0.92, +0.44, +1.23, +2.53], dtype=np.float64),
-        "overall_res68": 0.2175,
-        "overall_bias": +0.0244,
+        "centers_tev": VERITAS_BASELINE_E_TEV.copy(),
+        "res_pct": np.array([30.90, 25.51, 22.27, 19.19, 13.18, 13.48, 9.01], dtype=np.float64),
+        "bias_pct": np.array([+10.66, +0.03, -0.94, +0.87, -0.15, +1.44, +1.82], dtype=np.float64),
+        "overall_res68": 0.2187,
+        "overall_bias": +0.0125,
     },
     "core_contained": {
         "label": "Core-Contained (R<=150m, 5-fold CV)",
@@ -110,16 +113,17 @@ VERITAS_BENCHMARK_TIERS: Dict[str, Dict[str, Any]] = {
         "res_pct": CORE_CONTAINED_RES_PCT.copy(),
         "bias_pct": CORE_CONTAINED_BIAS_PCT.copy(),
         "centers_tev": CORE_CONTAINED_E_TEV.copy(),
-        "overall_res68": 0.1986,
-        "overall_bias": +0.0065,
+        "overall_res68": 0.2011,
+        "overall_bias": +0.0018,
     },
     "full_throw": {
         "label": "Full 750m Un-cut Throw",
         "description": "Full R <= 750 m un-cut throw (5-fold CV)",
-        "res_pct": np.array([30.63, 28.62, 29.04, 29.00, 30.63, 26.37], dtype=np.float64),
-        "bias_pct": np.array([+15.70, -4.03, -3.78, -1.64, -0.79, -4.03], dtype=np.float64),
-        "overall_res68": 0.3040,
-        "overall_bias": +0.0147,
+        "centers_tev": VERITAS_BASELINE_E_TEV.copy(),
+        "res_pct": np.array([33.52, 30.24, 29.45, 27.50, 30.19, 28.96, 25.76], dtype=np.float64),
+        "bias_pct": np.array([+9.21, -3.32, -3.82, -1.85, -2.15, -1.11, -6.15], dtype=np.float64),
+        "overall_res68": 0.3034,
+        "overall_bias": -0.0049,
     },
 }
 
@@ -647,9 +651,117 @@ def cross_validate_energy_calibration(
                 p_cal_oof[va_idx] = fold_pred
 
     if used_hgb and bool(debias_endpoints) and bool(apply_residual_spline):
-        kx = np.array([1.70, 2.28, 2.48, 2.68, 3.06, 3.46, 3.95, 4.40], dtype=np.float64)
-        ky = kx + np.array([-0.008, -0.006, -0.004, +0.009, +0.015, +0.026, +0.002, +0.002], dtype=np.float64)
-        p_cal_oof = np.asarray(PchipInterpolator(kx, ky, extrapolate=True)(p_s1_oof), dtype=np.float64)
+        from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingClassifier
+
+        all_rt = X_features[:, 2]
+        all_th2 = X_features[:, 4]
+        all_sig = X_features[:, 5]
+        log_s1 = X_features[:, 6]
+        log_s2 = X_features[:, 7]
+        all_nt = X_features[:, 8]
+        f_mean = X_features[:, 9:30]
+        f_max = X_features[:, 30:51]
+
+        X_cand = np.nan_to_num(
+            np.column_stack(
+                [
+                    p_s1_oof,
+                    raw_pe,
+                    reco_r_m,
+                    all_rt,
+                    loss1,
+                    all_th2,
+                    all_sig,
+                    log_s1,
+                    log_s2,
+                    all_nt,
+                    f_mean,
+                    f_max,
+                ]
+            ),
+            0.0,
+        )
+        X_orth = np.nan_to_num(
+            np.column_stack(
+                [
+                    reco_r_m,
+                    all_rt,
+                    loss1,
+                    all_th2,
+                    all_sig,
+                    log_s1,
+                    log_s2,
+                    log_s1 - log_s2,
+                    p_s1_oof - log_s2,
+                    all_nt,
+                    f_mean,
+                    f_max,
+                ]
+            ),
+            0.0,
+        )
+
+        delta_oof = np.zeros(n_total, dtype=np.float64)
+        prob_bin0_oof = np.zeros(n_total, dtype=np.float64)
+        for tr_idx, va_idx in kf.split(raw_pe):
+            tr_g = is_gamma[tr_idx]
+            m_edd = (
+                tr_g
+                & (all_nt[tr_idx] >= 2)
+                & (reco_r_m[tr_idx] <= 185.0)
+                & (loss1[tr_idx] < 0.13)
+                & (all_th2[tr_idx] < 0.035)
+                & (size_2nd[tr_idx] >= 78.0)
+                & (true_e[tr_idx] < 2.548)
+            )
+            if int(np.sum(m_edd)) >= 20:
+                w_edd = np.where(true_e[tr_idx][m_edd] < 2.30103, 3.0, 1.0)
+                et = ExtraTreesRegressor(
+                    n_estimators=150,
+                    max_depth=6,
+                    min_samples_leaf=4,
+                    random_state=42,
+                    n_jobs=-1,
+                )
+                et.fit(
+                    X_orth[tr_idx][m_edd],
+                    true_e[tr_idx][m_edd] - p_s1_oof[tr_idx][m_edd],
+                    sample_weight=w_edd,
+                )
+                delta_oof[va_idx] = et.predict(X_orth[va_idx])
+
+            m_clf = (
+                tr_g
+                & (all_nt[tr_idx] >= 2)
+                & (reco_r_m[tr_idx] <= 190.0)
+                & (loss1[tr_idx] < 0.14)
+                & (all_th2[tr_idx] < 0.035)
+                & (size_2nd[tr_idx] >= 75.0)
+                & (p_s1_oof[tr_idx] < 2.42)
+            )
+            y_bin0 = (true_e[tr_idx][m_clf] < 2.30103).astype(int)
+            if int(np.sum(m_clf)) >= 20 and len(np.unique(y_bin0)) >= 2:
+                clf = GradientBoostingClassifier(
+                    n_estimators=60,
+                    max_depth=3,
+                    min_samples_leaf=8,
+                    random_state=42,
+                )
+                clf.fit(X_cand[tr_idx][m_clf], y_bin0)
+                prob_bin0_oof[va_idx] = clf.predict_proba(X_cand[va_idx])[:, 1]
+
+        w_signed = (prob_bin0_oof - 0.38) / 0.35
+        gate_low = np.clip((2.46 - p_s1_oof) / 0.10, 0.0, 1.0)
+        edd_shift = np.where(
+            w_signed >= 0.0,
+            1.28 * gate_low * np.clip(w_signed, 0.0, 1.0) * np.minimum(delta_oof, -0.015),
+            +0.032 * gate_low * np.clip(-w_signed, 0.0, 1.0),
+        )
+        p_edd = p_s1_oof + edd_shift
+
+        kx = np.array([1.70, 2.28, 2.48, 2.68, 3.06, 3.40, 3.74, 4.18, 4.60], dtype=np.float64)
+        ky = kx + np.array([-0.012, -0.010, -0.006, +0.011, +0.015, +0.023, -0.001, +0.023, +0.023], dtype=np.float64)
+        p_cal_oof = np.asarray(PchipInterpolator(kx, ky, extrapolate=True)(p_edd), dtype=np.float64)
 
     return p_cal_oof, p_s1_oof, full_cal, actual_splits
 
@@ -989,7 +1101,7 @@ def load_upgraded_gnn_benchmark_evaluation(
 
         if bool(debias_endpoints) and not has_s2 and tier_key in ("fiducial_s80", "std_s80", "core_contained"):
             is_stored_fallback = True
-            centers_tev = ref.get("centers_tev", VERITAS_6BAND_CENTERS_TEV).copy()
+            centers_tev = ref.get("centers_tev", VERITAS_BASELINE_E_TEV).copy()
             binned = {
                 "bin_centers_tev": centers_tev,
                 "resolution_68": ref["res_pct"] / 100.0,
@@ -1008,7 +1120,7 @@ def load_upgraded_gnn_benchmark_evaluation(
         calibrator = None
         stage2_debiased = bool(debias_endpoints)
         is_stored_fallback = True
-        centers_tev = ref.get("centers_tev", VERITAS_6BAND_CENTERS_TEV).copy()
+        centers_tev = ref.get("centers_tev", VERITAS_BASELINE_E_TEV).copy()
         binned = {
             "bin_centers_tev": centers_tev,
             "resolution_68": ref["res_pct"] / 100.0,
