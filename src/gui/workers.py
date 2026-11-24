@@ -1297,6 +1297,21 @@ class SimulationWorker(QThread):
         trig_pix = int(self.array_model.trigger_min_pixels)
         trig_tels = int(self.array_model.trigger_min_telescopes)
         low_gain_factor = float(self.array_model.fadc_config.low_gain_factor)
+        from sim.trigger import CameraTrigger, evaluate_array_trigger
+
+        cam = self.array_model.primary_camera()
+        cam_trigger = (
+            CameraTrigger(
+                cam.pixel_x,
+                cam.pixel_y,
+                threshold_pe=trig_pe,
+                window_ns=5.0,
+                min_pixels=3,
+                pixel_size=cam.pixel_size,
+            )
+            if trig_pix == 3
+            else None
+        )
 
         self.log.emit(
             f"Starting MC simulation for {self.array_model.preset_name} "
@@ -1408,7 +1423,7 @@ class SimulationWorker(QThread):
                     py_init=py_batch,
                     pz_init=pz_batch,
                 )
-                sim.run(max_generations=30, verbose=False)
+                sim.run(max_generations=60, verbose=False)
 
             batch_trig = 0
             for i in range(batch_size):
@@ -1440,14 +1455,18 @@ class SimulationWorker(QThread):
                     tel.x_tel += ix
                     tel.y_tel += iy
 
-                trigger_count = 0
-                for trace, gain in img_outputs:
-                    restored = restore_low_gain_traces(trace, gain, low_gain_factor=low_gain_factor)
-                    total_pe_per_pixel = np.sum(restored, axis=1)
-                    if np.sum(total_pe_per_pixel > trig_pe) >= trig_pix:
-                        trigger_count += 1
+                passed, trigger_count = evaluate_array_trigger(
+                    img_outputs,
+                    cam,
+                    threshold_pe=trig_pe,
+                    min_pixels=trig_pix,
+                    min_telescopes=trig_tels,
+                    bin_width_ns=float(self.array_model.fadc_config.bin_width_ns),
+                    low_gain_factor=low_gain_factor,
+                    camera_trigger=cam_trigger,
+                )
 
-                if trigger_count >= trig_tels:
+                if passed:
                     is_g = pids[i] == "gamma"
                     if is_g and gammas_needed == 0:
                         continue

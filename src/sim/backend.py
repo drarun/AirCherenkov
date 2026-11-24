@@ -10,11 +10,24 @@ import os
 import math
 import numpy as np
 
+from sim.atmosphere import (
+    atmospheric_transmission,
+    atmospheric_transmission_np,
+    optical_path_delay_m,
+    refractive_index_excess,
+    refractive_index_excess_np,
+)
+
 try:
     import torch
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+# Frank--Tamm Cherenkov photon yield constant over the 300--600 nm optical/UV
+# PMT passband: 2 * pi * alpha * (1/300e-9 - 1/600e-9) [photons / m].
+FRANK_TAMM_300_600_NM = 76418.0
+ELECTRON_MASS_GEV = 0.000511
 
 # ── Device selection ──────────────────────────────────────────────────────────
 
@@ -104,7 +117,8 @@ def compute_cherenkov_pool_gpu(seg_x1, seg_y1, seg_z1,
                                 seg_event_id=None,
                                 target_photons_per_packet=1.0,
                                 max_packets_per_segment=None,
-                                device='auto', generator=None):
+                                device='auto', generator=None,
+                                z_obs=0.0, seg_mass_gev=None):
     """Generate weighted Cherenkov photon packets and trace them to ground.
 
     The five historical position arrays are retained.  ``weight`` gives the
@@ -114,9 +128,11 @@ def compute_cherenkov_pool_gpu(seg_x1, seg_y1, seg_z1,
     returned as well.
 
     Packet emission locations and azimuths are stratified within each segment.
-    The local refractive index and the electron beta-dependent Cherenkov angle
-    are evaluated at each packet's emission altitude.  The packet weights are
-    a stratified quadrature of the segment's Frank--Tamm yield.
+    The local refractive index (5-layer CORSIKA US Standard Atmosphere) and the
+    beta-dependent Cherenkov angle (using ``seg_mass_gev``, defaulting to
+    0.000511 GeV for electrons/positrons) are evaluated at each packet's
+    emission altitude.  The packet weights are a stratified quadrature of the
+    segment's 300--600 nm Frank--Tamm yield attenuated to ``z_obs``.
 
     ``max_photons_per_segment`` remains as the legacy positional packet cap.
     New code may use ``max_packets_per_segment`` to state that intent directly.
@@ -125,6 +141,14 @@ def compute_cherenkov_pool_gpu(seg_x1, seg_y1, seg_z1,
         raise ValueError("photon_yield_factor must be finite and non-negative")
     if not np.isfinite(target_photons_per_packet) or target_photons_per_packet <= 0:
         raise ValueError("target_photons_per_packet must be finite and greater than zero")
+    if (
+        isinstance(z_obs, bool)
+        or np.ndim(z_obs) != 0
+        or not np.isfinite(z_obs)
+        or float(z_obs) < 0
+    ):
+        raise ValueError("z_obs must be finite and non-negative")
+    z_obs = float(z_obs)
 
     packet_cap = (
         max_photons_per_segment
@@ -143,6 +167,7 @@ def compute_cherenkov_pool_gpu(seg_x1, seg_y1, seg_z1,
             seg_energy, photon_yield_factor,
             int(packet_cap), seg_event_id,
             float(target_photons_per_packet), resolved_device, generator,
+            z_obs, seg_mass_gev,
         )
 
     return _cherenkov_packets_numpy(
@@ -152,6 +177,7 @@ def compute_cherenkov_pool_gpu(seg_x1, seg_y1, seg_z1,
         seg_energy, photon_yield_factor,
         int(packet_cap), seg_event_id,
         float(target_photons_per_packet), generator,
+        z_obs, seg_mass_gev,
     )
 
 
@@ -191,12 +217,72 @@ def _packet_chunk_limit(device):
     return 1_000_000
 
 
+def _resolve_seg_mass_torch(seg_mass_gev, n_segments, device):
+    if seg_mass_gev is None:
+        return torch.full(
+            (n_segments,), ELECTRON_MASS_GEV, dtype=torch.float64, device=device
+        )
+    if isinstance(seg_mass_gev, bool):
+        raise ValueError("seg_mass_gev must be finite and greater than zero")
+    if isinstance(seg_mass_gev, torch.Tensor):
+        if seg_mass_gev.dtype == torch.bool:
+            raise ValueError("seg_mass_gev must contain positive numeric values")
+        mass_tensor = seg_mass_gev.to(dtype=torch.float64, device=device)
+    else:
+        raw_arr = np.asarray(seg_mass_gev)
+        if raw_arr.dtype == np.bool_:
+            raise ValueError("seg_mass_gev must contain positive numeric values")
+        mass_tensor = torch.as_tensor(
+            raw_arr.astype(np.float64, copy=False), dtype=torch.float64, device=device
+        )
+
+    if mass_tensor.ndim == 0:
+        if not bool(torch.isfinite(mass_tensor)) or float(mass_tensor.item()) <= 0.0:
+            raise ValueError("seg_mass_gev must be finite and greater than zero")
+        return mass_tensor.expand(n_segments)
+
+    mass_tensor = mass_tensor.reshape(-1)
+    if mass_tensor.numel() != n_segments:
+        raise ValueError(
+            "seg_mass_gev must be a positive scalar or have the same length as segment arrays"
+        )
+    if not bool(torch.all(torch.isfinite(mass_tensor))) or bool(torch.any(mass_tensor <= 0.0)):
+        raise ValueError("seg_mass_gev must contain only finite values greater than zero")
+    return mass_tensor
+
+
+def _resolve_seg_mass_numpy(seg_mass_gev, n_segments):
+    if seg_mass_gev is None:
+        return np.full(n_segments, ELECTRON_MASS_GEV, dtype=np.float64)
+    if isinstance(seg_mass_gev, bool):
+        raise ValueError("seg_mass_gev must be finite and greater than zero")
+    raw_arr = np.asarray(seg_mass_gev)
+    if raw_arr.dtype == np.bool_:
+        raise ValueError("seg_mass_gev must contain positive numeric values")
+    mass_arr = raw_arr.astype(np.float64, copy=False)
+    if mass_arr.ndim == 0:
+        val = float(mass_arr.item())
+        if not np.isfinite(val) or val <= 0.0:
+            raise ValueError("seg_mass_gev must be finite and greater than zero")
+        return np.full(n_segments, val, dtype=np.float64)
+
+    mass_arr = mass_arr.reshape(-1)
+    if len(mass_arr) != n_segments:
+        raise ValueError(
+            "seg_mass_gev must be a positive scalar or have the same length as segment arrays"
+        )
+    if not np.all(np.isfinite(mass_arr)) or np.any(mass_arr <= 0.0):
+        raise ValueError("seg_mass_gev must contain only finite values greater than zero")
+    return mass_arr
+
+
 def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
                                seg_x2, seg_y2, seg_z2,
                                seg_px, seg_py, seg_pz,
                                seg_energy, photon_yield_factor,
                                max_packets_per_segment, seg_event_id,
-                               target_photons_per_packet, device, generator):
+                               target_photons_per_packet, device, generator,
+                               z_obs, seg_mass_gev):
     dtype = torch.float32
     _validate_generator(generator, device)
 
@@ -213,6 +299,7 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
         raise ValueError("All segment arrays must have the same length")
     n_segments = tensors[0].numel()
     include_event_id = seg_event_id is not None
+    mass_gev64 = _resolve_seg_mass_torch(seg_mass_gev, n_segments, device)
     if n_segments == 0:
         return _empty_photon_packets(include_event_id)
 
@@ -228,30 +315,42 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
     x1, y1, z1, x2, y2, z2, px, py, pz, energies = tensors
     delta = torch.stack((x2 - x1, y2 - y1, z2 - z1), dim=1)
     segment_length = torch.linalg.vector_norm(delta, dim=1)
-    z_mid = 0.5 * (z1 + z2)
 
-    # Electron beta and midpoint yield are used only to choose packet count.
-    # The actual local angle and yield are recomputed at each packet altitude.
-    scale_height = 7640.0
-    eta_0 = 0.000293
-    electron_mass_gev = 0.000511
-    beta_sq = torch.clamp(
-        1.0 - (electron_mass_gev / torch.clamp(energies, min=electron_mass_gev)) ** 2,
+    # Evaluate beta and Cherenkov threshold in float64 using the 5-layer
+    # CORSIKA atmosphere.  Check the lower endpoint (highest refractivity
+    # above z_obs) so segments crossing into threshold in their lower half are
+    # retained, while estimating packet counts from max(sin2_mid, 0.5*sin2_low).
+    energies64 = energies.to(torch.float64)
+    beta_sq64 = torch.clamp(
+        1.0 - (mass_gev64 / torch.maximum(energies64, mass_gev64)).square(),
         min=0.0,
         max=1.0,
     )
-    n_mid = 1.0 + eta_0 * torch.exp(-torch.clamp(z_mid, min=0.0) / scale_height)
-    sin2_mid = torch.clamp(
-        1.0 - 1.0 / torch.clamp(beta_sq * n_mid.square(), min=1e-20),
+    z_low64 = torch.clamp(torch.minimum(z1, z2).to(torch.float64), min=z_obs)
+    z_mid64 = torch.clamp((0.5 * (z1 + z2)).to(torch.float64), min=z_obs)
+    n_low64 = 1.0 + refractive_index_excess(z_low64)
+    sin2_low64 = torch.clamp(
+        1.0 - 1.0 / torch.clamp(beta_sq64 * n_low64.square(), min=1e-20),
         min=0.0,
         max=1.0,
     )
+    n_mid64 = 1.0 + refractive_index_excess(z_mid64)
+    sin2_mid64 = torch.clamp(
+        1.0 - 1.0 / torch.clamp(beta_sq64 * n_mid64.square(), min=1e-20),
+        min=0.0,
+        max=1.0,
+    )
+    sin2_est64 = torch.maximum(sin2_mid64, 0.5 * sin2_low64)
     estimated_yield = (
-        segment_length * sin2_mid * 37000.0 * float(photon_yield_factor)
+        segment_length.to(torch.float64)
+        * sin2_est64
+        * FRANK_TAMM_300_600_NM
+        * float(photon_yield_factor)
     )
     candidate = (
         (segment_length > 0)
-        & (torch.maximum(z1, z2) > 0)
+        & (torch.maximum(z1, z2) > z_obs)
+        & (sin2_low64 > 0)
         & (estimated_yield > 0)
     )
     if not bool(torch.any(candidate)):
@@ -264,7 +363,7 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
     y2 = y2[candidate]
     z2 = z2[candidate]
     segment_length = segment_length[candidate]
-    beta_sq = beta_sq[candidate]
+    beta_sq64 = beta_sq64[candidate]
     estimated_yield = estimated_yield[candidate]
     directions = torch.stack((px[candidate], py[candidate], pz[candidate]), dim=1)
     directions = directions / torch.clamp(
@@ -287,6 +386,7 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
     segment_start = 0
     base_packets = 0
     n_valid_segments = packet_counts.numel()
+    z_obs_tensor = torch.tensor(z_obs, dtype=torch.float64, device=device)
     if os.environ.get('AIRCHERENKOV_DEBUG', '0') == '1':
         print(f"[DEBUG] n_valid_segments: {n_valid_segments}, total_packets: {total_packets}, packet_limit: {packet_limit}")
 
@@ -328,22 +428,21 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
             ye = sy1[local_segment] + fraction * (sy2 - sy1)[local_segment]
             ze = sz1[local_segment] + fraction * (sz2 - sz1)[local_segment]
 
-            local_n = 1.0 + eta_0 * torch.exp(
-                -torch.clamp(ze, min=0.0) / scale_height
-            )
-            local_beta_sq = beta_sq[segment_start:segment_end][local_segment]
-            local_sin2 = torch.clamp(
-                1.0 - 1.0 / torch.clamp(
-                    local_beta_sq * local_n.square(), min=1e-20
-                ),
+            ze64 = ze.to(torch.float64)
+            local_n64 = 1.0 + refractive_index_excess(torch.clamp(ze64, min=0.0))
+            local_beta_sq64 = beta_sq64[segment_start:segment_end][local_segment]
+            beta_n2 = local_beta_sq64 * local_n64.square()
+            local_sin2_64 = torch.clamp(
+                1.0 - 1.0 / torch.clamp(beta_n2, min=1e-20),
                 min=0.0,
                 max=1.0,
             )
-            cos_theta = torch.rsqrt(torch.clamp(
-                local_beta_sq * local_n.square(), min=1.0
-            ))
-            cos_theta = torch.clamp(cos_theta, min=-1.0, max=1.0)
-            sin_theta = torch.sqrt(local_sin2)
+            cos_theta = torch.clamp(
+                torch.rsqrt(torch.clamp(beta_n2, min=1.0)),
+                min=-1.0,
+                max=1.0,
+            ).to(dtype)
+            sin_theta = torch.sqrt(local_sin2_64).to(dtype)
 
             chunk_directions = directions[segment_start:segment_end]
             reference = torch.zeros_like(chunk_directions)
@@ -374,30 +473,30 @@ def _cherenkov_packets_torch(seg_x1, seg_y1, seg_z1,
 
             distance_to_ground = -ze / photon_direction[:, 2]
             reaches_ground = (
-                (ze > 0)
+                (ze > z_obs)
                 & (photon_direction[:, 2] < 0)
                 & torch.isfinite(distance_to_ground)
                 & (distance_to_ground >= 0)
-                & (local_sin2 > 0)
+                & (local_sin2_64 > 0)
             )
             x_ground = xe + distance_to_ground * photon_direction[:, 0]
             y_ground = ye + distance_to_ground * photon_direction[:, 1]
 
-            # Stratified quadrature of the Frank--Tamm yield along the segment.
-            # This preserves the local altitude/beta dependence instead of
-            # forcing every long segment to use its midpoint refractivity.
-            # Atmospheric absorption (approx 22km extinction length)
-            transmission = torch.exp(-distance_to_ground / 22000.0)
-            packet_weight = (
-                segment_length[segment_start:segment_end][local_segment]
-                * 37000.0
-                * float(photon_yield_factor)
-                * local_sin2
-                * transmission
-                / count_per_packet.to(dtype)
+            # Stratified quadrature of the 300--600 nm Frank--Tamm yield along
+            # the segment with altitude/wavelength-dependent extinction to z_obs.
+            transmission64 = atmospheric_transmission(
+                ze64,
+                z_obs_tensor,
+                (-photon_direction[:, 2]).to(torch.float64),
             )
-            # Store pz_emit for slant-path emission time calculation in ray_trace
-            chunk_pz = directions[segment_start:segment_end, 2][local_segment]
+            packet_weight = (
+                segment_length[segment_start:segment_end][local_segment].to(torch.float64)
+                * FRANK_TAMM_300_600_NM
+                * float(photon_yield_factor)
+                * local_sin2_64
+                * transmission64
+                / count_per_packet.to(torch.float64)
+            ).to(dtype)
             packet_values = torch.stack(
                 (xe, ye, ze, x_ground, y_ground, packet_weight), dim=1
             )[reaches_ground]
@@ -426,7 +525,8 @@ def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
                                seg_px, seg_py, seg_pz,
                                seg_energy, photon_yield_factor,
                                max_packets_per_segment, seg_event_id,
-                               target_photons_per_packet, generator):
+                               target_photons_per_packet, generator,
+                               z_obs, seg_mass_gev):
     """NumPy fallback with the same weighted-packet contract."""
     arrays = [
         np.asarray(value, dtype=np.float32).reshape(-1)
@@ -437,8 +537,10 @@ def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
     ]
     if len({len(value) for value in arrays}) != 1:
         raise ValueError("All segment arrays must have the same length")
+    n_segments = len(arrays[0])
     include_event_id = seg_event_id is not None
-    if len(arrays[0]) == 0:
+    mass_gev64 = _resolve_seg_mass_numpy(seg_mass_gev, n_segments)
+    if n_segments == 0:
         return _empty_photon_packets(include_event_id)
     if generator is not None and not isinstance(generator, np.random.Generator):
         raise TypeError("Without PyTorch, generator must be numpy.random.Generator")
@@ -446,17 +548,29 @@ def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
 
     x1, y1, z1, x2, y2, z2, px, py, pz, energies = arrays
     ds = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
-    beta_sq = np.clip(1.0 - (0.000511 / np.maximum(energies, 0.000511)) ** 2, 0, 1)
-    n_mid = 1.0 + 0.000293 * np.exp(-np.maximum(0.5 * (z1 + z2), 0) / 7640.0)
-    sin2_mid = np.clip(1.0 - 1.0 / np.maximum(beta_sq * n_mid ** 2, 1e-20), 0, 1)
-    estimated = ds * sin2_mid * 37000.0 * photon_yield_factor
-    valid = (ds > 0) & (np.maximum(z1, z2) > 0) & (estimated > 0)
+    energies64 = energies.astype(np.float64, copy=False)
+    beta_sq64 = np.clip(
+        1.0 - (mass_gev64 / np.maximum(energies64, mass_gev64)) ** 2, 0.0, 1.0
+    )
+    z_low64 = np.maximum(np.minimum(z1, z2).astype(np.float64), z_obs)
+    z_mid64 = np.maximum((0.5 * (z1 + z2)).astype(np.float64), z_obs)
+    n_low64 = 1.0 + refractive_index_excess_np(z_low64)
+    sin2_low64 = np.clip(
+        1.0 - 1.0 / np.maximum(beta_sq64 * n_low64 ** 2, 1e-20), 0.0, 1.0
+    )
+    n_mid64 = 1.0 + refractive_index_excess_np(z_mid64)
+    sin2_mid64 = np.clip(
+        1.0 - 1.0 / np.maximum(beta_sq64 * n_mid64 ** 2, 1e-20), 0.0, 1.0
+    )
+    sin2_est64 = np.maximum(sin2_mid64, 0.5 * sin2_low64)
+    estimated = ds.astype(np.float64) * sin2_est64 * FRANK_TAMM_300_600_NM * float(photon_yield_factor)
+    valid = (ds > 0) & (np.maximum(z1, z2) > z_obs) & (sin2_low64 > 0) & (estimated > 0)
     if not np.any(valid):
         return _empty_photon_packets(include_event_id)
 
-    x1, y1, z1, x2, y2, z2, px, py, pz, ds, beta_sq, estimated = [
+    x1, y1, z1, x2, y2, z2, px, py, pz, ds, beta_sq64, estimated = [
         value[valid]
-        for value in (x1, y1, z1, x2, y2, z2, px, py, pz, ds, beta_sq, estimated)
+        for value in (x1, y1, z1, x2, y2, z2, px, py, pz, ds, beta_sq64, estimated)
     ]
     events = None
     if include_event_id:
@@ -477,14 +591,12 @@ def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
     ye = y1[segment_index] + fraction * (y2 - y1)[segment_index]
     ze = z1[segment_index] + fraction * (z2 - z1)[segment_index]
 
-    local_n = 1.0 + 0.000293 * np.exp(-np.maximum(ze, 0) / 7640.0)
-    local_sin2 = np.clip(
-        1.0 - 1.0 / np.maximum(beta_sq[segment_index] * local_n ** 2, 1e-20), 0, 1
-    )
-    cos_theta = np.clip(
-        1.0 / np.sqrt(np.maximum(beta_sq[segment_index] * local_n ** 2, 1.0)), -1, 1
-    )
-    sin_theta = np.sqrt(local_sin2)
+    ze64 = ze.astype(np.float64, copy=False)
+    local_n64 = 1.0 + refractive_index_excess_np(np.maximum(ze64, 0.0))
+    beta_n2 = beta_sq64[segment_index] * local_n64 ** 2
+    local_sin2_64 = np.clip(1.0 - 1.0 / np.maximum(beta_n2, 1e-20), 0.0, 1.0)
+    cos_theta = np.clip(1.0 / np.sqrt(np.maximum(beta_n2, 1.0)), -1.0, 1.0)
+    sin_theta = np.sqrt(local_sin2_64)
 
     directions = np.column_stack((px, py, pz))
     directions /= np.maximum(np.linalg.norm(directions, axis=1, keepdims=True), 1e-12)
@@ -503,17 +615,18 @@ def _cherenkov_packets_numpy(seg_x1, seg_y1, seg_z1,
     )
     distance = -ze / photon_direction[:, 2]
     reaches_ground = (
-        (ze > 0) & (photon_direction[:, 2] < 0) & np.isfinite(distance)
-        & (distance >= 0) & (local_sin2 > 0)
+        (ze > z_obs) & (photon_direction[:, 2] < 0) & np.isfinite(distance)
+        & (distance >= 0) & (local_sin2_64 > 0)
     )
-    # Atmospheric absorption (approx 22km extinction length)
-    transmission = np.exp(-distance / 22000.0)
+    transmission64 = atmospheric_transmission_np(
+        ze64, z_obs, -photon_direction[:, 2]
+    )
     weight = (
-        ds[segment_index]
-        * 37000.0
-        * photon_yield_factor
-        * local_sin2
-        * transmission
+        ds[segment_index].astype(np.float64)
+        * FRANK_TAMM_300_600_NM
+        * float(photon_yield_factor)
+        * local_sin2_64
+        * transmission64
         / packet_count
     )
     packed = np.column_stack((
@@ -564,6 +677,7 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                   x_tel, y_tel, z_tel, mirror_radius,
                   mirror_reflectivity, quantum_efficiency, *,
                   pointing_zenith=0.0, pointing_azimuth=0.0,
+                  optical_psf_deg=0.0, optical_time_spread_ns=0.0,
                   n_time_bins=16, bin_width_ns=2.0, nsb_rate=2.0,
                   pedestal_std=0.5, saturation_limit=250.0,
                   low_gain_factor=10.0, shower_start_altitude=20000.0,
@@ -588,6 +702,8 @@ def ray_trace_gpu(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         shower_start_altitude=shower_start_altitude,
         pointing_zenith=pointing_zenith,
         pointing_azimuth=pointing_azimuth,
+        optical_psf_deg=[optical_psf_deg],
+        optical_time_spread_ns=[optical_time_spread_ns],
         device=device,
         generator=generator,
     )
@@ -598,6 +714,7 @@ def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
                     telescope_x, telescope_y, telescope_z, mirror_radius,
                     mirror_reflectivity, quantum_efficiency, *,
                     pointing_zenith=0.0, pointing_azimuth=0.0,
+                    optical_psf_deg=0.0, optical_time_spread_ns=0.0,
                     n_time_bins=16, bin_width_ns=2.0, nsb_rate=2.0,
                     pedestal_std=0.5, saturation_limit=250.0,
                     low_gain_factor=10.0, shower_start_altitude=20000.0,
@@ -625,6 +742,8 @@ def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         n_time_bins, bin_width_ns, nsb_rate, pedestal_std,
         saturation_limit, low_gain_factor,
     )
+    if not np.isfinite(pointing_zenith) or not np.isfinite(pointing_azimuth):
+        raise ValueError("pointing_zenith and pointing_azimuth must be finite")
 
     pixel_q, pixel_r, n_rings = _camera_axial_coordinates(
         pixel_x, pixel_y, pixel_size
@@ -641,6 +760,8 @@ def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
         mirror_radius=mirror_radius,
         mirror_reflectivity=mirror_reflectivity,
         quantum_efficiency=quantum_efficiency,
+        optical_psf_deg=optical_psf_deg,
+        optical_time_spread_ns=optical_time_spread_ns,
     )
     _validate_telescope_parameters(telescope_parameters)
 
@@ -652,7 +773,7 @@ def ray_trace_array(cherenkov_photons, pixel_x, pixel_y, pixel_size,
             int(n_time_bins), float(bin_width_ns), float(nsb_rate),
             float(pedestal_std), float(saturation_limit),
             float(low_gain_factor), float(shower_start_altitude),
-            pointing_zenith, pointing_azimuth,
+            float(pointing_zenith), float(pointing_azimuth),
             resolved_device, generator,
         )
     return (
@@ -706,6 +827,10 @@ def _validate_telescope_parameters(parameters):
         value = parameters[name]
         if bool(torch.any((value < 0) | (value > 1))):
             raise ValueError(f"{name} values must lie in [0, 1]")
+    for name in ('optical_psf_deg', 'optical_time_spread_ns'):
+        value = parameters[name]
+        if bool(torch.any(value < 0)):
+            raise ValueError(f"{name} must be non-negative")
 
 
 def _photon_tensor(photons, key, n_packets, device, *, default=None,
@@ -788,6 +913,17 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
         if bool(torch.any(~torch.isfinite(weights))) or bool(torch.any(weights < 0)):
             raise ValueError("Photon weights must be finite and non-negative")
 
+        theta_rad = math.radians(float(pointing_zenith))
+        phi_rad = math.radians(float(pointing_azimuth))
+        sin_theta = math.sin(theta_rad)
+        cos_theta = math.cos(theta_rad)
+        sin_phi = math.sin(phi_rad)
+        cos_phi = math.cos(phi_rad)
+        # Unit normal of the tilted mirror dish pointing toward the sky
+        nx = sin_theta * cos_phi
+        ny = sin_theta * sin_phi
+        nz = cos_theta
+
         if 'emission_time_ns' in cherenkov_photons:
             emission_time = _photon_tensor(
                 cherenkov_photons, 'emission_time_ns', n_packets, device
@@ -802,25 +938,10 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             )
             # 3D Planar Shower Wavefront Timing:
             # For an inclined shower at (pointing_zenith, pointing_azimuth), the shower front
-            # travels as a planar wavefront along direction vector s_hat.
-            # In IACT geometry, telescopes point towards (zenith, azimuth_pointing), so
-            # the shower arriving from the source travels along:
-            #   sx = -sin(theta) * cos(phi)
-            #   sy = -sin(theta) * sin(phi)
-            #   sz = -cos(theta)
-            # The distance from emission point (xe, ye, ze) to the reference plane along the
-            # shower axis is the dot product of position with s_hat:
-            #   distance_along_axis = xe * sx + ye * sy + (ze - packet_start_altitude) * sz
-            # Emission time = distance_along_axis / c.
-            # Because both lateral (xe, ye) and vertical (ze) coordinates are accounted for,
-            # Cherenkov photons from the shower maximum arrive in a coherent ~5-15 ns window,
-            # avoiding the artificial ~250 ns dispersion from 1D Δz/cos(θ) approximations.
-            import math as _math
-            theta_rad = _math.radians(float(pointing_zenith))
-            phi_rad = _math.radians(float(pointing_azimuth))
-            sx = -_math.sin(theta_rad) * _math.cos(phi_rad)
-            sy = -_math.sin(theta_rad) * _math.sin(phi_rad)
-            sz = -_math.cos(theta_rad)
+            # travels as a planar wavefront along direction vector s_hat = -n_hat.
+            sx = -nx
+            sy = -ny
+            sz = -nz
 
             slant_distance = xe * sx + ye * sy + (ze - packet_start_altitude) * sz
             emission_time = slant_distance / 0.299792458
@@ -828,24 +949,41 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
         pair_limit = _ray_pair_chunk_limit(device)
         packet_chunk_size = max(1, pair_limit // n_telescopes)
         height = np.sqrt(3.0) * 0.5 * pixel_size
+        has_optical_psf = bool(torch.any(telescope['optical_psf_deg'] > 0))
+        has_optical_time_spread = bool(torch.any(telescope['optical_time_spread_ns'] > 0))
 
         for start in range(0, n_packets, packet_chunk_size):
             end = min(start + packet_chunk_size, n_packets)
             c_xe, c_ye, c_ze = xe[start:end], ye[start:end], ze[start:end]
             c_xg, c_yg = xg[start:end], yg[start:end]
 
+            tel_x = telescope['telescope_x'][:, None]
+            tel_y = telescope['telescope_y'][:, None]
             tel_z = telescope['telescope_z'][:, None]
-            denominator = -c_ze[None, :]
-            projection = (tel_z - c_ze[None, :]) / denominator
-            x_hit = c_xe[None, :] + projection * (c_xg - c_xe)[None, :]
-            y_hit = c_ye[None, :] + projection * (c_yg - c_ye)[None, :]
+            d_vec_x = (c_xg - c_xe)[None, :]
+            d_vec_y = (c_yg - c_ye)[None, :]
+            d_vec_z = -c_ze[None, :]
+            denom = d_vec_x * nx + d_vec_y * ny + d_vec_z * nz
+            numer = (
+                (tel_x - c_xe[None, :]) * nx
+                + (tel_y - c_ye[None, :]) * ny
+                + (tel_z - c_ze[None, :]) * nz
+            )
+            t_hit = numer / denom
+            x_hit = c_xe[None, :] + t_hit * d_vec_x
+            y_hit = c_ye[None, :] + t_hit * d_vec_y
+            z_hit = c_ze[None, :] + t_hit * d_vec_z
             mirror_distance_sq = (
-                (x_hit - telescope['telescope_x'][:, None]).square()
-                + (y_hit - telescope['telescope_y'][:, None]).square()
+                (x_hit - tel_x).square()
+                + (y_hit - tel_y).square()
+                + (z_hit - tel_z).square()
             )
             mirror_hit = (
                 torch.isfinite(x_hit)
                 & torch.isfinite(y_hit)
+                & torch.isfinite(z_hit)
+                & (denom < -1e-9)
+                & (t_hit > 0)
                 & (c_ze[None, :] > tel_z)
                 & (mirror_distance_sq <= telescope['mirror_radius'][:, None].square())
             )
@@ -858,32 +996,38 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
 
             hit_x = x_hit[telescope_index, local_packet_index]
             hit_y = y_hit[telescope_index, local_packet_index]
+            hit_z = z_hit[telescope_index, local_packet_index]
             emit_x = c_xe[local_packet_index]
             emit_y = c_ye[local_packet_index]
             emit_z = c_ze[local_packet_index]
-            hit_z = telescope['telescope_z'][telescope_index]
             dx = hit_x - emit_x
             dy = hit_y - emit_y
             dz = hit_z - emit_z
-
-            theta = torch.tensor(math.radians(pointing_zenith), device=device, dtype=dx.dtype)
-            phi = torch.tensor(math.radians(pointing_azimuth), device=device, dtype=dx.dtype)
 
             vx = -dx
             vy = -dy
             vz = -dz
 
             # Rotate around Z by -phi
-            x_prime = vx * torch.cos(phi) + vy * torch.sin(phi)
-            y_prime = -vx * torch.sin(phi) + vy * torch.cos(phi)
+            x_prime = vx * cos_phi + vy * sin_phi
+            y_prime = -vx * sin_phi + vy * cos_phi
             z_prime = vz
 
             # Rotate around Y by -theta
-            x_double_prime = x_prime * torch.cos(theta) - z_prime * torch.sin(theta)
+            x_double_prime = x_prime * cos_theta - z_prime * sin_theta
             y_double_prime = y_prime
-            z_double_prime = x_prime * torch.sin(theta) + z_prime * torch.cos(theta)
+            z_double_prime = x_prime * sin_theta + z_prime * cos_theta
             u_deg = torch.rad2deg(torch.atan2(x_double_prime, z_double_prime))
             v_deg = torch.rad2deg(torch.atan2(y_double_prime, z_double_prime))
+
+            if has_optical_psf:
+                psf = telescope['optical_psf_deg'][telescope_index]
+                u_deg = u_deg + torch.randn(
+                    u_deg.shape, dtype=u_deg.dtype, device=device, generator=generator
+                ) * psf
+                v_deg = v_deg + torch.randn(
+                    v_deg.shape, dtype=v_deg.dtype, device=device, generator=generator
+                ) * psf
             
             r_float = v_deg / height
             q_float = (u_deg / pixel_size) - 0.5 * r_float
@@ -929,16 +1073,29 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
             emit_z = c_ze[local_packet_index]
             hit_x = x_hit[telescope_index, local_packet_index]
             hit_y = y_hit[telescope_index, local_packet_index]
-            hit_z = telescope['telescope_z'][telescope_index]
+            hit_z = z_hit[telescope_index, local_packet_index]
             photon_distance = torch.sqrt(
                 (hit_x - emit_x).square()
                 + (hit_y - emit_y).square()
                 + (hit_z - emit_z).square()
             )
+            cos_zen_ray = torch.clamp(
+                (emit_z - hit_z) / torch.clamp(photon_distance, min=1e-6),
+                min=1e-4,
+            )
+            delay_m = optical_path_delay_m(emit_z, hit_z, cos_zen_ray)
             arrival_time = (
                 emission_time[start:end][local_packet_index]
-                + photon_distance / (0.299792458 / 1.0003)
+                + (photon_distance + delay_m) / 0.299792458
             )
+            if has_optical_time_spread:
+                t_spread = telescope['optical_time_spread_ns'][telescope_index]
+                arrival_time = arrival_time + torch.randn(
+                    arrival_time.shape,
+                    dtype=arrival_time.dtype,
+                    device=device,
+                    generator=generator,
+                ) * t_spread
 
             probability = (
                 telescope['mirror_reflectivity'][telescope_index]
@@ -960,17 +1117,26 @@ def _ray_trace_torch_core(cherenkov_photons, pixel_q, pixel_r, n_rings,
         pixel_index = torch.cat(hit_pixels)
         arrival_time = torch.cat(hit_times)
         charge = torch.cat(hit_charges)
-        # In an IACT array (such as VERITAS), each telescope is equipped with a constant-fraction
-        # discriminator (CFD) trigger and hardware delay compensation line.
-        # Without delay compensation, the geometric plane delay across a >100m array at 30° zenith
-        # is >200 ns, which pushed all telescopes except the earliest one completely out of the
-        # narrow 32 ns (16 bin) FADC window.
-        # We align each telescope's readout window to its own arrival time.
+        # Anchor each telescope's FADC readout window to the 10th percentile of
+        # its charge-weighted arrival-time CDF (2 bins before that anchor) so
+        # stray early photons do not push the main Cherenkov pulse out of the
+        # narrow FADC window.
+        quantile = torch.tensor(0.10, device=device, dtype=charge.dtype)
         tel_trace_starts = torch.zeros(n_telescopes, device=device, dtype=arrival_time.dtype)
         for t_idx in range(n_telescopes):
             t_mask = (telescope_index == t_idx)
             if torch.any(t_mask):
-                tel_trace_starts[t_idx] = torch.min(arrival_time[t_mask]) - 2.0 * bin_width_ns
+                t_vals = arrival_time[t_mask]
+                w_vals = charge[t_mask]
+                order = torch.argsort(t_vals)
+                t_sorted = t_vals[order]
+                w_sorted = w_vals[order]
+                cdf = torch.cumsum(w_sorted, dim=0) / torch.clamp(w_sorted.sum(), min=1e-12)
+                anchor_idx = torch.clamp(
+                    torch.searchsorted(cdf, quantile),
+                    max=t_sorted.numel() - 1,
+                )
+                tel_trace_starts[t_idx] = t_sorted[anchor_idx] - 2.0 * bin_width_ns
             else:
                 tel_trace_starts[t_idx] = 0.0
 

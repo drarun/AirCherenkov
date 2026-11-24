@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import torch
 import numpy as np
+
+from sim.fadc import restore_low_gain_traces
 
 class CameraTrigger:
     def __init__(self, pixel_x, pixel_y, threshold_pe=5.0, window_ns=5.0,
@@ -162,8 +166,111 @@ class CameraTrigger:
         crossing_time[~np.any(over_threshold, axis=1)] = np.nan
         return self.evaluate(peak_amplitude, crossing_time)
 
+    def evaluate_traces_sliding_sum(self, traces, bin_width_ns=2.0, integration_bins=3):
+        """Evaluate compact 3-pixel coincidence with a sliding-window charge sum.
+
+        Integrates each pixel waveform over consecutive windows of width
+        ``integration_bins`` (e.g. 3 bins = 6 ns, matching a fast VERITAS/IACT
+        CFD pulse integration window) and enforces both compact 3-pixel
+        adjacent cluster geometry and ``window_ns`` timing coincidence.
+        """
+        traces = self._as_numpy(traces)
+        if traces.ndim != 2 or traces.shape[0] != self.adj_matrix.shape[0]:
+            raise ValueError(
+                "traces must have shape (n_camera_pixels, n_time_bins)"
+            )
+        if traces.shape[1] < 1:
+            raise ValueError("traces must contain at least one time bin")
+        if not np.all(np.isfinite(traces)):
+            raise ValueError("traces must contain only finite values")
+        if not np.isfinite(bin_width_ns) or bin_width_ns <= 0:
+            raise ValueError("bin_width_ns must be finite and greater than zero")
+        if isinstance(integration_bins, bool) or not isinstance(
+            integration_bins, (int, np.integer)
+        ):
+            raise TypeError("integration_bins must be an integer")
+        integration_bins = int(integration_bins)
+        if integration_bins < 1:
+            raise ValueError("integration_bins must be >= 1")
+
+        traces_f64 = np.asarray(traces, dtype=np.float64)
+        n_time_bins = traces_f64.shape[1]
+        if n_time_bins <= integration_bins:
+            peak_charge = np.sum(traces_f64, axis=1)
+            crossing_time = np.argmax(traces_f64, axis=1).astype(np.float64) * float(
+                bin_width_ns
+            )
+            crossing_time[peak_charge <= self.threshold] = np.nan
+            return self.evaluate(peak_charge, crossing_time)
+
+        window_sums = np.lib.stride_tricks.sliding_window_view(
+            traces_f64, integration_bins, axis=1
+        ).sum(axis=-1)
+        peak_charge = np.max(window_sums, axis=1)
+        over_thresh = window_sums > self.threshold
+        first_cross_bin = np.argmax(over_thresh, axis=1)
+        crossing_time = first_cross_bin.astype(np.float64) * float(bin_width_ns)
+        crossing_time[~np.any(over_thresh, axis=1)] = np.nan
+        return self.evaluate(peak_charge, crossing_time)
+
     @staticmethod
     def _as_numpy(values):
         if isinstance(values, torch.Tensor):
             return values.detach().cpu().numpy()
         return np.asarray(values)
+
+
+def evaluate_array_trigger(
+    img_outputs,
+    camera,
+    *,
+    threshold_pe: float = 8.0,
+    min_pixels: int = 3,
+    min_telescopes: int = 2,
+    window_ns: float = 5.0,
+    bin_width_ns: float = 2.0,
+    integration_bins: int = 3,
+    low_gain_factor: float = 10.0,
+    camera_trigger: CameraTrigger | None = None,
+) -> tuple[bool, int]:
+    """Evaluate the stereo array hardware trigger across all telescope outputs.
+
+    Restores low-gain waveforms for each ``(trace, gain)`` pair before testing
+    each telescope. When ``min_pixels == 3``, enforces compact 3-pixel adjacent
+    triangle coincidence and ``window_ns`` timing coincidence via
+    :meth:`CameraTrigger.evaluate_traces_sliding_sum`. When a custom
+    ``min_pixels != 3`` is requested, falls back to a pixel-count threshold.
+    """
+    cam_trig = None
+    if min_pixels == 3:
+        cam_trig = camera_trigger
+        if cam_trig is None:
+            cam_trig = CameraTrigger(
+                camera.pixel_x,
+                camera.pixel_y,
+                threshold_pe=threshold_pe,
+                window_ns=window_ns,
+                min_pixels=3,
+                pixel_size=camera.pixel_size,
+            )
+
+    trigger_count = 0
+    for trace, gain in img_outputs:
+        restored = restore_low_gain_traces(
+            CameraTrigger._as_numpy(trace),
+            CameraTrigger._as_numpy(gain),
+            low_gain_factor=low_gain_factor,
+        )
+        if cam_trig is not None:
+            triggered, _ = cam_trig.evaluate_traces_sliding_sum(
+                restored,
+                bin_width_ns=bin_width_ns,
+                integration_bins=integration_bins,
+            )
+            if triggered:
+                trigger_count += 1
+        else:
+            if int(np.sum(np.sum(restored, axis=1) > threshold_pe)) >= min_pixels:
+                trigger_count += 1
+
+    return bool(trigger_count >= min_telescopes), int(trigger_count)

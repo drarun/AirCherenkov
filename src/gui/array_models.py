@@ -47,6 +47,8 @@ class DetectorArrayModel:
                     focal_length=float(spec.get("focal_length", 12.0)),
                     mirror_reflectivity=float(spec.get("mirror_reflectivity", 0.82)),
                     quantum_efficiency=float(spec.get("quantum_efficiency", 0.20)),
+                    optical_psf_deg=float(spec.get("optical_psf_deg", 0.0)),
+                    optical_time_spread_ns=float(spec.get("optical_time_spread_ns", 0.0)),
                     n_rings=int(spec.get("n_rings", 12)),
                     pixel_size=float(spec.get("pixel_size", 0.15)),
                     fadc_config=self.fadc_config,
@@ -82,6 +84,8 @@ class DetectorArrayModel:
                     "focal_length": float(spec["focal_length"]),
                     "mirror_reflectivity": float(spec["mirror_reflectivity"]),
                     "quantum_efficiency": float(spec["quantum_efficiency"]),
+                    "optical_psf_deg": float(spec.get("optical_psf_deg", 0.0)),
+                    "optical_time_spread_ns": float(spec.get("optical_time_spread_ns", 0.0)),
                     "n_rings": int(spec["n_rings"]),
                     "pixel_size": float(spec["pixel_size"]),
                 }
@@ -112,6 +116,8 @@ class DetectorArrayModel:
                     "focal_length": float(t.get("focal_length", 12.0)),
                     "mirror_reflectivity": float(t.get("mirror_reflectivity", 0.82)),
                     "quantum_efficiency": float(t.get("quantum_efficiency", 0.20)),
+                    "optical_psf_deg": float(t.get("optical_psf_deg", 0.0)),
+                    "optical_time_spread_ns": float(t.get("optical_time_spread_ns", 0.0)),
                     "n_rings": int(t.get("n_rings", 12)),
                     "pixel_size": float(t.get("pixel_size", 0.15)),
                 }
@@ -145,6 +151,8 @@ def get_preset_model(name: str) -> DetectorArrayModel:
                 "focal_length": float(tel.focal_length),
                 "mirror_reflectivity": float(tel.mirror_reflectivity),
                 "quantum_efficiency": float(tel.quantum_efficiency),
+                "optical_psf_deg": float(tel.optical_psf_deg),
+                "optical_time_spread_ns": float(tel.optical_time_spread_ns),
                 "n_rings": int(tel.camera.n_rings),
                 "pixel_size": float(tel.camera.pixel_size),
             }

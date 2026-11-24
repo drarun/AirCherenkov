@@ -14,7 +14,9 @@ from sim.camera import Camera
 from sim.fadc import FADC, FADCConfig
 
 
-def _finite(name: str, value, *, positive: bool = False) -> float:
+def _finite(
+    name: str, value, *, positive: bool = False, non_negative: bool = False
+) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError(f"{name} must be a real number")
     value = float(value)
@@ -22,6 +24,8 @@ def _finite(name: str, value, *, positive: bool = False) -> float:
         raise ValueError(f"{name} must be finite")
     if positive and value <= 0:
         raise ValueError(f"{name} must be greater than zero")
+    if non_negative and value < 0:
+        raise ValueError(f"{name} must be non-negative")
     return value
 
 
@@ -53,6 +57,8 @@ class Telescope:
         n_rings=15,
         pixel_size=0.1,
         *,
+        optical_psf_deg: float = 0.0,
+        optical_time_spread_ns: float = 0.0,
         fadc_config: Optional[FADCConfig] = None,
         n_time_bins: Optional[int] = None,
         bin_width_ns: Optional[float] = None,
@@ -83,6 +89,12 @@ class Telescope:
             raise ValueError("mirror_reflectivity must lie in [0, 1]")
         if not 0.0 <= self.quantum_efficiency <= 1.0:
             raise ValueError("quantum_efficiency must lie in [0, 1]")
+        self.optical_psf_deg = _finite(
+            "optical_psf_deg", optical_psf_deg, non_negative=True
+        )
+        self.optical_time_spread_ns = _finite(
+            "optical_time_spread_ns", optical_time_spread_ns, non_negative=True
+        )
 
         if fadc_config is None:
             config = FADCConfig()
@@ -144,6 +156,8 @@ class Telescope:
         device=None,
         generator=None,
         shower_start_altitude=None,
+        pointing_zenith=0.0,
+        pointing_azimuth=0.0,
     ):
         """Trace weighted photon packets and return ``(traces, gain_flags)``.
 
@@ -172,13 +186,26 @@ class Telescope:
             self.quantum_efficiency,
             **config.backend_kwargs(),
             shower_start_altitude=start_altitude,
+            pointing_zenith=pointing_zenith,
+            pointing_azimuth=pointing_azimuth,
+            optical_psf_deg=self.optical_psf_deg,
+            optical_time_spread_ns=self.optical_time_spread_ns,
             device=resolved_device,
             generator=resolved_generator,
         )
 
 
 class VeritasTelescope(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=1268.0, **kwargs):
+    def __init__(
+        self,
+        x_tel=0.0,
+        y_tel=0.0,
+        z_tel=1268.0,
+        *,
+        optical_psf_deg=0.04,
+        optical_time_spread_ns=1.2,
+        **kwargs,
+    ):
         super().__init__(
             x_tel=x_tel,
             y_tel=y_tel,
@@ -187,12 +214,23 @@ class VeritasTelescope(Telescope):
             focal_length=12.0,
             n_rings=12,
             pixel_size=0.15,
+            optical_psf_deg=optical_psf_deg,
+            optical_time_spread_ns=optical_time_spread_ns,
             **kwargs,
         )
 
 
 class HessTelescope(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, **kwargs):
+    def __init__(
+        self,
+        x_tel=0.0,
+        y_tel=0.0,
+        z_tel=0.0,
+        *,
+        optical_psf_deg=0.035,
+        optical_time_spread_ns=1.2,
+        **kwargs,
+    ):
         super().__init__(
             x_tel=x_tel,
             y_tel=y_tel,
@@ -201,6 +239,8 @@ class HessTelescope(Telescope):
             focal_length=15.0,
             n_rings=16,
             pixel_size=0.1,
+            optical_psf_deg=optical_psf_deg,
+            optical_time_spread_ns=optical_time_spread_ns,
             **kwargs,
         )
 
@@ -213,6 +253,9 @@ class MagicTelescope(Telescope):
         z_tel=2200.0,
         mirror_reflectivity=0.85,
         quantum_efficiency=0.28,
+        *,
+        optical_psf_deg=0.035,
+        optical_time_spread_ns=0.0,
         **kwargs,
     ):
         super().__init__(
@@ -225,12 +268,23 @@ class MagicTelescope(Telescope):
             quantum_efficiency=quantum_efficiency,
             n_rings=18,
             pixel_size=0.1,
+            optical_psf_deg=optical_psf_deg,
+            optical_time_spread_ns=optical_time_spread_ns,
             **kwargs,
         )
 
 
 class CtaLST(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, **kwargs):
+    def __init__(
+        self,
+        x_tel=0.0,
+        y_tel=0.0,
+        z_tel=0.0,
+        *,
+        optical_psf_deg=0.025,
+        optical_time_spread_ns=0.0,
+        **kwargs,
+    ):
         super().__init__(
             x_tel=x_tel,
             y_tel=y_tel,
@@ -239,12 +293,23 @@ class CtaLST(Telescope):
             focal_length=28.0,
             n_rings=20,
             pixel_size=0.1,
+            optical_psf_deg=optical_psf_deg,
+            optical_time_spread_ns=optical_time_spread_ns,
             **kwargs,
         )
 
 
 class CtaMST(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, **kwargs):
+    def __init__(
+        self,
+        x_tel=0.0,
+        y_tel=0.0,
+        z_tel=0.0,
+        *,
+        optical_psf_deg=0.030,
+        optical_time_spread_ns=1.2,
+        **kwargs,
+    ):
         super().__init__(
             x_tel=x_tel,
             y_tel=y_tel,
@@ -253,12 +318,23 @@ class CtaMST(Telescope):
             focal_length=16.0,
             n_rings=15,
             pixel_size=0.1,
+            optical_psf_deg=optical_psf_deg,
+            optical_time_spread_ns=optical_time_spread_ns,
             **kwargs,
         )
 
 
 class CtaSST(Telescope):
-    def __init__(self, x_tel=0.0, y_tel=0.0, z_tel=0.0, **kwargs):
+    def __init__(
+        self,
+        x_tel=0.0,
+        y_tel=0.0,
+        z_tel=0.0,
+        *,
+        optical_psf_deg=0.050,
+        optical_time_spread_ns=0.5,
+        **kwargs,
+    ):
         super().__init__(
             x_tel=x_tel,
             y_tel=y_tel,
@@ -267,6 +343,8 @@ class CtaSST(Telescope):
             focal_length=2.2,
             n_rings=10,
             pixel_size=0.1,
+            optical_psf_deg=optical_psf_deg,
+            optical_time_spread_ns=optical_time_spread_ns,
             **kwargs,
         )
 
@@ -345,6 +423,8 @@ class TelescopeArray:
                     "focal_length": float(tel.focal_length),
                     "mirror_reflectivity": float(tel.mirror_reflectivity),
                     "quantum_efficiency": float(tel.quantum_efficiency),
+                    "optical_psf_deg": float(tel.optical_psf_deg),
+                    "optical_time_spread_ns": float(tel.optical_time_spread_ns),
                     "n_rings": int(tel.camera.n_rings),
                     "pixel_size": float(tel.camera.pixel_size),
                     "shower_start_altitude": float(tel.shower_start_altitude),
@@ -371,6 +451,8 @@ class TelescopeArray:
                     focal_length=float(spec.get("focal_length", 12.0)),
                     mirror_reflectivity=float(spec.get("mirror_reflectivity", 0.82)),
                     quantum_efficiency=float(spec.get("quantum_efficiency", 0.20)),
+                    optical_psf_deg=float(spec.get("optical_psf_deg", 0.0)),
+                    optical_time_spread_ns=float(spec.get("optical_time_spread_ns", 0.0)),
                     n_rings=int(spec.get("n_rings", 12)),
                     pixel_size=float(spec.get("pixel_size", 0.15)),
                     shower_start_altitude=float(spec.get("shower_start_altitude", 20000.0)),
@@ -447,6 +529,8 @@ class TelescopeArray:
                         device=tel_device,
                         generator=tel_generator,
                         shower_start_altitude=start_altitude,
+                        pointing_zenith=pointing_zenith,
+                        pointing_azimuth=pointing_azimuth,
                     )
                 continue
 
@@ -468,6 +552,12 @@ class TelescopeArray:
                 shower_start_altitude=start_altitude,
                 pointing_zenith=pointing_zenith,
                 pointing_azimuth=pointing_azimuth,
+                optical_psf_deg=np.asarray(
+                    [tel.optical_psf_deg for tel in telescopes], dtype=np.float64
+                ),
+                optical_time_spread_ns=np.asarray(
+                    [tel.optical_time_spread_ns for tel in telescopes], dtype=np.float64
+                ),
                 device=tel_device,
                 generator=tel_generator,
             )

@@ -10,7 +10,7 @@ from tqdm import tqdm
 sys.path.insert(0, 'src')
 from sim.shower import ShowerSimulation
 from sim.telescope import TelescopeArray
-from sim.fadc import restore_low_gain_traces
+from sim.trigger import CameraTrigger, evaluate_array_trigger
 
 import argparse
 
@@ -143,6 +143,15 @@ def generate_training_data(
     array = TelescopeArray.veritas_array()
     arr_cx = float(np.mean([t.x_tel for t in array.telescopes]))
     arr_cy = float(np.mean([t.y_tel for t in array.telescopes]))
+    cam = array.telescopes[0].camera
+    cam_trigger = CameraTrigger(
+        cam.pixel_x,
+        cam.pixel_y,
+        threshold_pe=8.0,
+        window_ns=5.0,
+        min_pixels=3,
+        pixel_size=cam.pixel_size,
+    )
 
     current_chunk = []
     chunk_idx = start_chunk_idx
@@ -251,7 +260,7 @@ def generate_training_data(
                     x_init=x_init_batch, y_init=y_init_batch,
                     px_init=px_batch, py_init=py_batch, pz_init=pz_batch
                 )
-                sim.run(max_generations=30, verbose=False)
+                sim.run(max_generations=60, verbose=False)
 
             passed_trigger_count_in_batch = 0
             for i in range(current_batch_size):
@@ -281,14 +290,19 @@ def generate_training_data(
                     tel.x_tel += ix
                     tel.y_tel += iy
 
-                # Hardware Trigger: At least 2 telescopes with >= 3 pixels having > 8 PE total
-                trigger_count = 0
-                for trace, gain in img_outputs:
-                    total_pe_per_pixel = np.sum(restore_low_gain_traces(trace, gain), axis=1)
-                    if np.sum(total_pe_per_pixel > 8.0) >= 3:
-                        trigger_count += 1
+                # Hardware Trigger: At least 2 telescopes with compact 3-pixel adjacent coincidence (> 8 PE within 5 ns)
+                passed, trigger_count = evaluate_array_trigger(
+                    img_outputs,
+                    cam,
+                    threshold_pe=8.0,
+                    min_pixels=3,
+                    min_telescopes=2,
+                    bin_width_ns=array.telescopes[0].fadc_config.bin_width_ns,
+                    low_gain_factor=array.telescopes[0].fadc_config.low_gain_factor,
+                    camera_trigger=cam_trigger,
+                )
 
-                if trigger_count >= 2:
+                if passed:
                     passed_trigger_count_in_batch += 1
                     passed_trigger_count += 1
                     if pids[i] == 'gamma':
