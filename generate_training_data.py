@@ -13,6 +13,30 @@ from sim.telescope import TelescopeArray
 from sim.trigger import CameraTrigger, evaluate_array_trigger
 
 import argparse
+import subprocess
+from datetime import datetime, timezone
+
+SIM_SCHEMA_VERSION = "v2.0"
+
+
+def _get_git_provenance():
+    """Return (commit_hash, is_dirty) for the repository."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        )
+        return commit, dirty
+    except Exception:
+        return "unknown", False
 
 # Enable TF32 for up to 3x faster tensor math on RTX 3000/4000/5000 series
 if torch.cuda.is_available():
@@ -53,6 +77,8 @@ def generate_training_data(
     hadron_e_max=None,
     hadron_spectral_index=None,
     impact_radius=750.0,
+    append=False,
+    sim_version=None,
     debug=False,
 ):
     """
@@ -125,15 +151,86 @@ def generate_training_data(
 
     target_gammas = num_gammas
     target_hadrons = num_hadrons
-    gammas_needed = max(0, target_gammas - gammas_saved)
-    hadrons_needed = max(0, target_hadrons - hadrons_saved)
+    if append:
+        gammas_needed = max(0, target_gammas)
+        hadrons_needed = max(0, target_hadrons)
+        total_target_events = gammas_needed + hadrons_needed
+    else:
+        gammas_needed = max(0, target_gammas - gammas_saved)
+        hadrons_needed = max(0, target_hadrons - hadrons_saved)
     events_remaining = gammas_needed + hadrons_needed
 
     if events_remaining <= 0:
         print("All requested events have already been generated!")
         return
 
-    print(f"Generating {gammas_needed} gammas and {hadrons_needed} hadrons in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
+    # Remove stale cached processed/data.pt so downstream scripts rebuild from raw chunks
+    processed_cache = os.path.join(os.path.dirname(os.path.normpath(output_dir)), "processed", "data.pt")
+    if os.path.exists(processed_cache):
+        os.remove(processed_cache)
+        print(f"Removed stale processed cache: {processed_cache}")
+
+    git_commit, git_dirty = _get_git_provenance()
+    effective_sim_version = sim_version or SIM_SCHEMA_VERSION
+    manifest_path = os.path.join(output_dir, "sim_manifest.json")
+    session_start_chunk = start_chunk_idx
+    session_gammas_thrown_start = gammas_thrown
+    session_hadrons_thrown_start = hadrons_thrown
+    session_gammas_saved = 0
+    session_hadrons_saved = 0
+    session_started_at = datetime.now(timezone.utc).isoformat()
+
+    def _update_manifest(last_chunk_idx, status="in_progress"):
+        manifest = {"schema_version": SIM_SCHEMA_VERSION, "sessions": []}
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r") as mf:
+                    manifest = json.load(mf)
+            except Exception:
+                pass
+        sessions = manifest.setdefault("sessions", [])
+        session_entry = {
+            "session_index": len(sessions),
+            "sim_version": effective_sim_version,
+            "git_commit": git_commit,
+            "git_dirty": git_dirty,
+            "started_at": session_started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "append": bool(append),
+            "chunk_start": session_start_chunk,
+            "chunk_end": last_chunk_idx,
+            "gammas_thrown_session": gammas_thrown - session_gammas_thrown_start,
+            "hadrons_thrown_session": hadrons_thrown - session_hadrons_thrown_start,
+            "gammas_saved_session": session_gammas_saved,
+            "hadrons_saved_session": session_hadrons_saved,
+            "params": {
+                "e_min": e_min,
+                "e_max": e_max,
+                "spectral_index": spectral_index,
+                "hadron_e_min": hadron_e_min,
+                "hadron_e_max": hadron_e_max,
+                "hadron_spectral_index": hadron_spectral_index,
+                "impact_radius": impact_radius,
+                "zenith_deg": zenith_deg,
+                "azimuth_deg": azimuth_deg,
+                "wobble_offset": wobble_offset,
+                "wobble_mode": wobble_mode,
+                "diffuse_fov": diffuse_fov,
+            },
+        }
+        if sessions and sessions[-1].get("started_at") == session_started_at:
+            session_entry["session_index"] = sessions[-1].get("session_index", len(sessions) - 1)
+            sessions[-1] = session_entry
+        else:
+            sessions.append(session_entry)
+        with open(manifest_path, "w") as mf:
+            json.dump(manifest, mf, indent=2)
+
+    if append:
+        print(f"APPENDING +{gammas_needed} gammas and +{hadrons_needed} hadrons (starting at chunk {start_chunk_idx}) in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
+    else:
+        print(f"Generating {gammas_needed} gammas and {hadrons_needed} hadrons in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
     if gammas_needed > 0:
         print(f"Gamma energy range:  {e_min:.0f} - {e_max:.0f} GeV, spectral index: E^-{spectral_index:.1f}")
     if hadrons_needed > 0:
@@ -249,7 +346,7 @@ def generate_training_data(
             # Run fully batched simulation with direction injection aimed at (0, 0, z_obs)
             x_init_batch = []
             y_init_batch = []
-            z_obs = 1275.0
+            z_obs = 1268.0
             for pz_val, px_val, py_val, z_val in zip(pz_batch, px_batch, py_batch, z_starts):
                 x_init_batch.append((z_val - z_obs) * (px_val / pz_val))
                 y_init_batch.append((z_val - z_obs) * (py_val / pz_val))
@@ -307,8 +404,10 @@ def generate_training_data(
                     passed_trigger_count += 1
                     if pids[i] == 'gamma':
                         gammas_needed = max(0, gammas_needed - 1)
+                        session_gammas_saved += 1
                     else:
                         hadrons_needed = max(0, hadrons_needed - 1)
+                        session_hadrons_saved += 1
                     traces = [trace for trace, gain in img_outputs]
                     gains = [gain for trace, gain in img_outputs]
 
@@ -319,11 +418,14 @@ def generate_training_data(
                         'label': 1 if pids[i] == 'gamma' else 0,
                         'impact_x': ix,
                         'impact_y': iy,
+                        'impact_radius_thrown': float(impact_radius),
                         'zenith_deg': zenith_deg,
                         'azimuth_deg': azimuth_deg,
                         'true_zenith_deg': float(np.degrees(evt_zen_batch[i])),
                         'true_azimuth_deg': float(np.degrees(evt_azi_batch[i])),
                         'wobble_dir': wobble_dirs[i],
+                        'sim_version': effective_sim_version,
+                        'sim_git_commit': git_commit,
                     })
 
             events_remaining = gammas_needed + hadrons_needed
@@ -342,9 +444,32 @@ def generate_training_data(
 
                 with open(state_file, 'w') as f:
                     json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
+                _update_manifest(chunk_idx, status="completed" if events_remaining == 0 else "in_progress")
 
                 current_chunk = []
                 chunk_idx += 1
+
+            # Graceful pause-file check after each GPU batch
+            pause_file = os.path.join(output_dir, "PAUSE")
+            if os.path.exists(pause_file):
+                pbar.write(f"\nPAUSE file detected ({pause_file}). Flushing progress and pausing cleanly...")
+                if len(current_chunk) > 0:
+                    out_filename = os.path.join(output_dir, f"sim_batch_{chunk_idx:05d}.pt")
+                    torch.save(current_chunk, out_filename)
+                    with open(state_file, 'w') as f:
+                        json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
+                    _update_manifest(chunk_idx, status="paused")
+                    current_chunk = []
+                    chunk_idx += 1
+                elif chunk_idx > session_start_chunk:
+                    with open(state_file, 'w') as f:
+                        json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
+                    _update_manifest(chunk_idx - 1, status="paused")
+                try:
+                    os.remove(pause_file)
+                except OSError:
+                    pass
+                break
 
     except KeyboardInterrupt:
         print("\nGeneration interrupted by user.")
@@ -354,6 +479,7 @@ def generate_training_data(
             torch.save(current_chunk, out_filename)
             with open(state_file, 'w') as f:
                 json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
+            _update_manifest(chunk_idx, status="interrupted")
 
     finally:
         pbar.close()
@@ -380,6 +506,8 @@ if __name__ == '__main__':
     parser.add_argument('--hadron_e_max', type=float, default=None, help='Max hadron energy in GeV (defaults to e_max)')
     parser.add_argument('--hadron_spectral_index', type=float, default=None, help='Hadron spectral index (defaults to spectral_index)')
     parser.add_argument('--impact_radius', type=float, default=750.0, help='Max impact parameter radius in meters')
+    parser.add_argument('--append', action='store_true', help='Append +num_gammas/+num_hadrons to existing dataset instead of resuming to total')
+    parser.add_argument('--sim_version', type=str, default=None, help='Override simulation version tag in manifest and event metadata')
     parser.add_argument('--debug', action='store_true', help='Enable verbose DEBUG output')
     args = parser.parse_args()
 
@@ -401,5 +529,7 @@ if __name__ == '__main__':
         hadron_e_max=args.hadron_e_max,
         hadron_spectral_index=args.hadron_spectral_index,
         impact_radius=args.impact_radius,
+        append=args.append,
+        sim_version=args.sim_version,
         debug=args.debug,
     )
