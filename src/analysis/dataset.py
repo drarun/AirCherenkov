@@ -1,4 +1,5 @@
 import concurrent.futures
+import multiprocessing
 import os
 import torch
 import numpy as np
@@ -260,7 +261,10 @@ class CherenkovDataset(InMemoryDataset):
             if n_files >= 2:
                 max_workers = min(max(1, (os.cpu_count() or 2) - 1), 8, n_files)
                 try:
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=max_workers,
+                        mp_context=multiprocessing.get_context("spawn"),
+                    ) as pool:
                         cache_paths = list(
                             pool.map(
                                 _process_sim_chunk_file,
