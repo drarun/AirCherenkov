@@ -819,10 +819,15 @@ def describe_model_and_dataset(
     else:
         model_arch = "Geometric Hillas Stereo (No ML Loaded)"
 
+    from sim.provenance import read_dataset_provenance
+
     model_title = f"{model_arch} [{model_path_clean}]" if model_path_clean else model_arch
     dataset_title = data_path_clean if data_path_clean else "In-Memory / Unspecified Dataset"
+    sim_prov = read_dataset_provenance(data_path_clean)
+    sim_tag = str(sim_prov.get("summary_tag") or "").strip()
+    sim_suffix = f"  |  Sim: {sim_tag}" if sim_tag else ""
     provenance_banner = (
-        f"Model: {model_title}  ->  Dataset: {dataset_title}  |  Array: {array_preset}"
+        f"Model: {model_title}  ->  Dataset: {dataset_title}  |  Array: {array_preset}{sim_suffix}"
     )
     return {
         "model_arch": model_arch,
@@ -831,6 +836,7 @@ def describe_model_and_dataset(
         "data_path": data_path_clean,
         "dataset_title": dataset_title,
         "array_preset": str(array_preset or "VERITAS"),
+        "sim_provenance": sim_tag,
         "provenance_banner": provenance_banner,
     }
 
@@ -842,6 +848,7 @@ _PROVENANCE_KEYS = (
     "data_path",
     "dataset_title",
     "array_preset",
+    "sim_provenance",
     "provenance_banner",
 )
 
@@ -1338,6 +1345,27 @@ class SimulationWorker(QThread):
         all_trig_ix: List[float] = []
         all_trig_iy: List[float] = []
 
+        from sim.provenance import (
+            SIM_SCHEMA_VERSION,
+            clean_str,
+            get_git_provenance,
+            update_sim_manifest,
+            utc_now_iso,
+        )
+
+        sim_version = clean_str(p.get("sim_version")) or SIM_SCHEMA_VERSION
+        git_commit, git_dirty = get_git_provenance()
+        session_started_at = utc_now_iso()
+        session_gammas_thrown_start = gammas_thrown
+        session_hadrons_thrown_start = hadrons_thrown
+        session_gammas_saved = 0
+        session_hadrons_saved = 0
+        chunk_gammas_saved = 0
+        chunk_hadrons_saved = 0
+        session_chunk_history: List[Dict[str, Any]] = []
+        target_gammas_session = gammas_needed
+        target_hadrons_session = hadrons_needed
+
         while events_remaining > 0 and not self._stop_event.is_set():
             pids: List[str] = []
             energies: List[float] = []
@@ -1477,9 +1505,13 @@ class SimulationWorker(QThread):
                     if is_g:
                         gammas_needed = max(0, gammas_needed - 1)
                         gammas_saved += 1
+                        session_gammas_saved += 1
+                        chunk_gammas_saved += 1
                     else:
                         hadrons_needed = max(0, hadrons_needed - 1)
                         hadrons_saved += 1
+                        session_hadrons_saved += 1
+                        chunk_hadrons_saved += 1
 
                     traces = [trace for trace, _ in img_outputs]
                     gains = [gain for _, gain in img_outputs]
@@ -1490,11 +1522,16 @@ class SimulationWorker(QThread):
                         "label": 1 if is_g else 0,
                         "impact_x": float(ix),
                         "impact_y": float(iy),
+                        "impact_radius_thrown": float(impact_radius),
                         "zenith_deg": zenith_deg,
                         "azimuth_deg": azimuth_deg,
                         "true_zenith_deg": float(np.degrees(evt_zen_batch[i])),
                         "true_azimuth_deg": float(np.degrees(evt_azi_batch[i])),
                         "wobble_dir": wobble_dirs[i],
+                        "sim_version": sim_version,
+                        "sim_git_commit": git_commit,
+                        "sim_created_utc": utc_now_iso(),
+                        "array_preset": str(self.array_model.preset_name),
                     }
                     current_chunk.append(ev_rec)
                     all_trig_e.append(float(energies[i]))
@@ -1528,6 +1565,16 @@ class SimulationWorker(QThread):
                 if current_chunk:
                     out_filename = os.path.join(output_dir, f"sim_batch_{chunk_idx:05d}.pt")
                     torch.save(current_chunk, out_filename)
+                    session_chunk_history.append(
+                        {
+                            "chunk_idx": chunk_idx,
+                            "timestamp_utc": utc_now_iso(),
+                            "gammas_saved": chunk_gammas_saved,
+                            "hadrons_saved": chunk_hadrons_saved,
+                        }
+                    )
+                    chunk_gammas_saved = 0
+                    chunk_hadrons_saved = 0
                     self.log.emit(f"Saved chunk {os.path.basename(out_filename)} ({len(current_chunk)} events)")
                     current_chunk = []
                     chunk_idx += 1
@@ -1540,6 +1587,47 @@ class SimulationWorker(QThread):
                             pass
                 with open(state_file, "w", encoding="utf-8") as fh:
                     json.dump({"gammas_thrown": gammas_thrown, "hadrons_thrown": hadrons_thrown}, fh)
+                status_str = (
+                    "paused"
+                    if self._stop_event.is_set()
+                    else ("completed" if events_remaining == 0 else "in_progress")
+                )
+                update_sim_manifest(
+                    output_dir,
+                    {
+                        "sim_version": sim_version,
+                        "git_commit": git_commit,
+                        "git_dirty": git_dirty,
+                        "started_at": session_started_at,
+                        "updated_at": utc_now_iso(),
+                        "status": status_str,
+                        "append": append_mode,
+                        "chunk_start": start_chunk_idx,
+                        "chunk_end": max(start_chunk_idx, chunk_idx - 1),
+                        "target_gammas_session": int(target_gammas_session),
+                        "target_hadrons_session": int(target_hadrons_session),
+                        "gammas_thrown_session": gammas_thrown - session_gammas_thrown_start,
+                        "hadrons_thrown_session": hadrons_thrown - session_hadrons_thrown_start,
+                        "gammas_saved_session": session_gammas_saved,
+                        "hadrons_saved_session": session_hadrons_saved,
+                        "chunk_history": list(session_chunk_history),
+                        "params": {
+                            "e_min": e_min,
+                            "e_max": e_max,
+                            "spectral_index": g_idx,
+                            "hadron_e_min": h_emin,
+                            "hadron_e_max": h_emax,
+                            "hadron_spectral_index": h_idx,
+                            "impact_radius": impact_radius,
+                            "zenith_deg": zenith_deg,
+                            "azimuth_deg": azimuth_deg,
+                            "wobble_offset": wobble_offset,
+                            "wobble_mode": wobble_mode,
+                            "diffuse_fov": diffuse_fov,
+                        },
+                    },
+                    schema_version=SIM_SCHEMA_VERSION,
+                )
 
         if self._stop_event.is_set():
             self.log.emit("Simulation paused cleanly; state saved.")

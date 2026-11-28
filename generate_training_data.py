@@ -13,30 +13,13 @@ from sim.telescope import TelescopeArray
 from sim.trigger import CameraTrigger, evaluate_array_trigger
 
 import argparse
-import subprocess
-from datetime import datetime, timezone
-
-SIM_SCHEMA_VERSION = "v2.0"
-
-
-def _get_git_provenance():
-    """Return (commit_hash, is_dirty) for the repository."""
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        dirty = bool(
-            subprocess.check_output(
-                ["git", "status", "--porcelain"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
-        )
-        return commit, dirty
-    except Exception:
-        return "unknown", False
+from sim.provenance import (
+    SIM_SCHEMA_VERSION,
+    clean_str,
+    get_git_provenance,
+    update_sim_manifest,
+    utc_now_iso,
+)
 
 # Enable TF32 for up to 3x faster tensor math on RTX 3000/4000/5000 series
 if torch.cuda.is_available():
@@ -170,40 +153,36 @@ def generate_training_data(
         os.remove(processed_cache)
         print(f"Removed stale processed cache: {processed_cache}")
 
-    git_commit, git_dirty = _get_git_provenance()
-    effective_sim_version = sim_version or SIM_SCHEMA_VERSION
-    manifest_path = os.path.join(output_dir, "sim_manifest.json")
+    git_commit, git_dirty = get_git_provenance()
+    effective_sim_version = clean_str(sim_version) or SIM_SCHEMA_VERSION
     session_start_chunk = start_chunk_idx
     session_gammas_thrown_start = gammas_thrown
     session_hadrons_thrown_start = hadrons_thrown
     session_gammas_saved = 0
     session_hadrons_saved = 0
-    session_started_at = datetime.now(timezone.utc).isoformat()
+    session_chunk_history = []
+    chunk_gammas_saved = 0
+    chunk_hadrons_saved = 0
+    session_started_at = utc_now_iso()
 
     def _update_manifest(last_chunk_idx, status="in_progress"):
-        manifest = {"schema_version": SIM_SCHEMA_VERSION, "sessions": []}
-        if os.path.exists(manifest_path):
-            try:
-                with open(manifest_path, "r") as mf:
-                    manifest = json.load(mf)
-            except Exception:
-                pass
-        sessions = manifest.setdefault("sessions", [])
         session_entry = {
-            "session_index": len(sessions),
             "sim_version": effective_sim_version,
             "git_commit": git_commit,
             "git_dirty": git_dirty,
             "started_at": session_started_at,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": utc_now_iso(),
             "status": status,
             "append": bool(append),
             "chunk_start": session_start_chunk,
             "chunk_end": last_chunk_idx,
+            "target_gammas_session": int(num_gammas) if append else max(0, int(target_gammas) - gammas_saved + session_gammas_saved),
+            "target_hadrons_session": int(num_hadrons) if append else max(0, int(target_hadrons) - hadrons_saved + session_hadrons_saved),
             "gammas_thrown_session": gammas_thrown - session_gammas_thrown_start,
             "hadrons_thrown_session": hadrons_thrown - session_hadrons_thrown_start,
             "gammas_saved_session": session_gammas_saved,
             "hadrons_saved_session": session_hadrons_saved,
+            "chunk_history": list(session_chunk_history),
             "params": {
                 "e_min": e_min,
                 "e_max": e_max,
@@ -219,13 +198,7 @@ def generate_training_data(
                 "diffuse_fov": diffuse_fov,
             },
         }
-        if sessions and sessions[-1].get("started_at") == session_started_at:
-            session_entry["session_index"] = sessions[-1].get("session_index", len(sessions) - 1)
-            sessions[-1] = session_entry
-        else:
-            sessions.append(session_entry)
-        with open(manifest_path, "w") as mf:
-            json.dump(manifest, mf, indent=2)
+        update_sim_manifest(output_dir, session_entry, schema_version=SIM_SCHEMA_VERSION)
 
     if append:
         print(f"APPENDING +{gammas_needed} gammas and +{hadrons_needed} hadrons (starting at chunk {start_chunk_idx}) in batches of {batch_size}, saving every {save_every} events to {output_dir}.")
@@ -405,9 +378,11 @@ def generate_training_data(
                     if pids[i] == 'gamma':
                         gammas_needed = max(0, gammas_needed - 1)
                         session_gammas_saved += 1
+                        chunk_gammas_saved += 1
                     else:
                         hadrons_needed = max(0, hadrons_needed - 1)
                         session_hadrons_saved += 1
+                        chunk_hadrons_saved += 1
                     traces = [trace for trace, gain in img_outputs]
                     gains = [gain for trace, gain in img_outputs]
 
@@ -426,6 +401,8 @@ def generate_training_data(
                         'wobble_dir': wobble_dirs[i],
                         'sim_version': effective_sim_version,
                         'sim_git_commit': git_commit,
+                        'sim_created_utc': utc_now_iso(),
+                        'array_preset': 'VERITAS',
                     })
 
             events_remaining = gammas_needed + hadrons_needed
@@ -441,6 +418,14 @@ def generate_training_data(
             if len(current_chunk) >= save_every or events_remaining == 0:
                 out_filename = os.path.join(output_dir, f"sim_batch_{chunk_idx:05d}.pt")
                 torch.save(current_chunk, out_filename)
+                session_chunk_history.append({
+                    "chunk_idx": chunk_idx,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "gammas_saved": chunk_gammas_saved,
+                    "hadrons_saved": chunk_hadrons_saved,
+                })
+                chunk_gammas_saved = 0
+                chunk_hadrons_saved = 0
 
                 with open(state_file, 'w') as f:
                     json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
@@ -456,6 +441,14 @@ def generate_training_data(
                 if len(current_chunk) > 0:
                     out_filename = os.path.join(output_dir, f"sim_batch_{chunk_idx:05d}.pt")
                     torch.save(current_chunk, out_filename)
+                    session_chunk_history.append({
+                        "chunk_idx": chunk_idx,
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "gammas_saved": chunk_gammas_saved,
+                        "hadrons_saved": chunk_hadrons_saved,
+                    })
+                    chunk_gammas_saved = 0
+                    chunk_hadrons_saved = 0
                     with open(state_file, 'w') as f:
                         json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
                     _update_manifest(chunk_idx, status="paused")
@@ -477,6 +470,12 @@ def generate_training_data(
             out_filename = os.path.join(output_dir, f"sim_batch_{chunk_idx:05d}.pt")
             print(f"Saving remaining {len(current_chunk)} events to {out_filename} before exiting...")
             torch.save(current_chunk, out_filename)
+            session_chunk_history.append({
+                "chunk_idx": chunk_idx,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "gammas_saved": chunk_gammas_saved,
+                "hadrons_saved": chunk_hadrons_saved,
+            })
             with open(state_file, 'w') as f:
                 json.dump({'gammas_thrown': gammas_thrown, 'hadrons_thrown': hadrons_thrown}, f)
             _update_manifest(chunk_idx, status="interrupted")

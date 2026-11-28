@@ -25,7 +25,8 @@ def extract_stereo_features(
     z_obs: float = 1275.0,
     gain_flags: Optional[np.ndarray] = None,
     include_extended: bool = False,
-) -> np.ndarray:
+    return_intermediates: bool = False,
+):
     """Extract a fixed-size feature vector for an event across all telescopes.
 
     Base feature vector structure (65 features):
@@ -67,6 +68,9 @@ def extract_stereo_features(
     n_tel = len(telescopes)
     feat_tel = []
     ext_tel = []
+    restored_traces: List[np.ndarray] = []
+    dp_results: List[Any] = []
+    hillas_results: List[Any] = []
 
     tot_size = 0.0
     cog_x_num = 0.0
@@ -82,6 +86,10 @@ def extract_stereo_features(
             c_clean, mask = dp.charges, dp.mask
             n_pix = int(np.count_nonzero(mask))
             h = compute_hillas(camera, c_clean, mask) if n_pix >= 3 else None
+            if return_intermediates:
+                restored_traces.append(trace)
+                dp_results.append(dp)
+                hillas_results.append(h)
         else:
             dp = None
             n_pix = 0
@@ -158,9 +166,10 @@ def extract_stereo_features(
     array_feats = [n_trig, np.log10(1.0 + tot_size), cog_x, cog_y] + geom_feats
 
     base_vec = feat_tel + array_feats + impact_feats
-    if include_extended:
-        return np.array(base_vec + ext_tel, dtype=np.float32)
-    return np.array(base_vec, dtype=np.float32)
+    out_vec = np.array(base_vec + ext_tel, dtype=np.float32) if include_extended else np.array(base_vec, dtype=np.float32)
+    if return_intermediates:
+        return out_vec, restored_traces, dp_results, hillas_results
+    return out_vec
 
 
 # Feature indices that encode absolute arrival direction / source position in the camera.

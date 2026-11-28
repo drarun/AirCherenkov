@@ -122,6 +122,7 @@ class AirCherenkovMainWindow(QMainWindow):
 
         self.array_model: DetectorArrayModel = get_preset_model(initial_preset)
         self._active_bundle: Optional[Dict[str, Any]] = None
+        self._last_viewer_loaded_path: Optional[str] = None
 
         central = QWidget()
         v_layout = QVBoxLayout(central)
@@ -276,17 +277,24 @@ class AirCherenkovMainWindow(QMainWindow):
             self.irf_tab.set_test_data(clean)
         if self.skymap_tab.edit_test.text() != clean:
             self.skymap_tab.set_test_data(clean)
+        self.sim_tab.set_monitored_directory(clean)
         try:
+            target_to_load: Optional[str] = None
             if os.path.isdir(clean):
                 pt_files = sorted(glob.glob(os.path.join(clean, "sim_batch_*.pt")))
                 if not pt_files:
                     pt_files = sorted(glob.glob(os.path.join(clean, "raw", "sim_batch_*.pt")))
                 if pt_files:
-                    self.viewer_tab.load_path(pt_files[0])
+                    target_to_load = pt_files[0]
             elif os.path.isfile(clean) and any(
                 clean.lower().endswith(ext) for ext in (".pt", ".h5", ".hdf5", ".npz", ".vbf", ".root")
             ):
-                self.viewer_tab.load_path(clean)
+                target_to_load = clean
+            if target_to_load:
+                abs_target = os.path.abspath(target_to_load)
+                if abs_target != self._last_viewer_loaded_path:
+                    self.viewer_tab.load_path(target_to_load)
+                    self._last_viewer_loaded_path = abs_target
         except Exception:
             pass
         self._update_active_context_banner()
@@ -348,16 +356,17 @@ class AirCherenkovMainWindow(QMainWindow):
         for candidate in ("data/corsika_crab_30deg/raw", "data/stereo_eval_v2"):
             if os.path.isdir(candidate):
                 try:
-                    # Load first batch lightly so Event Viewer is immediately populated if data exists
                     pt_files = sorted(glob.glob(os.path.join(candidate, "sim_batch_*.pt")))
                     if pt_files:
-                        self.viewer_tab.load_path(pt_files[0])
                         self.set_active_dataset_path(candidate)
                         break
                 except Exception:
                     pass
 
-        if os.path.exists("data/eval_predictions_corsika_upgraded.npz"):
+        if (
+            os.path.exists("data/eval_predictions_corsika_upgraded.npz")
+            and os.path.exists("data/corsika_crab_30deg/processed/data.pt")
+        ):
             try:
                 self.train_tab.load_pretrained_gnn_benchmark()
             except Exception:
@@ -405,6 +414,7 @@ class AirCherenkovMainWindow(QMainWindow):
         self._update_active_context_banner(self._active_bundle)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.sim_tab.shutdown()
         for tab in (self.sim_tab, self.train_tab, self.irf_tab, self.skymap_tab):
             for attr in ("worker", "eval_worker"):
                 w = getattr(tab, attr, None)

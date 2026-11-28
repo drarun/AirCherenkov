@@ -94,7 +94,7 @@ def reconstruct_event_geometric(
     camera: Camera,
     pointing_zenith_deg: float = 30.0,
     pointing_azimuth_deg: float = 0.0,
-    z_obs: float = 1275.0,
+    z_obs: float = 1268.0,
     min_size: float = 40.0,
     max_wl_ratio: float = 0.88,
     gain_flags: Optional[np.ndarray] = None,

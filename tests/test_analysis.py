@@ -167,3 +167,62 @@ def test_spectral_fit_synthetic_recovery():
     assert np.isclose(fit['alpha'], true_alpha, rtol=1e-3)
     assert fit['alpha_err'] > 0
     assert fit['f0_err'] > 0
+
+
+def test_multi_session_effective_area_and_threshold():
+    from analysis.irf import (
+        build_effective_area_from_manifest,
+        build_energy_migration_matrix,
+        compute_energy_threshold,
+    )
+
+    # Session 0: 10-100 GeV, R=300m; Session 1: 100-10000 GeV, R=750m
+    # Constant true A_eff = 0.25 * pi * 250^2 across 10-10000 GeV
+    true_aeff = 0.25 * np.pi * (250.0 ** 2)
+    n0 = 200_000
+    n1 = 200_000
+    manifest = {
+        "sessions": [
+            {
+                "sim_version": "v2.0",
+                "gammas_thrown_session": n0,
+                "params": {"e_min": 10.0, "e_max": 100.0, "spectral_index": 2.0, "impact_radius": 300.0},
+            },
+            {
+                "sim_version": "v1.0",
+                "gammas_thrown_session": n1,
+                "params": {"e_min": 100.0, "e_max": 10000.0, "spectral_index": 2.0, "impact_radius": 750.0},
+            },
+        ]
+    }
+    rng = np.random.default_rng(42)
+    # Sample E^-2 in [10, 100] and [100, 10000] and select with probability true_aeff / (pi * R_s^2)
+    u0 = rng.random(n0)
+    e0 = 10.0 / (1.0 - u0 * (1.0 - 10.0 / 100.0))
+    sel0 = e0[rng.random(n0) < (true_aeff / (np.pi * 300.0 ** 2))]
+
+    u1 = rng.random(n1)
+    e1 = 100.0 / (1.0 - u1 * (1.0 - 100.0 / 10000.0))
+    sel1 = e1[rng.random(n1) < (true_aeff / (np.pi * 750.0 ** 2))]
+
+    all_sel = np.concatenate([sel0, sel1])
+    res = build_effective_area_from_manifest(
+        manifest, all_sel, np.ones(len(all_sel), dtype=bool), n_bins=12
+    )
+    # All bins should be statistically consistent with true_aeff (|z| < 3.0) and
+    # well-sampled low/mid bins (including the 100 GeV stitch) within 6%.
+    rel_err = np.abs(res["aeff"] - true_aeff) / true_aeff
+    z_scores = np.abs(res["aeff"] - true_aeff) / np.maximum(res["aeff_err"], 1.0)
+    assert np.all(rel_err[:4] < 0.05)
+    assert np.median(z_scores) < 1.5
+    assert np.all(z_scores < 3.5)
+
+    thresh = compute_energy_threshold(res, spectral_index=2.49)
+    assert thresh["e_thresh_peak_rate_gev"] is not None
+    assert thresh["e_thresh_10pct_gev"] is not None
+
+    # Migration matrix preserves underflow/overflow loss in row sums
+    true_e = np.array([150.0, 150.0, 150.0, 150.0])
+    reco_e = np.array([150.0, 150.0, 50.0, 150.0])  # 1 event scatters below e_min=100
+    mig = build_energy_migration_matrix(true_e, reco_e, e_min=100.0, e_max=10000.0)
+    assert np.isclose(np.sum(mig["matrix"]), 0.75)

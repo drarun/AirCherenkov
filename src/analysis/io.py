@@ -338,22 +338,36 @@ def _normalize_event_dict(raw_ev: Dict[str, Any], default_zenith: float = 30.0, 
     if gains_np.ndim == 1:
         gains_np = gains_np[None, :]
 
+    from sim.provenance import clean_float, clean_str
+
     meta = raw_ev.get("event_metadata", {}) or {}
-    zen = float(raw_ev.get("zenith_deg", meta.get("zenith_deg", default_zenith)))
-    azi = float(raw_ev.get("azimuth_deg", meta.get("azimuth_deg", 0.0)))
+    zen = clean_float(raw_ev.get("zenith_deg", meta.get("zenith_deg", default_zenith)))
+    zen = zen if zen is not None else float(default_zenith)
+    azi = clean_float(raw_ev.get("azimuth_deg", meta.get("azimuth_deg", 0.0)))
+    azi = azi if azi is not None else 0.0
+    t_zen = clean_float(raw_ev.get("true_zenith_deg", meta.get("true_zenith_deg", zen)))
+    t_azi = clean_float(raw_ev.get("true_azimuth_deg", meta.get("true_azimuth_deg", azi)))
+    e_val = clean_float(raw_ev.get("energy", meta.get("energy", 0.0)))
+    ix_val = clean_float(raw_ev.get("impact_x", meta.get("impact_x", 0.0)))
+    iy_val = clean_float(raw_ev.get("impact_y", meta.get("impact_y", 0.0)))
     return {
         "fadc_traces": traces_np,
         "gain_flags": gains_np,
-        "energy": float(raw_ev.get("energy", meta.get("energy", 0.0))),
+        "energy": e_val if e_val is not None else 0.0,
         "label": int(raw_ev.get("label", meta.get("label", -1))),
-        "impact_x": float(raw_ev.get("impact_x", meta.get("impact_x", 0.0))),
-        "impact_y": float(raw_ev.get("impact_y", meta.get("impact_y", 0.0))),
+        "impact_x": ix_val if ix_val is not None else 0.0,
+        "impact_y": iy_val if iy_val is not None else 0.0,
+        "impact_radius_thrown": clean_float(raw_ev.get("impact_radius_thrown", meta.get("impact_radius_thrown"))),
         "zenith_deg": zen,
         "azimuth_deg": azi,
-        "true_zenith_deg": float(raw_ev.get("true_zenith_deg", meta.get("true_zenith_deg", zen))),
-        "true_azimuth_deg": float(raw_ev.get("true_azimuth_deg", meta.get("true_azimuth_deg", azi))),
-        "wobble_dir": str(raw_ev.get("wobble_dir", meta.get("wobble_dir", "unknown"))),
-        "source_format": str(meta.get("source", source_format)),
+        "true_zenith_deg": t_zen if t_zen is not None else zen,
+        "true_azimuth_deg": t_azi if t_azi is not None else azi,
+        "wobble_dir": clean_str(raw_ev.get("wobble_dir", meta.get("wobble_dir"))) or "Not recorded",
+        "source_format": clean_str(meta.get("source", source_format)) or source_format,
+        "sim_version": clean_str(raw_ev.get("sim_version", meta.get("sim_version"))),
+        "sim_git_commit": clean_str(raw_ev.get("sim_git_commit", meta.get("sim_git_commit"))),
+        "sim_created_utc": clean_str(raw_ev.get("sim_created_utc", meta.get("sim_created_utc"))),
+        "array_preset": clean_str(raw_ev.get("array_preset", meta.get("array_preset"))),
     }
 
 
@@ -389,25 +403,52 @@ def load_events_universal(
             pt_files = sorted(glob.glob(os.path.join(target, "raw", "sim_batch_*.pt")))
             if not pt_files:
                 pt_files = sorted(glob.glob(os.path.join(target, "raw", "*.pt")))
+        prov = None
+        if pt_files:
+            from sim.provenance import ensure_dataset_tagged
+
+            prov = ensure_dataset_tagged(os.path.dirname(pt_files[0]))
+        retro_ver = (prov or {}).get("latest_version")
+        retro_sha = (prov or {}).get("latest_commit")
         for fpath in pt_files:
             chunk = torch.load(fpath, weights_only=False)
             if isinstance(chunk, list):
                 for ev in chunk:
                     if isinstance(ev, dict) and "fadc_traces" in ev:
-                        events.append(_normalize_event_dict(ev, source_format="aircherenkov_pt"))
+                        norm_ev = _normalize_event_dict(ev, source_format="aircherenkov_pt")
+                        if norm_ev.get("sim_version") is None and retro_ver is not None:
+                            norm_ev["sim_version"] = retro_ver
+                            if norm_ev.get("sim_git_commit") is None and retro_sha is not None:
+                                norm_ev["sim_git_commit"] = retro_sha
+                        events.append(norm_ev)
                         if max_events is not None and len(events) >= max_events:
                             return events
         return events
 
     lower = target.lower()
     if lower.endswith(".pt"):
+        from sim.provenance import ensure_dataset_tagged
+
+        prov = ensure_dataset_tagged(os.path.dirname(target))
+        retro_ver = prov.get("latest_version")
+        retro_sha = prov.get("latest_commit")
         chunk = torch.load(target, weights_only=False)
         if isinstance(chunk, dict) and "fadc_traces" in chunk:
-            events.append(_normalize_event_dict(chunk, source_format="aircherenkov_pt"))
+            norm_ev = _normalize_event_dict(chunk, source_format="aircherenkov_pt")
+            if norm_ev.get("sim_version") is None and retro_ver is not None:
+                norm_ev["sim_version"] = retro_ver
+                if norm_ev.get("sim_git_commit") is None and retro_sha is not None:
+                    norm_ev["sim_git_commit"] = retro_sha
+            events.append(norm_ev)
         elif isinstance(chunk, list):
             for ev in chunk:
                 if isinstance(ev, dict) and "fadc_traces" in ev:
-                    events.append(_normalize_event_dict(ev, source_format="aircherenkov_pt"))
+                    norm_ev = _normalize_event_dict(ev, source_format="aircherenkov_pt")
+                    if norm_ev.get("sim_version") is None and retro_ver is not None:
+                        norm_ev["sim_version"] = retro_ver
+                        if norm_ev.get("sim_git_commit") is None and retro_sha is not None:
+                            norm_ev["sim_git_commit"] = retro_sha
+                    events.append(norm_ev)
                     if max_events is not None and len(events) >= max_events:
                         break
         return events

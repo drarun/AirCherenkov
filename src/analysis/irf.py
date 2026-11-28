@@ -140,6 +140,128 @@ def build_effective_area(
     }
 
 
+def build_effective_area_from_manifest(
+    manifest_or_path,
+    true_energies_gev,
+    passed_cut,
+    *,
+    n_bins: int = N_ENERGY_BINS,
+    e_min: float | None = None,
+    e_max: float | None = None,
+    allow_mixed_versions: bool = True,
+):
+    """Compute multi-session / multi-radius differential effective area A_eff(E_true).
+
+    For each energy bin [E_lo, E_hi], sums differential thrown exposure across all
+    overlapping simulation sessions in ``sim_manifest.json``:
+
+        exposure(b) = sum_s N_thrown_s(b) / (pi * R_s^2)
+        A_eff(b)    = N_selected(b) / exposure(b)
+    """
+    if isinstance(manifest_or_path, dict):
+        manifest = manifest_or_path
+    else:
+        p = str(manifest_or_path)
+        if os.path.isdir(p):
+            cand = os.path.join(p, "sim_manifest.json")
+            if not os.path.isfile(cand):
+                cand = os.path.join(p, "raw", "sim_manifest.json")
+            p = cand
+        with open(p, "r", encoding="utf-8") as mf:
+            manifest = json.load(mf)
+
+    sessions = manifest.get("sessions") or []
+    if not sessions:
+        raise ValueError("sim_manifest.json contains no sessions")
+
+    versions = {str(s.get("sim_version") or "") for s in sessions if s.get("sim_version")}
+    if not allow_mixed_versions and len(versions) > 1:
+        raise ValueError(f"Mixed simulation versions in manifest: {sorted(versions)}")
+
+    parsed_sessions = []
+    for s in sessions:
+        params = s.get("params") or {}
+        s_emin = float(params.get("e_min", 100.0))
+        s_emax = float(params.get("e_max", 30000.0))
+        s_alpha = float(params.get("spectral_index", DEFAULT_GEN_INDEX))
+        s_r = float(params.get("impact_radius", 750.0))
+        s_n = int(s.get("gammas_thrown_session", 0))
+        if s_n > 0 and s_emax > s_emin and s_r > 0:
+            parsed_sessions.append((s_emin, s_emax, s_alpha, s_r, s_n))
+
+    if not parsed_sessions:
+        raise ValueError("No valid sessions with gammas_thrown_session > 0 found in manifest")
+
+    glob_emin = float(e_min) if e_min is not None else min(s[0] for s in parsed_sessions)
+    glob_emax = float(e_max) if e_max is not None else max(s[1] for s in parsed_sessions)
+    bin_edges = np.logspace(np.log10(glob_emin), np.log10(glob_emax), int(n_bins) + 1)
+    bin_centres = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+
+    def _prim(E, alpha):
+        if np.isclose(alpha, 1.0):
+            return np.log(E)
+        return (E ** (1.0 - alpha)) / (1.0 - alpha)
+
+    exposure = np.zeros(len(bin_centres), dtype=np.float64)
+    n_simulated = np.zeros(len(bin_centres), dtype=np.float64)
+    for s_emin, s_emax, s_alpha, s_r, s_n in parsed_sessions:
+        area_s = np.pi * (s_r ** 2)
+        norm_s = _prim(s_emax, s_alpha) - _prim(s_emin, s_alpha)
+        for b in range(len(bin_centres)):
+            lo = max(bin_edges[b], s_emin)
+            hi = min(bin_edges[b + 1], s_emax)
+            if hi > lo:
+                n_bin_s = s_n * (_prim(hi, s_alpha) - _prim(lo, s_alpha)) / norm_s
+                n_simulated[b] += n_bin_s
+                exposure[b] += n_bin_s / area_s
+
+    true_e = np.asarray(true_energies_gev, dtype=np.float64)
+    mask = np.asarray(passed_cut, dtype=bool)
+    n_selected, _ = np.histogram(true_e[mask], bins=bin_edges)
+
+    valid = exposure > 0
+    aeff = np.zeros_like(exposure)
+    aeff_err = np.zeros_like(exposure)
+    aeff[valid] = n_selected[valid] / exposure[valid]
+    aeff_err[valid] = np.sqrt(n_selected[valid].astype(np.float64)) / exposure[valid]
+
+    return {
+        "bin_edges": bin_edges,
+        "bin_centres": bin_centres,
+        "aeff": aeff,
+        "aeff_err": aeff_err,
+        "n_selected": n_selected,
+        "n_simulated": n_simulated,
+        "exposure": exposure,
+        "versions": sorted(versions),
+    }
+
+
+def compute_energy_threshold(aeff_dict: dict, spectral_index: float = 2.49) -> dict:
+    """Compute standard IACT energy thresholds from A_eff(E):
+    1. Peak of differential trigger/detection rate A_eff(E) * E^(-spectral_index)
+    2. First bin centre reaching 10% of peak effective area.
+    """
+    centres = np.asarray(aeff_dict["bin_centres"], dtype=np.float64)
+    aeff = np.asarray(aeff_dict["aeff"], dtype=np.float64)
+    if len(centres) == 0 or np.max(aeff) <= 0:
+        return {"e_thresh_peak_rate_gev": None, "e_thresh_10pct_gev": None, "peak_aeff_m2": 0.0}
+
+    diff_rate = aeff * (centres ** (-float(spectral_index)))
+    peak_rate_idx = int(np.argmax(diff_rate))
+    e_peak_rate = float(centres[peak_rate_idx])
+
+    peak_aeff = float(np.max(aeff))
+    above_10 = np.where(aeff >= 0.10 * peak_aeff)[0]
+    e_10pct = float(centres[above_10[0]]) if len(above_10) > 0 else None
+
+    return {
+        "e_thresh_peak_rate_gev": e_peak_rate,
+        "e_thresh_10pct_gev": e_10pct,
+        "peak_aeff_m2": peak_aeff,
+    }
+
+
 def build_energy_migration_matrix(
     true_energies_gev,
     reco_energies_gev,
@@ -172,8 +294,10 @@ def build_energy_migration_matrix(
         true_energies_gev, reco_energies_gev, bins=[bin_edges, bin_edges]
     )
 
-    # Row-normalise (each true-energy row sums to 1)
-    row_sums = raw_counts.sum(axis=1, keepdims=True)
+    # Row-normalise by ALL selected true events in each true-energy bin (including
+    # events whose E_reco scattered outside [e_min, e_max]) so threshold efficiency is not inflated.
+    true_counts, _ = np.histogram(true_energies_gev, bins=bin_edges)
+    row_sums = true_counts[:, None].astype(np.float64)
     safe_sums = np.where(row_sums > 0, row_sums, 1.0)
     matrix = raw_counts / safe_sums
 

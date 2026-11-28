@@ -776,10 +776,23 @@ class EventViewerWidget(QWidget):
             bundle=self.trained_bundle,
             array_preset=self.array_model.preset_name,
         )
+        from sim.provenance import clean_float, format_event_provenance
+
         lbl_val = ev.get("label", -1)
         lbl_txt = "Gamma-ray" if lbl_val == 1 else ("Proton / Hadron" if lbl_val == 0 else "Real / Unlabeled")
-        e_true = float(ev.get("energy", 0.0))
-        e_str = f"{e_true:.1f} GeV ({e_true / 1000.0:.2f} TeV)" if e_true > 0 else "Unknown"
+        e_true = clean_float(ev.get("energy"))
+        e_str = f"{e_true:.1f} GeV ({e_true / 1000.0:.2f} TeV)" if (e_true is not None and e_true > 0) else "Not recorded"
+        ix_val = clean_float(ev.get("impact_x"))
+        iy_val = clean_float(ev.get("impact_y"))
+        core_str = f"({ix_val:.1f}, {iy_val:.1f}) m" if (ix_val is not None and iy_val is not None) else "Not recorded"
+        zen_disp = clean_float(zen)
+        azi_disp = clean_float(azi)
+        pt_str = (
+            f"Zen={zen_disp:.1f}°, Azi={azi_disp:.1f}°"
+            if (zen_disp is not None and azi_disp is not None)
+            else "Not recorded"
+        )
+        sim_ver_str = format_event_provenance(ev)
 
         ml_str = "Not loaded (train or load Stereo ML / GNN model in Tab 3)"
         if self.trained_bundle is not None and "classifier" in self.trained_bundle and "energy_regressor" in self.trained_bundle:
@@ -815,11 +828,11 @@ class EventViewerWidget(QWidget):
         )
         self.lbl_meta.setText(
             f"Event #{self.filtered_indices[self.current_pos]} [{ev.get('source_format', 'pt')}]\n"
-            f"Dataset:    {prov['dataset_title']}\n"
-            f"Model:      {prov['model_title']}\n"
-            f"Particle:   {lbl_txt}   |   True Energy: {e_str}\n"
-            f"True Core:  ({ev.get('impact_x', 0.0):.1f}, {ev.get('impact_y', 0.0):.1f}) m   |   "
-            f"Pointing: Zen={zen:.1f}°, Azi={azi:.1f}°\n"
+            f"Dataset:     {prov['dataset_title']}\n"
+            f"Sim Version: {sim_ver_str}\n"
+            f"Model:       {prov['model_title']}\n"
+            f"Particle:    {lbl_txt}   |   True Energy: {e_str}\n"
+            f"True Core:   {core_str}   |   Pointing: {pt_str}\n"
             f"SDP Reco (Dir/Core): {geom_str}\n"
             f"ML/GNN Reco (E, G/H): {ml_str}"
         )

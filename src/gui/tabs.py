@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -52,6 +53,7 @@ from gui.array_models import (
     load_detector_model_json,
     save_detector_model_json,
 )
+from gui.sim_monitor import SimulationMonitorWidget
 from gui.workers import (
     AnalysisIRFSpectralWorker,
     CORE_CONTAINED_BIAS_PCT,
@@ -459,6 +461,9 @@ class SimulationTab(QWidget):
         out_h = QHBoxLayout(out_row)
         out_h.setContentsMargins(0, 0, 0, 0)
         self.edit_out = QLineEdit("data/gui_sim/raw")
+        self.edit_out.editingFinished.connect(
+            lambda: self.set_monitored_directory(self.edit_out.text().strip())
+        )
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(self._browse_out)
         out_h.addWidget(self.edit_out, stretch=1)
@@ -466,6 +471,10 @@ class SimulationTab(QWidget):
 
         self.chk_append = QCheckBox("Concatenate (+N events) onto existing simulation batches")
         self.chk_append.setChecked(False)
+        from sim.provenance import SIM_SCHEMA_VERSION
+        self.edit_sim_version = QLineEdit(SIM_SCHEMA_VERSION)
+        self.edit_sim_version.setMaximumWidth(140)
+        self.edit_sim_version.setToolTip("Version tag recorded in sim_manifest.json and each saved event")
 
         form.addRow("Target Gammas / Hadrons:", ArrayConfigTab._pair(self.spin_ng, self.spin_nh))
         form.addRow("Gamma E_min / E_max:", ArrayConfigTab._pair(self.spin_emin, self.spin_emax))
@@ -476,7 +485,7 @@ class SimulationTab(QWidget):
         form.addRow("Wobble Offset / Mode:", ArrayConfigTab._pair(self.spin_wobble, self.combo_wobble))
         form.addRow("Batch / Save Every / Device:", ArrayConfigTab._triple(self.spin_batch, self.spin_save, self.combo_dev))
         form.addRow("Output Directory:", out_row)
-        form.addRow("Append Mode:", self.chk_append)
+        form.addRow("Append / Sim Version:", ArrayConfigTab._pair(self.chk_append, self.edit_sim_version))
         left_v.addWidget(grp)
 
         btn_row = QHBoxLayout()
@@ -498,9 +507,17 @@ class SimulationTab(QWidget):
         self.log_box.setFont(QFont("Consolas", 8.5))
         left_v.addWidget(self.log_box, stretch=1)
 
-        # Right side live plots
-        right = QWidget()
-        right_v = QVBoxLayout(right)
+        # Right side live monitor & plots
+        default_monitor_dir = (
+            "data/corsika_crab_30deg/raw"
+            if os.path.isdir("data/corsika_crab_30deg/raw")
+            else self.edit_out.text().strip()
+        )
+        self.monitor_widget = SimulationMonitorWidget(initial_dir=default_monitor_dir, parent=self)
+        self.monitor_widget.cohort_data_ready.connect(self._on_batch_completed)
+
+        right_map = QWidget()
+        right_v = QVBoxLayout(right_map)
         right_v.setContentsMargins(0, 0, 0, 0)
         self.fig = Figure(figsize=(6.5, 7.0), facecolor="#0b1120")
         self.canvas = FigureCanvas(self.fig)
@@ -509,10 +526,14 @@ class SimulationTab(QWidget):
         right_v.addWidget(self.canvas, stretch=1)
         self._init_empty_plots()
 
+        self.right_tabs = QTabWidget()
+        self.right_tabs.addTab(self.monitor_widget, "Live Progress & Timeseries")
+        self.right_tabs.addTab(right_map, "Live Energy & Core Map")
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([540, 720])
+        splitter.addWidget(self.right_tabs)
+        splitter.setSizes([520, 740])
         root.addWidget(splitter)
 
     def _init_empty_plots(self) -> None:
@@ -527,11 +548,19 @@ class SimulationTab(QWidget):
     def set_array_model(self, model: DetectorArrayModel) -> None:
         self.array_model = model
 
+    def set_monitored_directory(self, path: str) -> None:
+        if path:
+            self.monitor_widget.set_directory(path)
+
+    def shutdown(self) -> None:
+        self.monitor_widget.shutdown()
+
     @Slot()
     def _browse_out(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Select Simulation Output Directory", "data")
         if d:
             self.edit_out.setText(d)
+            self.set_monitored_directory(d)
 
     def build_params(self) -> Dict[str, Any]:
         return {
@@ -554,6 +583,7 @@ class SimulationTab(QWidget):
             "device": self.combo_dev.currentText(),
             "output_dir": self.edit_out.text().strip(),
             "append_mode": bool(self.chk_append.isChecked()),
+            "sim_version": self.edit_sim_version.text().strip(),
         }
 
     @Slot()
@@ -561,6 +591,7 @@ class SimulationTab(QWidget):
         if self.worker is not None and self.worker.isRunning():
             return
         params = self.build_params()
+        self.set_monitored_directory(params["output_dir"])
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.log_box.appendPlainText("Starting MC Simulation...")
@@ -584,31 +615,50 @@ class SimulationTab(QWidget):
 
     @Slot(dict)
     def _on_batch_completed(self, payload: dict) -> None:
-        energies = payload["energies"]
-        labels = payload["labels"]
-        ix = payload["impact_x"]
-        iy = payload["impact_y"]
-        if len(energies) == 0:
+        energies = np.asarray(payload["energies"], dtype=np.float64)
+        labels = np.asarray(payload["labels"], dtype=np.int64)
+        ix = np.asarray(payload["impact_x"], dtype=np.float64)
+        iy = np.asarray(payload["impact_y"], dtype=np.float64)
+        valid = np.isfinite(energies) & (energies > 0.0) & np.isfinite(ix) & np.isfinite(iy)
+        if not np.any(valid):
             return
+        energies, labels, ix, iy = energies[valid], labels[valid], ix[valid], iy[valid]
 
         self.fig.clear()
         ax1 = self.fig.add_subplot(211)
         ax2 = self.fig.add_subplot(212)
 
         _style_dark_ax(ax1, "Live Triggered Energy Distribution", "True Energy (GeV)", "Events")
-        bins = np.logspace(np.log10(max(energies.min(), 10.0)), np.log10(max(energies.max(), 20.0)), 18)
-        if np.any(labels == 1):
-            ax1.hist(energies[labels == 1], bins=bins, alpha=0.75, color="#38bdf8", label="Gammas")
-        if np.any(labels == 0):
-            ax1.hist(energies[labels == 0], bins=bins, alpha=0.6, color="#f43f5e", label="Hadrons")
+        e_lo = max(float(np.min(energies)), 1.0)
+        e_hi = max(float(np.max(energies)), e_lo * 1.25)
+        bins = np.logspace(np.log10(e_lo), np.log10(e_hi), 25)
+        g_mask = labels == 1
+        h_mask = labels == 0
+        counts_list = []
+        if np.any(g_mask):
+            cg, _ = np.histogram(energies[g_mask], bins=bins)
+            counts_list.append(int(np.max(cg)))
+            ax1.hist(energies[g_mask], bins=bins, alpha=0.75, color="#38bdf8", label=f"Gammas ({int(np.sum(g_mask)):,})")
+        if np.any(h_mask):
+            ch, _ = np.histogram(energies[h_mask], bins=bins)
+            counts_list.append(int(np.max(ch)))
+            ax1.hist(energies[h_mask], bins=bins, alpha=0.6, color="#f43f5e", label=f"Hadrons ({int(np.sum(h_mask)):,})")
         ax1.set_xscale("log")
+        if counts_list and max(counts_list) > 20:
+            ax1.set_yscale("log")
         ax1.legend(fontsize=8.5, facecolor="#0f172a", edgecolor="#334155", labelcolor="#e2e8f0")
 
         _style_dark_ax(ax2, "Live Triggered Ground Core Impact Map", "Impact X (m)", "Impact Y (m)")
-        if np.any(labels == 1):
-            ax2.scatter(ix[labels == 1], iy[labels == 1], s=14, alpha=0.75, color="#38bdf8", label="Gamma core")
-        if np.any(labels == 0):
-            ax2.scatter(ix[labels == 0], iy[labels == 0], s=14, alpha=0.55, color="#f43f5e", label="Hadron core")
+        if len(energies) > 6000:
+            stride = max(1, len(energies) // 6000)
+            g_s, h_s = g_mask[::stride], h_mask[::stride]
+            ix_s, iy_s = ix[::stride], iy[::stride]
+        else:
+            g_s, h_s, ix_s, iy_s = g_mask, h_mask, ix, iy
+        if np.any(g_s):
+            ax2.scatter(ix_s[g_s], iy_s[g_s], s=10, alpha=0.65, color="#38bdf8", label=f"Gamma core ({int(np.sum(g_mask)):,})")
+        if np.any(h_s):
+            ax2.scatter(ix_s[h_s], iy_s[h_s], s=10, alpha=0.5, color="#f43f5e", label=f"Hadron core ({int(np.sum(h_mask)):,})")
         tx = [float(t["x_tel"]) for t in self.array_model.telescopes_spec]
         ty = [float(t["y_tel"]) for t in self.array_model.telescopes_spec]
         ax2.scatter(tx, ty, s=90, marker="^", color="#fbbf24", edgecolor="#0f172a", zorder=5, label="Telescopes")
