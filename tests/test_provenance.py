@@ -4,10 +4,10 @@ import json
 import math
 
 import numpy as np
+import pytest
 import torch
 
 from analysis.io import _normalize_event_dict
-from gui.workers import describe_model_and_dataset
 from sim.provenance import (
     clean_float,
     clean_str,
@@ -148,6 +148,9 @@ def test_format_event_provenance_and_normalize_event_dict():
 
 
 def test_describe_model_and_dataset_provenance(tmp_path):
+    pytest.importorskip("PySide6")
+    from gui.workers import describe_model_and_dataset
+
     raw = tmp_path / "raw"
     raw.mkdir()
     update_sim_manifest(

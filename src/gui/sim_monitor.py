@@ -10,12 +10,12 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 import numpy as np
 import torch
 
 try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
     from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
     from PySide6.QtWidgets import (
         QCheckBox,
